@@ -1,0 +1,15 @@
+# Output directories and logs
+*_output/
+outputs/
+*.pdb
+*.trb
+*.jsonl
+*.fa
+*.fasta
+
+# Temporary files & caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
