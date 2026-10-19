@@ -19,40 +19,53 @@ source "$SCRIPT_DIR/scripts/env_setup.sh"
 # ------------------------------------------------------------------------------
 # CLI Subcommand Routing
 # ------------------------------------------------------------------------------
-if [ $# -gt 0 ]; then
-    SUBCMD="$1"
-    shift
+BACKGROUND_FLAG=""
+ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--background" ] || [ "$arg" = "-b" ]; then
+        BACKGROUND_FLAG="--background"
+    else
+        ARGS+=("$arg")
+    fi
+done
+
+if [ ${#ARGS[@]} -gt 0 ]; then
+    SUBCMD="${ARGS[0]}"
+    CMD_REST=("${ARGS[@]:1}")
+    [ -n "$BACKGROUND_FLAG" ] && CMD_REST+=("$BACKGROUND_FLAG")
     case "$SUBCMD" in
         motif|novo)
             [ -f "$SCRIPT_DIR/autoscaffold.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/autoscaffold.sh${NC}"; exit 1; }
-            exec bash "$SCRIPT_DIR/autoscaffold.sh" "$@"
+            exec bash "$SCRIPT_DIR/autoscaffold.sh" "${CMD_REST[@]}"
             ;;
         binder|target)
             [ -f "$SCRIPT_DIR/de_novo.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/de_novo.sh${NC}"; exit 1; }
-            exec bash "$SCRIPT_DIR/de_novo.sh" "$@"
+            exec bash "$SCRIPT_DIR/de_novo.sh" "${CMD_REST[@]}"
             ;;
         discontinuous|disc)
             [ -f "$SCRIPT_DIR/discontinuous_scaffold.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/discontinuous_scaffold.sh${NC}"; exit 1; }
-            exec bash "$SCRIPT_DIR/discontinuous_scaffold.sh" "$@"
+            exec bash "$SCRIPT_DIR/discontinuous_scaffold.sh" "${CMD_REST[@]}"
             ;;
         chimera|pse)
             [ -f "$SCRIPT_DIR/chimera_scaffold.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/chimera_scaffold.sh${NC}"; exit 1; }
-            exec bash "$SCRIPT_DIR/chimera_scaffold.sh" "$@"
+            exec bash "$SCRIPT_DIR/chimera_scaffold.sh" "${CMD_REST[@]}"
             ;;
         diagnostics|diag)
             [ -f "$SCRIPT_DIR/scripts/diagnostics.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/diagnostics.sh${NC}"; exit 1; }
-            exec bash "$SCRIPT_DIR/scripts/diagnostics.sh" "$@"
+            exec bash "$SCRIPT_DIR/scripts/diagnostics.sh" "${CMD_REST[@]}"
             ;;
         help|--help|-h)
             echo -e "${BOLD}AutoScaffold Master Suite CLI${NC}"
             echo -e "Usage:"
-            echo -e "  $0 [subcommand] [arguments...]"
+            echo -e "  $0 [subcommand] [arguments...] [--background]"
             echo -e "\nSubcommands:"
             echo -e "  motif             De Novo Active Site & Epitope Motif Scaffolding"
             echo -e "  binder            Target-Binder Design & ColabFold Validation"
             echo -e "  discontinuous     Discontinuous Contact Motif Scaffolding"
             echo -e "  chimera           Chimera Scaffolding: Graft Motif into Vessel Protein (PDB/PSE)"
             echo -e "  diagnostics       Run environment & dependency diagnostic checks"
+            echo -e "\nOptions:"
+            echo -e "  --background, -b  Run selected workflow in background"
             echo -e "\nRun without arguments to launch the interactive TUI menu."
             exit 0
             ;;
@@ -88,23 +101,23 @@ read -p "▶ Enter selection [1-6]: " WORKFLOW_CHOICE
 case "$WORKFLOW_CHOICE" in
     1)
         [ -f "$SCRIPT_DIR/autoscaffold.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/autoscaffold.sh${NC}"; exit 1; }
-        bash "$SCRIPT_DIR/autoscaffold.sh"
+        exec bash "$SCRIPT_DIR/autoscaffold.sh"
         ;;
     2)
         [ -f "$SCRIPT_DIR/de_novo.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/de_novo.sh${NC}"; exit 1; }
-        bash "$SCRIPT_DIR/de_novo.sh"
+        exec bash "$SCRIPT_DIR/de_novo.sh"
         ;;
     3)
         [ -f "$SCRIPT_DIR/discontinuous_scaffold.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/discontinuous_scaffold.sh${NC}"; exit 1; }
-        bash "$SCRIPT_DIR/discontinuous_scaffold.sh"
+        exec bash "$SCRIPT_DIR/discontinuous_scaffold.sh"
         ;;
     4)
         [ -f "$SCRIPT_DIR/chimera_scaffold.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/chimera_scaffold.sh${NC}"; exit 1; }
-        bash "$SCRIPT_DIR/chimera_scaffold.sh"
+        exec bash "$SCRIPT_DIR/chimera_scaffold.sh"
         ;;
     5)
         [ -f "$SCRIPT_DIR/scripts/diagnostics.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/diagnostics.sh${NC}"; exit 1; }
-        bash "$SCRIPT_DIR/scripts/diagnostics.sh"
+        exec bash "$SCRIPT_DIR/scripts/diagnostics.sh"
         ;;
     6|q|quit|exit)
         echo -e "\n${CYAN}Exiting AutoScaffold Suite. Happy designing!${NC}\n"

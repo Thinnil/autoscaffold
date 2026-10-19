@@ -16,11 +16,21 @@ echo -e "${CYAN} 🏗️  AUTOSCAFFOLD: DE NOVO MOTIF SCAFFOLDING 🏗️       
 echo -e "${CYAN}======================================================${NC}"
 echo -e "Tip: Press ${YELLOW}Ctrl + C${NC} at any time to cancel.\n"
 
+BACKGROUND_MODE=false
+ORIG_ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--background" ] || [ "$arg" = "-b" ]; then
+        BACKGROUND_MODE=true
+    else
+        ORIG_ARGS+=("$arg")
+    fi
+done
+
 # ------------------------------------------------------------------------------
 # 1. Input PDB verification
 # ------------------------------------------------------------------------------
-if [ -n "$1" ]; then
-    INPUT_PDB="$1"
+if [ -n "${ORIG_ARGS[0]}" ]; then
+    INPUT_PDB="${ORIG_ARGS[0]}"
 else
     read -e -p "▶ 1. Path to source PDB (containing active site/motif): " INPUT_PDB
 fi
@@ -39,8 +49,8 @@ ABS_INPUT_PDB=$(realpath "$INPUT_PDB")
 # 2. Topology Contig Assistant
 # ------------------------------------------------------------------------------
 echo -e "\n${YELLOW}--- Topology Assistant ---${NC}"
-if [ -n "$2" ]; then
-    CHAIN="$2"
+if [ -n "${ORIG_ARGS[1]}" ]; then
+    CHAIN="${ORIG_ARGS[1]}"
 else
     read -p "▶ 2. Chain ID of motif (e.g., A): " CHAIN
 fi
@@ -50,8 +60,8 @@ if [[ ! "$CHAIN" =~ ^[a-zA-Z0-9]+$ ]]; then
     exit 1
 fi
 
-if [ -n "$3" ]; then
-    NUM_MOTIFS="$3"
+if [ -n "${ORIG_ARGS[2]}" ]; then
+    NUM_MOTIFS="${ORIG_ARGS[2]}"
 else
     read -p "▶ 3. How many motif fragments will you preserve? (e.g., 3): " NUM_MOTIFS
 fi
@@ -141,13 +151,38 @@ fi
 
 echo -e "\n${GREEN}[✓] Configuration complete. Preparing workspace...${NC}\n"
 
-mkdir -p "$OUT_DIR/1_rfdiffusion"
-mkdir -p "$OUT_DIR/2_mpnn_inputs/target_folder"
-mkdir -p "$OUT_DIR/3_mpnn_outputs"
-ABS_OUT_DIR=$(realpath "$OUT_DIR")
-if [ -z "$ABS_OUT_DIR" ] || [ "$ABS_OUT_DIR" = "/" ]; then
-    echo -e "${RED}[ERROR] Invalid output directory path '$OUT_DIR'.${NC}"
+ABS_OUT_DIR=$(realpath "$OUT_DIR" 2>/dev/null || echo "$OUT_DIR")
+if [ -z "$ABS_OUT_DIR" ] || [ "$ABS_OUT_DIR" = "/" ] || [ "$ABS_OUT_DIR" = "\\" ] || [[ "$ABS_OUT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+    echo -e "${RED}[ERROR] Invalid or dangerous output directory path: '$OUT_DIR'.${NC}"
     exit 1
+fi
+
+mkdir -p "$ABS_OUT_DIR/1_rfdiffusion"
+mkdir -p "$ABS_OUT_DIR/2_mpnn_inputs/target_folder"
+mkdir -p "$ABS_OUT_DIR/3_mpnn_outputs"
+
+PID_FILE="$ABS_OUT_DIR/run.pid"
+LOG_FILE="$ABS_OUT_DIR/run.log"
+
+# ------------------------------------------------------------------------------
+# Background Execution Option
+# ------------------------------------------------------------------------------
+if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ]; then
+    read -p "▶ Do you want to run this workflow in the background? [y/N]: " RUN_BG
+    if [[ "$RUN_BG" =~ ^[Yy]$ ]]; then
+        BACKGROUND_MODE=true
+        nohup bash "$0" "${ORIG_ARGS[@]}" --background < /dev/null > "$LOG_FILE" 2>&1 &
+        BG_PID=$!
+        echo "$BG_PID" > "$PID_FILE"
+        echo -e "\n${CYAN}======================================================================${NC}"
+        echo -e "${GREEN}[✓] Workflow launched successfully in the background.${NC}"
+        echo -e "PID:             ${YELLOW}${BG_PID}${NC}"
+        echo -e "Log file:        ${CYAN}${LOG_FILE}${NC}"
+        echo -e "PID file:        ${CYAN}${PID_FILE}${NC}"
+        echo -e "Monitor command: ${BOLD}tail -f \"${LOG_FILE}\"${NC}"
+        echo -e "${CYAN}======================================================================${NC}\n"
+        exit 0
+    fi
 fi
 
 # ------------------------------------------------------------------------------
@@ -271,4 +306,21 @@ shopt -u nullglob
 if [ ${#fa_files[@]} -gt 0 ]; then
     cat "${fa_files[@]}"
 fi
+
+# Generate Automated Methodology & Reproducibility Report
+python "$SCRIPT_DIR/scripts/methodology_reporter.py" \
+    --run_name "${OUT_PREFIX}_Motif_Scaffold" \
+    --mode "Motif Scaffolding" \
+    --out_dir "$ABS_OUT_DIR" \
+    --input_pdb "$ABS_INPUT_PDB" \
+    --donor "Chain ${CHAIN}" \
+    --contigs "$CONTIGS" \
+    --num_designs "$NUM_DESIGNS" \
+    --num_seqs "$NUM_SEQS" \
+    --mpnn_temp "$MPNN_TEMP" \
+    --cmd "bash autoscaffold.sh \"$ABS_INPUT_PDB\" \"$CHAIN\" \"$NUM_MOTIFS\"" \
+    --status "SUCCESS" \
+    --total_candidates "$NUM_DESIGNS" \
+    --passing_candidates "$NUM_DESIGNS" 2>/dev/null || true
+
 echo -e "\nResults stored in: ${CYAN}${ABS_OUT_DIR}${NC}\n"

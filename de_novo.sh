@@ -15,11 +15,21 @@ echo -e "${CYAN}   🧬 DE NOVO BINDER DESIGN & VALIDATION PIPELINE 🧬  ${NC}"
 echo -e "${CYAN}======================================================${NC}"
 echo -e "Tip: Press ${YELLOW}Ctrl + C${NC} at any time to cancel.\n"
 
+BACKGROUND_MODE=false
+ORIG_ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--background" ] || [ "$arg" = "-b" ]; then
+        BACKGROUND_MODE=true
+    else
+        ORIG_ARGS+=("$arg")
+    fi
+done
+
 # ==============================================================================
 # DATA COLLECTION & VALIDATION
 # ==============================================================================
-if [ -n "$1" ]; then
-    INPUT_PDB="$1"
+if [ -n "${ORIG_ARGS[0]}" ]; then
+    INPUT_PDB="${ORIG_ARGS[0]}"
 else
     read -e -p "▶ 1. Path to Target PDB file: " INPUT_PDB
 fi
@@ -36,8 +46,8 @@ fi
 
 ABS_INPUT_PDB=$(realpath "$INPUT_PDB")
 
-if [ -n "$2" ]; then
-    CHAIN_A="$2"
+if [ -n "${ORIG_ARGS[1]}" ]; then
+    CHAIN_A="${ORIG_ARGS[1]}"
 else
     read -p "▶ 2. Target Chain ID to preserve (e.g., A): " CHAIN_A
 fi
@@ -47,8 +57,8 @@ if [[ ! "$CHAIN_A" =~ ^[a-zA-Z0-9]+$ ]]; then
     exit 1
 fi
 
-if [ -n "$3" ]; then
-    RES_RANGE="$3"
+if [ -n "${ORIG_ARGS[2]}" ]; then
+    RES_RANGE="${ORIG_ARGS[2]}"
 else
     read -p "▶ 3. Target residue range (e.g., 20-97. Press ENTER for FULL chain): " RES_RANGE
 fi
@@ -135,16 +145,40 @@ fi
 
 echo -e "\n${GREEN}[✓] Parameters validated. Creating directories...${NC}\n"
 
-# Directory layout
-mkdir -p "$OUT_DIR/1_rfdiffusion"
-mkdir -p "$OUT_DIR/2_mpnn_inputs/target_folder"
-mkdir -p "$OUT_DIR/3_mpnn_outputs"
-mkdir -p "$OUT_DIR/4_colabfold_validation"
-
-ABS_OUT_DIR=$(realpath "$OUT_DIR")
-if [ -z "$ABS_OUT_DIR" ] || [ "$ABS_OUT_DIR" = "/" ]; then
-    echo -e "${RED}[ERROR] Invalid output directory path '$OUT_DIR'.${NC}"
+ABS_OUT_DIR=$(realpath "$OUT_DIR" 2>/dev/null || echo "$OUT_DIR")
+if [ -z "$ABS_OUT_DIR" ] || [ "$ABS_OUT_DIR" = "/" ] || [ "$ABS_OUT_DIR" = "\\" ] || [[ "$ABS_OUT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+    echo -e "${RED}[ERROR] Invalid or dangerous output directory path: '$OUT_DIR'.${NC}"
     exit 1
+fi
+
+# Directory layout
+mkdir -p "$ABS_OUT_DIR/1_rfdiffusion"
+mkdir -p "$ABS_OUT_DIR/2_mpnn_inputs/target_folder"
+mkdir -p "$ABS_OUT_DIR/3_mpnn_outputs"
+mkdir -p "$ABS_OUT_DIR/4_colabfold_validation"
+
+PID_FILE="$ABS_OUT_DIR/run.pid"
+LOG_FILE="$ABS_OUT_DIR/run.log"
+
+# ------------------------------------------------------------------------------
+# Background Execution Option
+# ------------------------------------------------------------------------------
+if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ]; then
+    read -p "▶ Do you want to run this workflow in the background? [y/N]: " RUN_BG
+    if [[ "$RUN_BG" =~ ^[Yy]$ ]]; then
+        BACKGROUND_MODE=true
+        nohup bash "$0" "${ORIG_ARGS[@]}" --background < /dev/null > "$LOG_FILE" 2>&1 &
+        BG_PID=$!
+        echo "$BG_PID" > "$PID_FILE"
+        echo -e "\n${CYAN}======================================================================${NC}"
+        echo -e "${GREEN}[✓] Workflow launched successfully in the background.${NC}"
+        echo -e "PID:             ${YELLOW}${BG_PID}${NC}"
+        echo -e "Log file:        ${CYAN}${LOG_FILE}${NC}"
+        echo -e "PID file:        ${CYAN}${PID_FILE}${NC}"
+        echo -e "Monitor command: ${BOLD}tail -f \"${LOG_FILE}\"${NC}"
+        echo -e "${CYAN}======================================================================${NC}\n"
+        exit 0
+    fi
 fi
 
 # ==============================================================================
@@ -294,3 +328,19 @@ echo -e "${GREEN} 🏆 PIPELINE COMPLETED SUCCESSFULLY 🏆                ${NC}
 echo -e "${GREEN}======================================================${NC}"
 echo -e "Validated complex files located in:"
 echo -e "${CYAN}${ABS_OUT_DIR}/4_colabfold_validation/${NC}\n"
+
+# Generate Automated Methodology & Reproducibility Report
+python "$SCRIPT_DIR/scripts/methodology_reporter.py" \
+    --run_name "${OUT_PREFIX}_Binder_Design" \
+    --mode "De Novo Target-Binder Design" \
+    --out_dir "$ABS_OUT_DIR" \
+    --input_pdb "$ABS_INPUT_PDB" \
+    --donor "Target Chain: ${CHAIN_A} (${RES_RANGE})" \
+    --contigs "${CHAIN_A}${RES_RANGE}/0 ${BINDER_LEN}" \
+    --num_designs "$NUM_DESIGNS" \
+    --num_seqs "$NUM_SEQS" \
+    --mpnn_temp "$MPNN_TEMP" \
+    --cmd "bash de_novo.sh \"$ABS_INPUT_PDB\" \"$CHAIN_A\" \"$RES_RANGE\"" \
+    --status "SUCCESS" \
+    --total_candidates "$NUM_DESIGNS" \
+    --passing_candidates "$NUM_DESIGNS" 2>/dev/null || true

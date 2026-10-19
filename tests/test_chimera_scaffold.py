@@ -264,9 +264,140 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             dry_run=True
         )
         res = scaffolder.run_pipeline()
+        self.assertEqual(res["status"], "COMPLETED")
         self.assertEqual(scaffolder.mpnn_batch_size, 4)
         summary_json = os.path.join(out_batch, "chimera_summary.json")
         self.assertTrue(os.path.isfile(summary_json))
+
+    def test_vessel_locking_and_rfdiffusion_noise_scale(self):
+        """
+        Verify:
+        1. When lock_vessel=True, vessel framework residues are locked in fixed_positions_dict.jsonl.
+        2. When lock_vessel=False, only donor motif residues are locked.
+        3. denoiser.noise_scale_ca=0.0 and noise_scale_frame=0.0 are strictly present in rfdiffusion_command.
+        """
+        import json
+        out_locked = os.path.join(self.test_dir, "out_locked")
+        scaffolder = ChimeraScaffolder(
+            donor_pdb=self.donor_pdb,
+            vessel_pdb=self.vessel_pdb,
+            motif_residues="30-35",
+            chimera_mode="replace",
+            vessel_replace_range="40-60",
+            lock_vessel=True,
+            num_designs=1,
+            out_dir=out_locked,
+            dry_run=True
+        )
+        res = scaffolder.run_pipeline()
+
+        # Check noise scales
+        cmd = res["rfdiffusion_command"]
+        self.assertIn("denoiser.noise_scale_ca=0.0", cmd)
+        self.assertIn("denoiser.noise_scale_frame=0.0", cmd)
+
+        # Check fixed_positions_dict.jsonl
+        jsonl_files = [
+            os.path.join(out_locked, "2_mpnn", f)
+            for f in os.listdir(os.path.join(out_locked, "2_mpnn"))
+            if f.endswith("_fixed_positions.jsonl")
+        ]
+        self.assertTrue(len(jsonl_files) > 0)
+        with open(jsonl_files[0], "r", encoding="utf-8") as f:
+            fixed_data = json.loads(f.readline())
+
+        # When vessel is locked (1-39 and 61-100 = 79 residues) + motif (30-35 = 6 residues)
+        # Total locked positions must exceed motif-only residues
+        chain_fixed = list(fixed_data.values())[0]["A"]
+        self.assertGreater(len(chain_fixed), 6)
+
+        # Now test with lock_vessel=False
+        out_unlocked = os.path.join(self.test_dir, "out_unlocked")
+        scaffolder_unlocked = ChimeraScaffolder(
+            donor_pdb=self.donor_pdb,
+            vessel_pdb=self.vessel_pdb,
+            motif_residues="30-35",
+            chimera_mode="replace",
+            vessel_replace_range="40-60",
+            lock_vessel=False,
+            num_designs=1,
+            out_dir=out_unlocked,
+            dry_run=True
+        )
+        res_unlocked = scaffolder_unlocked.run_pipeline()
+        self.assertEqual(res_unlocked["status"], "COMPLETED")
+        jsonl_files_unlocked = [
+            os.path.join(out_unlocked, "2_mpnn", f)
+            for f in os.listdir(os.path.join(out_unlocked, "2_mpnn"))
+            if f.endswith("_fixed_positions.jsonl")
+        ]
+        with open(jsonl_files_unlocked[0], "r", encoding="utf-8") as f:
+            fixed_data_unlocked = json.loads(f.readline())
+        chain_fixed_unlocked = list(fixed_data_unlocked.values())[0]["A"]
+        # Only 6 motif residues locked
+        self.assertEqual(len(chain_fixed_unlocked), 6)
+
+    def test_methodology_report_generation(self):
+        """Test automated methodology report generation in output directory."""
+        out_rep = os.path.join(self.test_dir, "out_rep")
+        scaffolder = ChimeraScaffolder(
+            donor_pdb=self.donor_pdb,
+            vessel_pdb=self.vessel_pdb,
+            motif_residues="30-35",
+            chimera_mode="replace",
+            vessel_replace_range="40-60",
+            out_dir=out_rep,
+            dry_run=True
+        )
+        scaffolder.run_pipeline()
+
+        rep1 = os.path.join(out_rep, "run_methodology.txt")
+        rep2 = os.path.join(out_rep, "methodology.txt")
+
+        self.assertTrue(os.path.isfile(rep1), "run_methodology.txt not found")
+        self.assertTrue(os.path.isfile(rep2), "methodology.txt not found")
+
+        with open(rep1, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn("AUTOSCAFFOLD: COMPUTATIONAL METHODOLOGY REPORT", content)
+        self.assertIn("Chimera Scaffolding", content)
+        self.assertIn("EXECUTION ENVIRONMENT & HARDWARE ARCHITECTURE", content)
+        self.assertIn("EXACT REPRODUCIBILITY CLI COMMAND", content)
+        self.assertIn("denoiser.noise_scale_ca=0.0", content)
+
+    def test_methodology_reporter_caching_and_buffering(self):
+        """Test hardware caching, timeout bounds, and buffered report generation."""
+        import scripts.methodology_reporter as mr
+
+        # Test initial hardware info
+        info1 = mr.get_system_hardware_info()
+        self.assertIsInstance(info1, dict)
+        self.assertIn("os", info1)
+        self.assertIn("cpu", info1)
+        self.assertIsNotNone(mr._SYSTEM_HARDWARE_CACHE)
+
+        # Mutate cache to ensure get_system_hardware_info returns cached copy instantly
+        mr._SYSTEM_HARDWARE_CACHE["cpu"] = "Cached_Test_CPU_Architecture"
+        info2 = mr.get_system_hardware_info()
+        self.assertEqual(info2["cpu"], "Cached_Test_CPU_Architecture")
+
+        # Test buffered generation & symlink/copy
+        out_buf = os.path.join(self.test_dir, "out_buffered_report")
+        mr.generate_methodology_report(
+            run_name="Cache_Buffer_Test",
+            pipeline_mode="Chimera Scaffolding",
+            output_dir=out_buf
+        )
+        f1 = os.path.join(out_buf, "run_methodology.txt")
+        f2 = os.path.join(out_buf, "methodology.txt")
+        self.assertTrue(os.path.isfile(f1))
+        self.assertTrue(os.path.isfile(f2) or os.path.islink(f2))
+        with open(f2, "r", encoding="utf-8") as f:
+            self.assertIn("Cached_Test_CPU_Architecture", f.read())
+
+        # Reset cache
+        mr._SYSTEM_HARDWARE_CACHE = None
 
 
 if __name__ == "__main__":

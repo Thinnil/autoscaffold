@@ -37,6 +37,9 @@ RMSD_THRESHOLD="1.0"
 PLDDT_THRESHOLD="75.0"
 OUT_DIR="outputs/chimera_scaffold"
 DRY_RUN=""
+LOCK_VESSEL_FLAG=""
+BACKGROUND_MODE=false
+ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,6 +57,8 @@ while [[ $# -gt 0 ]]; do
             echo -e "  --split_after NUM       Vessel residue split point for insert_loop (e.g. 54)"
             echo -e "  --linker_n RANGE        N-terminal linker range [Default: 6-10]"
             echo -e "  --linker_c RANGE        C-terminal linker range [Default: 6-10]"
+            echo -e "  --lock_vessel           Lock vessel framework residue positions in ProteinMPNN [Default: True]"
+            echo -e "  --no_lock_vessel        Allow ProteinMPNN to redesign vessel framework residues"
             echo -e "  --num_designs N         Number of RFdiffusion backbones [Default: 10]"
             echo -e "  --num_seqs N            ProteinMPNN sequences per backbone [Default: 2]"
             echo -e "  --mpnn_temp TEMP        ProteinMPNN sampling temperature [Default: 0.1]"
@@ -62,7 +67,12 @@ while [[ $# -gt 0 ]]; do
             echo -e "  --plddt_threshold VAL   pLDDT quality cutoff [Default: 75.0]"
             echo -e "  --out_dir DIR           Output directory [Default: outputs/chimera_scaffold]"
             echo -e "  --dry_run               Execute pipeline without GPU inference"
+            echo -e "  --background, -b        Run pipeline detached in background via nohup"
             exit 0
+            ;;
+        --background|-b)
+            BACKGROUND_MODE=true
+            shift
             ;;
         --input|-i)
             INPUT_FILE="$2"
@@ -127,6 +137,14 @@ while [[ $# -gt 0 ]]; do
         --out_dir|-o)
             OUT_DIR="$2"
             shift 2
+            ;;
+        --lock_vessel)
+            LOCK_VESSEL_FLAG="--lock_vessel"
+            shift
+            ;;
+        --no_lock_vessel)
+            LOCK_VESSEL_FLAG="--no_lock_vessel"
+            shift
             ;;
         --dry_run)
             DRY_RUN="--dry_run"
@@ -256,13 +274,60 @@ if [ -t 0 ]; then
     OUT_DIR=${INP_OD:-$OUT_DIR}
 fi
 
-if [ -z "$OUT_DIR" ] || [ "$OUT_DIR" = "/" ] || [ "$OUT_DIR" = "/*" ]; then
-    echo -e "${RED}[ERROR] Invalid output directory specified: '$OUT_DIR'.${NC}"
+ABS_OUT_DIR=$(realpath "$OUT_DIR" 2>/dev/null || echo "$OUT_DIR")
+if [ -z "$ABS_OUT_DIR" ] || [ "$ABS_OUT_DIR" = "/" ] || [ "$ABS_OUT_DIR" = "\\" ] || [[ "$ABS_OUT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+    echo -e "${RED}[ERROR] Invalid or dangerous output directory specified: '$OUT_DIR'.${NC}"
     exit 1
 fi
-
-ABS_OUT_DIR=$(realpath "$OUT_DIR" 2>/dev/null || echo "$OUT_DIR")
 mkdir -p "$ABS_OUT_DIR"
+
+PID_FILE="$ABS_OUT_DIR/run.pid"
+LOG_FILE="$ABS_OUT_DIR/run.log"
+
+# ------------------------------------------------------------------------------
+# 3.5 Background Execution Option
+# ------------------------------------------------------------------------------
+if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ]; then
+    read -p "▶ Do you want to run this workflow in the background? [y/N]: " RUN_BG
+    if [[ "$RUN_BG" =~ ^[Yy]$ ]]; then
+        BACKGROUND_MODE=true
+        if [ ${#ORIG_ARGS[@]} -eq 0 ]; then
+            BG_ARGS=(
+                "--input" "$ABS_INPUT_FILE"
+                "--donor_id" "$DONOR_ID"
+                "--vessel_id" "$VESSEL_ID"
+                "--motif_residues" "$MOTIF_RESIDUES"
+                "--mode" "$CHIMERA_MODE"
+                "--linker_n" "$LINKER_N"
+                "--linker_c" "$LINKER_C"
+                "--num_designs" "$NUM_DESIGNS"
+                "--num_seqs" "$NUM_SEQS"
+                "--mpnn_temp" "$MPNN_TEMP"
+                "--mpnn_batch_size" "$MPNN_BATCH_SIZE"
+                "--rmsd_threshold" "$RMSD_THRESHOLD"
+                "--plddt_threshold" "$PLDDT_THRESHOLD"
+                "--out_dir" "$ABS_OUT_DIR"
+            )
+            [ -n "$VESSEL_REPLACE_RANGE" ] && BG_ARGS+=("--replace_range" "$VESSEL_REPLACE_RANGE")
+            [ -n "$VESSEL_SPLIT_AFTER" ] && BG_ARGS+=("--split_after" "$VESSEL_SPLIT_AFTER")
+            [ -n "$DRY_RUN" ] && BG_ARGS+=("$DRY_RUN")
+            [ -n "$LOCK_VESSEL_FLAG" ] && BG_ARGS+=("$LOCK_VESSEL_FLAG")
+        else
+            BG_ARGS=("${ORIG_ARGS[@]}")
+        fi
+        nohup bash "$0" "${BG_ARGS[@]}" --background < /dev/null > "$LOG_FILE" 2>&1 &
+        BG_PID=$!
+        echo "$BG_PID" > "$PID_FILE"
+        echo -e "\n${CYAN}======================================================================${NC}"
+        echo -e "${GREEN}[✓] Workflow launched successfully in the background.${NC}"
+        echo -e "PID:             ${YELLOW}${BG_PID}${NC}"
+        echo -e "Log file:        ${CYAN}${LOG_FILE}${NC}"
+        echo -e "PID file:        ${CYAN}${PID_FILE}${NC}"
+        echo -e "Monitor command: ${BOLD}tail -f \"${LOG_FILE}\"${NC}"
+        echo -e "${CYAN}======================================================================${NC}\n"
+        exit 0
+    fi
+fi
 
 # ------------------------------------------------------------------------------
 # 4. Pipeline Execution
@@ -297,6 +362,10 @@ fi
 
 if [ -n "$DRY_RUN" ]; then
     CMD_ARGS+=("$DRY_RUN")
+fi
+
+if [ -n "$LOCK_VESSEL_FLAG" ]; then
+    CMD_ARGS+=("$LOCK_VESSEL_FLAG")
 fi
 
 # Activate environment if configured

@@ -92,6 +92,8 @@ PLDDT_CUTOFF="80.0"
 RMSD_CUTOFF="1.2"
 IPTM_CUTOFF="0.70"
 DRY_RUN=""
+BACKGROUND_MODE=false
+ORIG_ARGS=("$@")
 
 # Parse positional or named arguments if provided
 while [[ $# -gt 0 ]]; do
@@ -119,7 +121,12 @@ while [[ $# -gt 0 ]]; do
             echo -e "  --rmsd_cutoff VAL       Motif RMSD filter cutoff [Default: 1.2]"
             echo -e "  --iptm_cutoff VAL       ipTM filter cutoff [Default: 0.70]"
             echo -e "  --dry_run               Run pipeline without executing GPU inference"
+            echo -e "  --background, -b        Run pipeline detached in background via nohup"
             exit 0
+            ;;
+        --background|-b)
+            BACKGROUND_MODE=true
+            shift
             ;;
         --complex_pdb)
             COMPLEX_PDB="$2"
@@ -341,6 +348,53 @@ if [ -z "$ABS_OUT_DIR" ] || [ "$ABS_OUT_DIR" = "/" ] || [ "$ABS_OUT_DIR" = "\\" 
     exit 1
 fi
 mkdir -p "$ABS_OUT_DIR"
+
+PID_FILE="$ABS_OUT_DIR/run.pid"
+LOG_FILE="$ABS_OUT_DIR/run.log"
+
+# ------------------------------------------------------------------------------
+# 2.5 Background Execution Option
+# ------------------------------------------------------------------------------
+if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ]; then
+    read -p "▶ Do you want to run this workflow in the background? [y/N]: " RUN_BG
+    if [[ "$RUN_BG" =~ ^[Yy]$ ]]; then
+        BACKGROUND_MODE=true
+        if [ "$IS_INTERACTIVE" = true ]; then
+            BG_ARGS=(
+                "--complex_pdb" "$COMPLEX_PDB"
+                "--motif_chain" "$MOTIF_CHAIN"
+                "--motif_residues" "$MOTIF_RESIDUES"
+                "--min_total_len" "$MIN_LEN"
+                "--max_total_len" "$MAX_LEN"
+                "--num_designs" "$NUM_DESIGNS"
+                "--mpnn_seqs_per_bb" "$NUM_SEQS"
+                "--mpnn_batch_size" "$MPNN_BATCH_SIZE"
+                "--colabfold_batch_size" "$COLABFOLD_BATCH_SIZE"
+                "--colabfold_num_recycles" "$COLABFOLD_NUM_RECYCLES"
+                "--colabfold_num_models" "$COLABFOLD_NUM_MODELS"
+                "--plddt_cutoff" "$PLDDT_CUTOFF"
+                "--rmsd_cutoff" "$RMSD_CUTOFF"
+                "--iptm_cutoff" "$IPTM_CUTOFF"
+                "--out_dir" "$OUT_DIR"
+            )
+            [ -n "$TARGET_CHAIN" ] && BG_ARGS+=("--target_chain" "$TARGET_CHAIN")
+            [ -n "$DRY_RUN" ] && BG_ARGS+=("$DRY_RUN")
+        else
+            BG_ARGS=("${ORIG_ARGS[@]}")
+        fi
+        nohup bash "$0" "${BG_ARGS[@]}" --background < /dev/null > "$LOG_FILE" 2>&1 &
+        BG_PID=$!
+        echo "$BG_PID" > "$PID_FILE"
+        echo -e "\n${CYAN}======================================================================${NC}"
+        echo -e "${GREEN}[✓] Workflow launched successfully in the background.${NC}"
+        echo -e "PID:             ${YELLOW}${BG_PID}${NC}"
+        echo -e "Log file:        ${CYAN}${LOG_FILE}${NC}"
+        echo -e "PID file:        ${CYAN}${PID_FILE}${NC}"
+        echo -e "Monitor command: ${BOLD}tail -f \"${LOG_FILE}\"${NC}"
+        echo -e "${CYAN}======================================================================${NC}\n"
+        exit 0
+    fi
+fi
 
 PYTHON_ORCHESTRATOR="$SCRIPT_DIR/scripts/discontinuous_motif_scaffold.py"
 

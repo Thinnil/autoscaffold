@@ -20,6 +20,7 @@ if SCRIPT_DIR not in sys.path:
 
 from extract_fixed_motif import extract_motif_from_pdb  # noqa: E402
 from format_complex_fasta import get_pdb_chains_sequences  # noqa: E402
+from methodology_reporter import generate_methodology_report  # noqa: E402
 
 
 class DiscontinuousMotifScaffolder:
@@ -116,6 +117,62 @@ class DiscontinuousMotifScaffolder:
 
         with open(os.path.join(self.out_dir, "discontinuous_summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
+
+        # Generate Automated Methodology & Reproducibility Report
+        try:
+            repro_parts = [
+                "python scripts/discontinuous_motif_scaffold.py",
+                f"--complex_pdb \"{self.complex_pdb}\"",
+                f"--motif_chain \"{self.motif_chain}\"",
+                f"--motif_residues \"{self.motif_residues}\"",
+                f"--min_total_len {self.min_total_len}",
+                f"--max_total_len {self.max_total_len}",
+                f"--num_designs {self.num_designs}",
+                f"--mpnn_seqs_per_bb {self.mpnn_seqs_per_bb}",
+                f"--mpnn_batch_size {self.mpnn_batch_size}",
+                f"--out_dir \"{self.out_dir}\""
+            ]
+            if self.target_chain:
+                repro_parts.append(f"--target_chain \"{self.target_chain}\"")
+            if self.dry_run:
+                repro_parts.append("--dry_run")
+            repro_cmd = " ".join(repro_parts)
+
+            input_structs = {
+                "Complex PDB": self.complex_pdb,
+                "Motif Chain": self.motif_chain,
+                "Motif Residues": self.motif_residues,
+                "Motif Sequence": motif_info.get("sequence", "N/A")
+            }
+            if self.target_chain:
+                input_structs["Target Chain"] = self.target_chain
+
+            params = {
+                "Scaffold Min Length": self.min_total_len,
+                "Scaffold Max Length": self.max_total_len,
+                "Contig Formulation": contigs,
+                "Number of Designs": self.num_designs,
+                "ProteinMPNN Sequences Per Backbone": self.mpnn_seqs_per_bb,
+                "ProteinMPNN Batch Size": self.mpnn_batch_size
+            }
+
+            cand_summary = {
+                "status": "SUCCESS",
+                "total_candidates": self.num_designs,
+                "passing_candidates": self.num_designs if self.dry_run else "Pending Validation"
+            }
+
+            generate_methodology_report(
+                run_name="Discontinuous_Motif_Scaffolding_Execution",
+                pipeline_mode="Discontinuous Contact Motif Scaffolding",
+                output_dir=self.out_dir,
+                input_structures=input_structs,
+                parameters=params,
+                candidates_summary=cand_summary,
+                reproducibility_cmd=repro_cmd
+            )
+        except Exception as e:
+            print(f"[!] Warning: Failed to generate methodology report: {e}")
 
         return summary
 
