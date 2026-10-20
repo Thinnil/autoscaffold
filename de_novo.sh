@@ -7,6 +7,46 @@ trap 'echo -e "\n\n${YELLOW}[!] Operation cancelled by user.${NC}"; exit 130' IN
 
 # Resolve script directory and source shared environment
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Verify and self-heal scripts directory if missing
+if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
+    echo -e "\033[1;33m[!] AutoScaffold environment files not found in: $SCRIPT_DIR/scripts/\033[0m"
+    if [ -d "$SCRIPT_DIR/.git" ]; then
+        echo -e "\033[1;36m[+] Restoring missing repository files from git...\033[0m"
+        git -C "$SCRIPT_DIR" checkout HEAD -- scripts/ 2>/dev/null || git -C "$SCRIPT_DIR" pull origin main 2>/dev/null || true
+    fi
+    if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
+        echo -e "\033[1;36m[+] Downloading essential AutoScaffold scripts from GitHub repository...\033[0m"
+        mkdir -p "$SCRIPT_DIR/scripts"
+        RAW_BASE="https://raw.githubusercontent.com/Thinnil/autoscaffold/main/scripts"
+        CORE_SCRIPTS=(
+            "env_setup.sh"
+            "install_dependencies.sh"
+            "self_update.sh"
+            "diagnostics.sh"
+            "chimera_scaffold.py"
+            "discontinuous_motif_scaffold.py"
+            "methodology_reporter.py"
+            "pse_pdb_extractor.py"
+            "extract_fixed_motif.py"
+            "format_complex_fasta.py"
+            "kabsch_rmsd.py"
+        )
+        for s in "${CORE_SCRIPTS[@]}"; do
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL "$RAW_BASE/$s" -o "$SCRIPT_DIR/scripts/$s" 2>/dev/null || true
+            elif command -v wget >/dev/null 2>&1; then
+                wget -qO "$SCRIPT_DIR/scripts/$s" "$RAW_BASE/$s" 2>/dev/null || true
+            fi
+        done
+        chmod +x "$SCRIPT_DIR"/scripts/*.sh "$SCRIPT_DIR"/scripts/*.py 2>/dev/null || true
+    fi
+    if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
+        echo -e "\033[0;31m[ERROR] Could not locate or download 'scripts/env_setup.sh'.\033[0m"
+        exit 1
+    fi
+fi
+
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/scripts/env_setup.sh"
 
