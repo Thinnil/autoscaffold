@@ -110,14 +110,9 @@ sync_codebase() {
 
     if [ ! -d ".git" ]; then
         echo -e "${YELLOW}[!] Current directory is not a Git repository.${NC}"
-        if [ -f "autoscaffold_suite.sh" ]; then
-            echo -e "Initializing Git repo to link with remote..."
-            git init
-            git remote add origin "$REPO_URL" 2>/dev/null || git remote set-url origin "$REPO_URL"
-        else
-            echo -e "Cloning AutoScaffold repository into current folder..."
-            git clone "$REPO_URL" .
-        fi
+        echo -e "Initializing Git repository and linking with remote..."
+        git init
+        git remote add origin "$REPO_URL" 2>/dev/null || git remote set-url origin "$REPO_URL"
     fi
 
     echo -e "Fetching latest release from $REPO_URL ($BRANCH)..."
@@ -126,32 +121,38 @@ sync_codebase() {
         return 0
     }
 
-    LOCAL_HASH=$(git rev-parse HEAD 2>/dev/null || echo "none")
-    REMOTE_HASH=$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo "unknown")
-
-    if [[ "$LOCAL_HASH" == "$REMOTE_HASH" && "$LOCAL_HASH" != "none" ]]; then
-        echo -e "${GREEN}[✓] AutoScaffold codebase is already up to date! (${LOCAL_HASH:0:8})${NC}"
+    # If HEAD is not set (freshly initialized repository in non-empty directory), checkout origin/main directly!
+    if ! git rev-parse HEAD >/dev/null 2>&1; then
+        echo -e "Checking out AutoScaffold files from $BRANCH..."
+        git checkout -f -B "$BRANCH" "origin/$BRANCH"
     else
-        echo -e "${YELLOW}New version detected on remote:${NC}"
-        echo -e "  Local commit:  ${LOCAL_HASH:0:8}"
-        echo -e "  Remote commit: ${REMOTE_HASH:0:8}"
-        
-        # Backup existing user scripts
-        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        BACKUP_DIR="$INSTALL_DIR/.backup_$TIMESTAMP"
-        mkdir -p "$BACKUP_DIR"
-        for f in autoscaffold.sh de_novo.sh autoscaffold_suite.sh chimera_scaffold.sh discontinuous_scaffold.sh; do
-            [ -f "$INSTALL_DIR/$f" ] && cp "$INSTALL_DIR/$f" "$BACKUP_DIR/"
-        done
-        echo -e "Active scripts backed up to: ${CYAN}$BACKUP_DIR${NC}"
+        LOCAL_HASH=$(git rev-parse HEAD 2>/dev/null || echo "none")
+        REMOTE_HASH=$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo "unknown")
 
-        # Stash and update
-        if ! git diff-index --quiet HEAD -- 2>/dev/null; then
-            git stash save "Auto-update stash $TIMESTAMP" 2>/dev/null || true
+        if [[ "$LOCAL_HASH" == "$REMOTE_HASH" && "$LOCAL_HASH" != "none" ]]; then
+            echo -e "${GREEN}[✓] AutoScaffold codebase is already up to date! (${LOCAL_HASH:0:8})${NC}"
+        else
+            echo -e "${YELLOW}New version detected on remote:${NC}"
+            echo -e "  Local commit:  ${LOCAL_HASH:0:8}"
+            echo -e "  Remote commit: ${REMOTE_HASH:0:8}"
+            
+            # Backup existing user scripts
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            BACKUP_DIR="$INSTALL_DIR/.backup_$TIMESTAMP"
+            mkdir -p "$BACKUP_DIR"
+            for f in autoscaffold.sh de_novo.sh autoscaffold_suite.sh chimera_scaffold.sh discontinuous_scaffold.sh; do
+                [ -f "$INSTALL_DIR/$f" ] && cp "$INSTALL_DIR/$f" "$BACKUP_DIR/"
+            done
+            echo -e "Active scripts backed up to: ${CYAN}$BACKUP_DIR${NC}"
+
+            # Stash and update
+            if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+                git stash save "Auto-update stash $TIMESTAMP" 2>/dev/null || true
+            fi
+            git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH" "origin/$BRANCH"
+            git pull origin "$BRANCH"
+            echo -e "${GREEN}[✓] Codebase successfully updated to ${REMOTE_HASH:0:8}!${NC}"
         fi
-        git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH" "origin/$BRANCH"
-        git pull origin "$BRANCH"
-        echo -e "${GREEN}[✓] Codebase successfully updated to ${REMOTE_HASH:0:8}!${NC}"
     fi
 
     # Set execute permissions
