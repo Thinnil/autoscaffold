@@ -128,27 +128,25 @@ class ChimeraScaffolder:
         if self.input_file:
             # Single input (PSE or multi-chain PDB)
             extracted = extract_file(self.input_file, work_prep)
+            keys_list = list(extracted.keys())
 
-            # Match donor_id and vessel_id
-            if self.donor_id in extracted:
-                self.working_donor_pdb = extracted[self.donor_id]
-            else:
-                # Look for matching key case-insensitively or first
-                matched = [f for k, f in extracted.items() if k.lower() == self.donor_id.lower()]
-                self.working_donor_pdb = matched[0] if matched else list(extracted.values())[0]
-
-            if self.vessel_id in extracted:
-                self.working_vessel_pdb = extracted[self.vessel_id]
-            else:
-                matched = [f for k, f in extracted.items() if k.lower() == self.vessel_id.lower()]
+            def resolve_entity(val: str, fallback_idx: int = 0) -> str:
+                s = str(val).strip()
+                if s.isdigit():
+                    idx = int(s) - 1
+                    if 0 <= idx < len(keys_list):
+                        return extracted[keys_list[idx]]
+                if s in extracted:
+                    return extracted[s]
+                matched = [extracted[k] for k in keys_list if k.lower() == s.lower()]
                 if matched:
-                    self.working_vessel_pdb = matched[0]
-                elif len(extracted) > 1:
-                    # Select second
-                    items = [f for k, f in extracted.items() if f != self.working_donor_pdb]
-                    self.working_vessel_pdb = items[0] if items else self.working_donor_pdb
-                else:
-                    self.working_vessel_pdb = self.working_donor_pdb
+                    return matched[0]
+                if 0 <= fallback_idx < len(keys_list):
+                    return extracted[keys_list[fallback_idx]]
+                return list(extracted.values())[0] if extracted else ""
+
+            self.working_donor_pdb = resolve_entity(self.donor_id, 0)
+            self.working_vessel_pdb = resolve_entity(self.vessel_id, 1 if len(keys_list) > 1 else 0)
 
         else:
             if not self.donor_pdb or not os.path.isfile(self.donor_pdb):
@@ -178,9 +176,16 @@ class ChimeraScaffolder:
 
     def parse_motif_ranges(self) -> List[Tuple[int, int]]:
         """
-        Parses motif residue intervals, e.g. '30-45,78-82'.
+        Parses motif residue intervals, e.g. '30-45,78-82' or 'all'.
         Returns sorted contiguous intervals [(start, end), ...].
         """
+        motif_clean = str(self.motif_residues).strip().lower()
+        if motif_clean in ("all", "full", "whole", "100%", "*"):
+            d_min, d_max = self.donor_metadata["range"]
+            intervals = [(d_min, d_max)]
+            self.preserved_donor_segments = intervals
+            return intervals
+
         ordered_tuples = parse_residue_spec(self.motif_residues, default_chain=self.donor_chain_id)
         if not ordered_tuples:
             raise ValueError(f"No valid residues found in motif specification: '{self.motif_residues}'")

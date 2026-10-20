@@ -245,31 +245,63 @@ for k, v in objs.items():
 # ------------------------------------------------------------------------------
 if [ -z "$DONOR_ID" ]; then
     echo -e ""
-    read -p "▶ 2. Select Donor Object/Chain ID (contains desired active 3D motif): " DONOR_ID
+    read -p "▶ 2. Select Donor Object/Chain ID (contains desired active 3D motif) [e.g. 4 or 7ZUB_chain_D]: " DONOR_ID
 fi
 DONOR_ID=${DONOR_ID:-A}
+if [[ "$DONOR_ID" =~ ^[0-9]+$ ]]; then
+    RESOLVED_DONOR=$(echo "$INSPECT_JSON" | python -c "
+import sys, json
+data = json.load(sys.stdin)
+objs = list(data.get('objects', {}).keys())
+idx = int('$DONOR_ID') - 1
+if 0 <= idx < len(objs):
+    print(objs[idx])
+else:
+    print('$DONOR_ID')
+" 2>/dev/null || true)
+    [ -n "$RESOLVED_DONOR" ] && DONOR_ID="$RESOLVED_DONOR"
+fi
+
 if [[ ! "$DONOR_ID" =~ ^[a-zA-Z0-9_\-]+$ ]]; then
     echo -e "${RED}[ERROR] Invalid Donor ID '$DONOR_ID'. Must contain only alphanumeric characters, underscores, or hyphens.${NC}"
     exit 1
 fi
+echo -e "  ${GREEN}[✓] Selected Donor:${NC} ${BOLD}$DONOR_ID${NC}"
 
 if [ -z "$MOTIF_RESIDUES" ]; then
-    echo -e "   Examples: '30-45', '30-45,78-82', 'A30-A45'"
-    read -p "▶ 3. Specify Donor Residues to preserve in 3D: " MOTIF_RESIDUES
+    echo -e "   Examples: 'all' (preserve entire donor structure), '30-45', '30-45,78-82'"
+    read -p "▶ 3. Specify Donor Residues to preserve in 3D [Default: all]: " MOTIF_RESIDUES
 fi
+MOTIF_RESIDUES=${MOTIF_RESIDUES:-all}
 if [ -z "$MOTIF_RESIDUES" ]; then
     echo -e "${RED}[ERROR] Motif residues cannot be empty.${NC}"
     exit 1
 fi
+echo -e "  ${GREEN}[✓] Preserved Motif:${NC} ${BOLD}$MOTIF_RESIDUES${NC}"
 
 if [ -z "$VESSEL_ID" ]; then
-    read -p "▶ 4. Select Recipient / Vessel Object/Chain ID: " VESSEL_ID
+    read -p "▶ 4. Select Recipient / Vessel Object/Chain ID [e.g. 1 or 7ZUB_chain_A]: " VESSEL_ID
 fi
 VESSEL_ID=${VESSEL_ID:-B}
+if [[ "$VESSEL_ID" =~ ^[0-9]+$ ]]; then
+    RESOLVED_VESSEL=$(echo "$INSPECT_JSON" | python -c "
+import sys, json
+data = json.load(sys.stdin)
+objs = list(data.get('objects', {}).keys())
+idx = int('$VESSEL_ID') - 1
+if 0 <= idx < len(objs):
+    print(objs[idx])
+else:
+    print('$VESSEL_ID')
+" 2>/dev/null || true)
+    [ -n "$RESOLVED_VESSEL" ] && VESSEL_ID="$RESOLVED_VESSEL"
+fi
+
 if [[ ! "$VESSEL_ID" =~ ^[a-zA-Z0-9_\-]+$ ]]; then
     echo -e "${RED}[ERROR] Invalid Vessel ID '$VESSEL_ID'. Must contain only alphanumeric characters, underscores, or hyphens.${NC}"
     exit 1
 fi
+echo -e "  ${GREEN}[✓] Selected Vessel:${NC} ${BOLD}$VESSEL_ID${NC}"
 
 if [ -t 0 ] && [ "$CHIMERA_MODE" = "replace" ] && [ -z "$VESSEL_REPLACE_RANGE" ]; then
     echo -e "\n${YELLOW}--- Chimera Architecture Modes ---${NC}"
