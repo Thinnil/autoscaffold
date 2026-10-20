@@ -118,7 +118,12 @@ if [[ "$BUILD_ENVS" =~ ^[Yy]$ ]]; then
 
     # Create ColabFold env
     echo -e "\nConfiguring ColabFold environment ($CONDA_ENV_COLABFOLD)..."
-    "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_COLABFOLD" python=3.10 colabfold=1.5.2 openmm=7.7.0 pdbfixer=1.9 kalign2=2.04 -c conda-forge -c bioconda || true
+    "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_COLABFOLD" python=3.10 openmm pdbfixer kalign2 -c conda-forge -c bioconda || \
+    "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_COLABFOLD" python=3.10 openmm -c conda-forge || true
+
+    echo -e "Installing colabfold package into $CONDA_ENV_COLABFOLD via pip..."
+    "$MICROMAMBA_BIN" run -n "$CONDA_ENV_COLABFOLD" pip install --no-warn-conflicts "colabfold[alphafold-minus-jax]" 2>/dev/null || \
+    "$MICROMAMBA_BIN" run -n "$CONDA_ENV_COLABFOLD" pip install --no-warn-conflicts colabfold 2>/dev/null || true
 
     echo -e "\n${GREEN}[✓] Environments configured successfully!${NC}"
 fi

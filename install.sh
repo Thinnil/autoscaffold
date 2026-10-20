@@ -287,7 +287,12 @@ build_environments() {
 
     # 3. ColabFold Env
     echo -e "\nConfiguring ColabFold validation environment ($CONDA_ENV_COLABFOLD)..."
-    "$CONDA_BIN" create -y -n "$CONDA_ENV_COLABFOLD" python=3.10 colabfold=1.5.2 openmm=7.7.0 pdbfixer=1.9 kalign2=2.04 -c conda-forge -c bioconda || true
+    "$CONDA_BIN" create -y -n "$CONDA_ENV_COLABFOLD" python=3.10 openmm pdbfixer kalign2 -c conda-forge -c bioconda || \
+    "$CONDA_BIN" create -y -n "$CONDA_ENV_COLABFOLD" python=3.10 openmm -c conda-forge || true
+
+    echo -e "Installing colabfold package into $CONDA_ENV_COLABFOLD via pip..."
+    "$CONDA_BIN" run -n "$CONDA_ENV_COLABFOLD" pip install --no-warn-conflicts "colabfold[alphafold-minus-jax]" 2>/dev/null || \
+    "$CONDA_BIN" run -n "$CONDA_ENV_COLABFOLD" pip install --no-warn-conflicts colabfold 2>/dev/null || true
 
     echo -e "\n${GREEN}[✓] Environments configured successfully!${NC}"
 }
