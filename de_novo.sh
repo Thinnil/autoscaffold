@@ -229,10 +229,14 @@ activate_env "$CONDA_ENV_RFDIFF"
 
 if [ ! -d "$RFDIFF_DIR" ] || [ ! -f "$RFDIFF_DIR/scripts/run_inference.py" ]; then
     echo -e "${RED}[ERROR] RFdiffusion script not found at: $RFDIFF_DIR/scripts/run_inference.py${NC}"
-    if [ -t 0 ] && [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ]; then
+    if [ -t 0 ]; then
         read -p "▶ Would you like to run the Automatic Dependency Installer now? [y/N]: " RUN_INST
         if [[ "$RUN_INST" =~ ^[Yy]$ ]]; then
-            bash "$SCRIPT_DIR/scripts/install_dependencies.sh"
+            if [ -f "$SCRIPT_DIR/install.sh" ]; then
+                bash "$SCRIPT_DIR/install.sh" --full
+            elif [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ]; then
+                bash "$SCRIPT_DIR/scripts/install_dependencies.sh"
+            fi
             # shellcheck disable=SC1091
             source "$SCRIPT_DIR/scripts/env_setup.sh"
         fi
@@ -284,10 +288,14 @@ activate_env "$CONDA_ENV_MPNN"
 
 if [ ! -d "$MPNN_DIR" ] || [ ! -f "$MPNN_DIR/protein_mpnn_run.py" ]; then
     echo -e "${RED}[ERROR] ProteinMPNN not found at: $MPNN_DIR/protein_mpnn_run.py${NC}"
-    if [ -t 0 ] && [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ]; then
+    if [ -t 0 ]; then
         read -p "▶ Would you like to run the Automatic Dependency Installer now? [y/N]: " RUN_INST
         if [[ "$RUN_INST" =~ ^[Yy]$ ]]; then
-            bash "$SCRIPT_DIR/scripts/install_dependencies.sh"
+            if [ -f "$SCRIPT_DIR/install.sh" ]; then
+                bash "$SCRIPT_DIR/install.sh" --full
+            elif [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ]; then
+                bash "$SCRIPT_DIR/scripts/install_dependencies.sh"
+            fi
             # shellcheck disable=SC1091
             source "$SCRIPT_DIR/scripts/env_setup.sh"
         fi

@@ -6,6 +6,29 @@ AutoScaffold provides a unified, production-grade terminal interface (TUI) and m
 
 ---
 
+## ⚡ One-File Setup & Maintenance (`install.sh`)
+
+AutoScaffold includes a unified standalone installer and maintenance orchestrator (`install.sh`) that can run from any directory:
+
+```bash
+# Option A: One-line bootstrap on a fresh Linux machine:
+curl -fsSL https://raw.githubusercontent.com/Thinnil/autoscaffold/main/install.sh -o install.sh && bash install.sh
+
+# Option B: Run inside an existing repository:
+./install.sh
+```
+
+### What `install.sh` handles automatically:
+1. **System & GPU Diagnostics**: Audits Linux kernel, architecture, RAM, NVIDIA GPU, and driver CUDA compatibility.
+2. **Codebase Synchronization**: Automatically clones or updates the repository, preserving user weights and custom configs.
+3. **Zero-Root Micromamba**: Bootstraps an isolated `micromamba` executable into `./envs/bin/` if Conda is not installed.
+4. **Tool Management**: Clones and configures RFdiffusion and ProteinMPNN into `./tools/`.
+5. **Model Weights**: Downloads and validates all official neural network weights (`Base_ckpt.pt`, etc.).
+6. **Environment Generation**: Builds dedicated conda environments (`SE3nv`, `mlfold`, `colabfold`).
+7. **In-Place Updates**: Run `./install.sh update` at any time to pull and apply the latest GitHub releases safely.
+
+---
+
 ## 🌟 Highlights & Features
 
 - **Unified Master Suite (`autoscaffold_suite.sh`)**:

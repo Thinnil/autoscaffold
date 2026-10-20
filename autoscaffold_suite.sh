@@ -99,12 +99,20 @@ if [ ${#ARGS[@]} -gt 0 ]; then
             exec bash "$SCRIPT_DIR/scripts/diagnostics.sh" "${CMD_REST[@]}"
             ;;
         install|setup|deps)
-            [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/install_dependencies.sh${NC}"; exit 1; }
-            exec bash "$SCRIPT_DIR/scripts/install_dependencies.sh" "${CMD_REST[@]}"
+            if [ -f "$SCRIPT_DIR/install.sh" ]; then
+                exec bash "$SCRIPT_DIR/install.sh" "${CMD_REST[@]}"
+            else
+                [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/install_dependencies.sh${NC}"; exit 1; }
+                exec bash "$SCRIPT_DIR/scripts/install_dependencies.sh" "${CMD_REST[@]}"
+            fi
             ;;
         update|upgrade)
-            [ -f "$SCRIPT_DIR/scripts/self_update.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/self_update.sh${NC}"; exit 1; }
-            exec bash "$SCRIPT_DIR/scripts/self_update.sh" "${CMD_REST[@]}"
+            if [ -f "$SCRIPT_DIR/install.sh" ]; then
+                exec bash "$SCRIPT_DIR/install.sh" update "${CMD_REST[@]}"
+            else
+                [ -f "$SCRIPT_DIR/scripts/self_update.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/self_update.sh${NC}"; exit 1; }
+                exec bash "$SCRIPT_DIR/scripts/self_update.sh" "${CMD_REST[@]}"
+            fi
             ;;
         help|--help|-h)
             echo -e "${BOLD}AutoScaffold Master Suite CLI${NC}"
@@ -176,12 +184,20 @@ case "$WORKFLOW_CHOICE" in
         exec bash "$SCRIPT_DIR/scripts/diagnostics.sh"
         ;;
     6)
-        [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/install_dependencies.sh${NC}"; exit 1; }
-        exec bash "$SCRIPT_DIR/scripts/install_dependencies.sh"
+        if [ -f "$SCRIPT_DIR/install.sh" ]; then
+            exec bash "$SCRIPT_DIR/install.sh"
+        else
+            [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/install_dependencies.sh${NC}"; exit 1; }
+            exec bash "$SCRIPT_DIR/scripts/install_dependencies.sh"
+        fi
         ;;
     7)
-        [ -f "$SCRIPT_DIR/scripts/self_update.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/self_update.sh${NC}"; exit 1; }
-        exec bash "$SCRIPT_DIR/scripts/self_update.sh"
+        if [ -f "$SCRIPT_DIR/install.sh" ]; then
+            exec bash "$SCRIPT_DIR/install.sh" update
+        else
+            [ -f "$SCRIPT_DIR/scripts/self_update.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/self_update.sh${NC}"; exit 1; }
+            exec bash "$SCRIPT_DIR/scripts/self_update.sh"
+        fi
         ;;
     8|q|quit|exit)
         echo -e "\n${CYAN}Exiting AutoScaffold Suite. Happy designing!${NC}\n"
