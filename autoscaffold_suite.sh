@@ -54,6 +54,14 @@ if [ ${#ARGS[@]} -gt 0 ]; then
             [ -f "$SCRIPT_DIR/scripts/diagnostics.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/diagnostics.sh${NC}"; exit 1; }
             exec bash "$SCRIPT_DIR/scripts/diagnostics.sh" "${CMD_REST[@]}"
             ;;
+        install|setup|deps)
+            [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/install_dependencies.sh${NC}"; exit 1; }
+            exec bash "$SCRIPT_DIR/scripts/install_dependencies.sh" "${CMD_REST[@]}"
+            ;;
+        update|upgrade)
+            [ -f "$SCRIPT_DIR/scripts/self_update.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/self_update.sh${NC}"; exit 1; }
+            exec bash "$SCRIPT_DIR/scripts/self_update.sh" "${CMD_REST[@]}"
+            ;;
         help|--help|-h)
             echo -e "${BOLD}AutoScaffold Master Suite CLI${NC}"
             echo -e "Usage:"
@@ -64,6 +72,8 @@ if [ ${#ARGS[@]} -gt 0 ]; then
             echo -e "  discontinuous     Discontinuous Contact Motif Scaffolding"
             echo -e "  chimera           Chimera Scaffolding: Graft Motif into Vessel Protein (PDB/PSE)"
             echo -e "  diagnostics       Run environment & dependency diagnostic checks"
+            echo -e "  install           Run automated dependency, tool, and environment installer"
+            echo -e "  update            Check and apply in-place updates from GitHub"
             echo -e "\nOptions:"
             echo -e "  --background, -b  Run selected workflow in background"
             echo -e "\nRun without arguments to launch the interactive TUI menu."
@@ -71,7 +81,7 @@ if [ ${#ARGS[@]} -gt 0 ]; then
             ;;
         *)
             echo -e "${RED}[ERROR] Unknown subcommand: '$SUBCMD'${NC}"
-            echo -e "Available subcommands: motif, binder, discontinuous, chimera, diagnostics, help"
+            echo -e "Available subcommands: motif, binder, discontinuous, chimera, diagnostics, install, update, help"
             exit 1
             ;;
     esac
@@ -93,10 +103,12 @@ echo -e "  ${GREEN}[2]${NC} 🎯 De Novo Target-Binder Design (Interface hotspot
 echo -e "  ${GREEN}[3]${NC} 🧩 Discontinuous Binding Surface Scaffolding"
 echo -e "  ${GREEN}[4]${NC} 🧬 Chimera Scaffolding: Graft Motif into Vessel Protein (PDB/PSE)"
 echo -e "  ${GREEN}[5]${NC} 🩺 System Diagnostics & Environment Pre-Flight Checks"
-echo -e "  ${GREEN}[6]${NC} 🚪 Exit"
+echo -e "  ${GREEN}[6]${NC} 📦 Automatic Dependency & Environment Installer"
+echo -e "  ${GREEN}[7]${NC} 🔄 In-Place Self-Update & GitHub Upgrade"
+echo -e "  ${GREEN}[8]${NC} 🚪 Exit"
 echo -e ""
 
-read -p "▶ Enter selection [1-6]: " WORKFLOW_CHOICE
+read -p "▶ Enter selection [1-8]: " WORKFLOW_CHOICE
 
 case "$WORKFLOW_CHOICE" in
     1)
@@ -119,7 +131,15 @@ case "$WORKFLOW_CHOICE" in
         [ -f "$SCRIPT_DIR/scripts/diagnostics.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/diagnostics.sh${NC}"; exit 1; }
         exec bash "$SCRIPT_DIR/scripts/diagnostics.sh"
         ;;
-    6|q|quit|exit)
+    6)
+        [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/install_dependencies.sh${NC}"; exit 1; }
+        exec bash "$SCRIPT_DIR/scripts/install_dependencies.sh"
+        ;;
+    7)
+        [ -f "$SCRIPT_DIR/scripts/self_update.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/self_update.sh${NC}"; exit 1; }
+        exec bash "$SCRIPT_DIR/scripts/self_update.sh"
+        ;;
+    8|q|quit|exit)
         echo -e "\n${CYAN}Exiting AutoScaffold Suite. Happy designing!${NC}\n"
         exit 0
         ;;

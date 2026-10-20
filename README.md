@@ -66,7 +66,9 @@ Select a workflow to launch:
   [3] 🧩 Discontinuous Binding Surface Scaffolding
   [4] 🧬 Chimera Scaffolding: Graft Motif into Vessel Protein (PDB/PSE)
   [5] 🩺 System Diagnostics & Environment Pre-Flight Checks
-  [6] 🚪 Exit
+  [6] 📦 Automatic Dependency & Environment Installer
+  [7] 🔄 In-Place Self-Update & GitHub Upgrade
+  [8] 🚪 Exit
 ```
 
 ---
@@ -186,6 +188,18 @@ python scripts/discontinuous_motif_scaffold.py \
 ### 5. Diagnostics & Health Check
 ```bash
 ./autoscaffold_suite.sh diagnostics
+```
+
+### 6. Automated Dependency & Environment Installer
+Automatically bootstraps micromamba, clones RFdiffusion & ProteinMPNN into `./tools/`, downloads weights, and configures environments into `./envs/`:
+```bash
+./autoscaffold_suite.sh install
+```
+
+### 7. In-Place Self-Update & GitHub Upgrade
+Checks remote GitHub repository for new commits, backs up active scripts, and merges updates:
+```bash
+./autoscaffold_suite.sh update
 ```
 
 ---

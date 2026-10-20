@@ -189,8 +189,18 @@ activate_env "$CONDA_ENV_RFDIFF"
 
 if [ ! -d "$RFDIFF_DIR" ] || [ ! -f "$RFDIFF_DIR/scripts/run_inference.py" ]; then
     echo -e "${RED}[ERROR] RFdiffusion script not found at: $RFDIFF_DIR/scripts/run_inference.py${NC}"
-    echo -e "Please configure RFDIFF_DIR in config.env or run the dependency installer."
-    exit 1
+    if [ -t 0 ] && [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ]; then
+        read -p "▶ Would you like to run the Automatic Dependency Installer now? [y/N]: " RUN_INST
+        if [[ "$RUN_INST" =~ ^[Yy]$ ]]; then
+            bash "$SCRIPT_DIR/scripts/install_dependencies.sh"
+            # shellcheck disable=SC1091
+            source "$SCRIPT_DIR/scripts/env_setup.sh"
+        fi
+    fi
+    if [ ! -d "$RFDIFF_DIR" ] || [ ! -f "$RFDIFF_DIR/scripts/run_inference.py" ]; then
+        echo -e "${RED}Please configure RFDIFF_DIR in config.env or run: ./autoscaffold_suite.sh install${NC}"
+        exit 1
+    fi
 fi
 
 CURRENT_PWD=$(pwd)
@@ -234,8 +244,18 @@ activate_env "$CONDA_ENV_MPNN"
 
 if [ ! -d "$MPNN_DIR" ] || [ ! -f "$MPNN_DIR/protein_mpnn_run.py" ]; then
     echo -e "${RED}[ERROR] ProteinMPNN not found at: $MPNN_DIR/protein_mpnn_run.py${NC}"
-    echo -e "Please configure MPNN_DIR in config.env or run the dependency installer."
-    exit 1
+    if [ -t 0 ] && [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ]; then
+        read -p "▶ Would you like to run the Automatic Dependency Installer now? [y/N]: " RUN_INST
+        if [[ "$RUN_INST" =~ ^[Yy]$ ]]; then
+            bash "$SCRIPT_DIR/scripts/install_dependencies.sh"
+            # shellcheck disable=SC1091
+            source "$SCRIPT_DIR/scripts/env_setup.sh"
+        fi
+    fi
+    if [ ! -d "$MPNN_DIR" ] || [ ! -f "$MPNN_DIR/protein_mpnn_run.py" ]; then
+        echo -e "${RED}Please configure MPNN_DIR in config.env or run: ./autoscaffold_suite.sh install${NC}"
+        exit 1
+    fi
 fi
 
 if [ -n "$ABS_OUT_DIR" ] && [ -d "${ABS_OUT_DIR}/2_mpnn_inputs/target_folder" ]; then
