@@ -1,9 +1,10 @@
 # Technical Specification: Chimera Scaffolding from PDB or PyMOL (.pse) Files
 
-- **Document Version**: 1.0.0
+- **Document Version**: 2.0.0 (Extended with Global Launcher & Structural Continuity)
 - **Status**: Approved Technical Specification (Prompt Polisher Step)
-- **Target Subsystem**: `autoscaffold` suite (`autoscaffold_suite.sh`, `scripts/chimera_scaffold.py`, `scripts/pse_pdb_extractor.py`)
+- **Target Subsystem**: `autoscaffold` suite (`autoscaffold`, `autoscaffold_suite.sh`, `scripts/chimera_scaffold.py`, `scripts/pse_pdb_extractor.py`)
 - **Primary AI & Structural Engines**: RFdiffusion, ProteinMPNN, PyMOL/Biopython parser, Kabsch Alignment / RMSD Validator
+- **Companion Specifications**: [CONTINUITY_AND_LAUNCHER_SPEC.md](file:///C:/Users/g_san/.gemini/antigravity/scratch/autoscaffold/CONTINUITY_AND_LAUNCHER_SPEC.md)
 
 ---
 

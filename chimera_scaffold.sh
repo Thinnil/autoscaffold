@@ -7,7 +7,11 @@ set -e
 trap 'echo -e "\n\n${YELLOW}[!] Operation cancelled by user.${NC}"; exit 130' INT
 
 # Resolve script directory and source shared environment
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" = "/" ] || [ "$SCRIPT_DIR" = "\\" ] || [[ "$SCRIPT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+    echo -e "\033[0;31m[ERROR] Dangerous or invalid SCRIPT_DIR: '$SCRIPT_DIR'\033[0m"
+    exit 1
+fi
 
 # Verify and self-heal scripts directory if missing
 if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
@@ -40,7 +44,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
                 wget -qO "$SCRIPT_DIR/scripts/$s" "$RAW_BASE/$s" 2>/dev/null || true
             fi
         done
-        chmod +x "$SCRIPT_DIR"/scripts/*.sh "$SCRIPT_DIR"/scripts/*.py 2>/dev/null || true
+        chmod 755 "$SCRIPT_DIR"/scripts/*.sh "$SCRIPT_DIR"/scripts/*.py 2>/dev/null || true
     fi
     if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
         echo -e "\033[0;31m[ERROR] Could not locate or download 'scripts/env_setup.sh'.\033[0m"
@@ -50,6 +54,36 @@ fi
 
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/scripts/env_setup.sh"
+
+# Fast canonical path resolution minimizing external process forks
+fast_realpath() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        echo ""
+        return
+    fi
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$target" 2>/dev/null && return
+    elif command -v readlink >/dev/null 2>&1; then
+        readlink -f "$target" 2>/dev/null && return
+    fi
+    if [ -d "$target" ]; then
+        (cd -P "$target" 2>/dev/null && echo "$PWD")
+    elif [ -f "$target" ]; then
+        local dir="${target%/*}"
+        local file="${target##*/}"
+        [ "$dir" = "$target" ] && dir="."
+        local abs_dir
+        abs_dir="$(cd -P "$dir" 2>/dev/null && echo "$PWD")"
+        if [ -n "$abs_dir" ]; then
+            echo "$abs_dir/$file"
+        else
+            echo "$target"
+        fi
+    else
+        echo "$target"
+    fi
+}
 
 echo -e "${CYAN}======================================================================${NC}"
 echo -e "${CYAN} 🧬 AUTOSCAFFOLD: CHIMERA SCAFFOLDING WIZARD 🧬                         ${NC}"
@@ -61,6 +95,8 @@ echo -e "Tip: Press ${YELLOW}Ctrl + C${NC} at any time to cancel.\n"
 # 1. Parameter Parsing (CLI flags support)
 # ------------------------------------------------------------------------------
 INPUT_FILE=""
+DONOR_PDB=""
+VESSEL_PDB=""
 DONOR_ID=""
 VESSEL_ID=""
 MOTIF_RESIDUES=""
@@ -89,6 +125,9 @@ while [[ $# -gt 0 ]]; do
             echo -e "  $0 [options...]"
             echo -e "\nOptions:"
             echo -e "  --input FILE            Path to input file (.pdb or .pse)"
+            echo -e "  --input_file FILE       Alias for --input"
+            echo -e "  --donor_pdb FILE        Path to standalone donor PDB"
+            echo -e "  --vessel_pdb FILE       Path to standalone vessel PDB"
             echo -e "  --donor_id ID           Donor chain or object name (containing active motif)"
             echo -e "  --vessel_id ID          Vessel / recipient chain or object name"
             echo -e "  --motif_residues RES    Donor motif residues (e.g. '30-45' or '30-45,78-82')"
@@ -114,8 +153,16 @@ while [[ $# -gt 0 ]]; do
             BACKGROUND_MODE=true
             shift
             ;;
-        --input|-i)
+        --input|--input_file|-i)
             INPUT_FILE="$2"
+            shift 2
+            ;;
+        --donor_pdb)
+            DONOR_PDB="$2"
+            shift 2
+            ;;
+        --vessel_pdb)
+            VESSEL_PDB="$2"
             shift 2
             ;;
         --donor_id)
@@ -202,63 +249,82 @@ done
 # ------------------------------------------------------------------------------
 # 2. Interactive Input File Selection & Inspection
 # ------------------------------------------------------------------------------
-if [ -z "$INPUT_FILE" ]; then
-    read -e -p "▶ 1. Path to input file (.pdb or PyMOL session .pse): " INPUT_FILE
+if [ -z "$INPUT_FILE" ] && ([ -z "$DONOR_PDB" ] || [ -z "$VESSEL_PDB" ]); then
+    read -r -e -p "▶ 1. Path to input file (.pdb or PyMOL session .pse): " INPUT_FILE
 fi
 
-if [ ! -f "$INPUT_FILE" ]; then
-    echo -e "${RED}[ERROR] Input file not found: '$INPUT_FILE'${NC}"
-    exit 1
+# Canonicalize standalone donor/vessel PDB files if provided using fast path resolution
+if [ -n "$DONOR_PDB" ]; then
+    if [ ! -f "$DONOR_PDB" ]; then
+        echo -e "${RED}[ERROR] Donor PDB file not found: '$DONOR_PDB'${NC}"
+        exit 1
+    fi
+    DONOR_PDB="$(fast_realpath "$DONOR_PDB")"
+fi
+if [ -n "$VESSEL_PDB" ]; then
+    if [ ! -f "$VESSEL_PDB" ]; then
+        echo -e "${RED}[ERROR] Vessel PDB file not found: '$VESSEL_PDB'${NC}"
+        exit 1
+    fi
+    VESSEL_PDB="$(fast_realpath "$VESSEL_PDB")"
 fi
 
-ABS_INPUT_FILE=$(realpath "$INPUT_FILE" 2>/dev/null || echo "$INPUT_FILE")
-echo -e "\n${CYAN}🔍 Inspecting structural units in '$INPUT_FILE'...${NC}"
+if [ -n "$INPUT_FILE" ]; then
+    if [ ! -f "$INPUT_FILE" ]; then
+        echo -e "${RED}[ERROR] Input file not found: '$INPUT_FILE'${NC}"
+        exit 1
+    fi
+    ABS_INPUT_FILE="$(fast_realpath "$INPUT_FILE")"
+    echo -e "\n${CYAN}🔍 Inspecting structural units in '$INPUT_FILE'...${NC}"
 
-if ! INSPECT_JSON=$(python "$SCRIPT_DIR/scripts/pse_pdb_extractor.py" inspect --input "$ABS_INPUT_FILE" 2>/dev/null); then
-    echo -e "${RED}[ERROR] Failed to inspect structural units in '$ABS_INPUT_FILE'.${NC}"
-    exit 1
-fi
+    if ! INSPECT_JSON=$(python "$SCRIPT_DIR/scripts/pse_pdb_extractor.py" inspect --input "$ABS_INPUT_FILE" 2>/dev/null); then
+        echo -e "${RED}[ERROR] Failed to inspect structural units in '$ABS_INPUT_FILE'.${NC}"
+        exit 1
+    fi
 
-if ! echo "$INSPECT_JSON" | python -c "import sys, json; json.load(sys.stdin)" >/dev/null 2>&1; then
-    echo -e "${RED}[ERROR] Received invalid JSON from structure inspector for '$ABS_INPUT_FILE'.${NC}"
-    exit 1
-fi
-
-echo -e "\n${GREEN}Detected structural objects/chains:${NC}"
-echo "$INSPECT_JSON" | python -c "
+    echo -e "\n${GREEN}Detected structural objects/chains:${NC}"
+    if ! echo "$INSPECT_JSON" | python -c "
 import sys, json
-data = json.load(sys.stdin)
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
 objs = data.get('objects', {})
-idx = 1
-for k, v in objs.items():
+for idx, (k, v) in enumerate(objs.items(), 1):
     name = v.get('name', k)
     length = v.get('length', 0)
     r_str = v.get('range_str', '')
     seq = v.get('sequence', '')
     seq_trunc = seq[:25] + '...' if len(seq) > 25 else seq
     print(f'  [{idx}] ID: {k:<8} Name: {name:<12} Length: {length:>4} aa  Range: {r_str:<10} Seq: {seq_trunc}')
-    idx += 1
-"
+"; then
+        echo -e "${RED}[ERROR] Received invalid JSON from structure inspector for '$ABS_INPUT_FILE'.${NC}"
+        exit 1
+    fi
+fi
 
 # ------------------------------------------------------------------------------
 # 3. Interactive Structural Assignments
 # ------------------------------------------------------------------------------
 if [ -z "$DONOR_ID" ]; then
     echo -e ""
-    read -p "▶ 2. Select Donor Object/Chain ID (contains desired active 3D motif) [e.g. 4 or 7ZUB_chain_D]: " DONOR_ID
+    read -r -p "▶ 2. Select Donor Object/Chain ID (contains desired active 3D motif) [e.g. 4 or 7ZUB_chain_D]: " DONOR_ID
 fi
 DONOR_ID=${DONOR_ID:-A}
 if [[ "$DONOR_ID" =~ ^[0-9]+$ ]]; then
     RESOLVED_DONOR=$(echo "$INSPECT_JSON" | python -c "
 import sys, json
-data = json.load(sys.stdin)
-objs = list(data.get('objects', {}).keys())
-idx = int('$DONOR_ID') - 1
-if 0 <= idx < len(objs):
-    print(objs[idx])
-else:
-    print('$DONOR_ID')
-" 2>/dev/null || true)
+try:
+    data = json.load(sys.stdin)
+    objs = list(data.get('objects', {}).keys())
+    idx = int(sys.argv[1]) - 1
+    if 0 <= idx < len(objs):
+        print(objs[idx])
+    else:
+        print(sys.argv[1])
+except Exception:
+    print(sys.argv[1])
+" "$DONOR_ID" 2>/dev/null || true)
     [ -n "$RESOLVED_DONOR" ] && DONOR_ID="$RESOLVED_DONOR"
 fi
 
@@ -270,30 +336,37 @@ echo -e "  ${GREEN}[✓] Selected Donor:${NC} ${BOLD}$DONOR_ID${NC}"
 
 if [ -z "$MOTIF_RESIDUES" ]; then
     echo -e "   Examples: 'all' (preserve entire donor structure), '30-45', '30-45,78-82'"
-    read -p "▶ 3. Specify Donor Residues to preserve in 3D [Default: all]: " MOTIF_RESIDUES
+    read -r -p "▶ 3. Specify Donor Residues to preserve in 3D [Default: all]: " MOTIF_RESIDUES
 fi
 MOTIF_RESIDUES=${MOTIF_RESIDUES:-all}
 if [ -z "$MOTIF_RESIDUES" ]; then
     echo -e "${RED}[ERROR] Motif residues cannot be empty.${NC}"
     exit 1
 fi
+if [[ ! "$MOTIF_RESIDUES" =~ ^[a-zA-Z0-9,\-:\ \*%]+$ ]]; then
+    echo -e "${RED}[ERROR] Invalid motif residues specification '$MOTIF_RESIDUES'.${NC}"
+    exit 1
+fi
 echo -e "  ${GREEN}[✓] Preserved Motif:${NC} ${BOLD}$MOTIF_RESIDUES${NC}"
 
 if [ -z "$VESSEL_ID" ]; then
-    read -p "▶ 4. Select Recipient / Vessel Object/Chain ID [e.g. 1 or 7ZUB_chain_A]: " VESSEL_ID
+    read -r -p "▶ 4. Select Recipient / Vessel Object/Chain ID [e.g. 1 or 7ZUB_chain_A]: " VESSEL_ID
 fi
 VESSEL_ID=${VESSEL_ID:-B}
 if [[ "$VESSEL_ID" =~ ^[0-9]+$ ]]; then
     RESOLVED_VESSEL=$(echo "$INSPECT_JSON" | python -c "
 import sys, json
-data = json.load(sys.stdin)
-objs = list(data.get('objects', {}).keys())
-idx = int('$VESSEL_ID') - 1
-if 0 <= idx < len(objs):
-    print(objs[idx])
-else:
-    print('$VESSEL_ID')
-" 2>/dev/null || true)
+try:
+    data = json.load(sys.stdin)
+    objs = list(data.get('objects', {}).keys())
+    idx = int(sys.argv[1]) - 1
+    if 0 <= idx < len(objs):
+        print(objs[idx])
+    else:
+        print(sys.argv[1])
+except Exception:
+    print(sys.argv[1])
+" "$VESSEL_ID" 2>/dev/null || true)
     [ -n "$RESOLVED_VESSEL" ] && VESSEL_ID="$RESOLVED_VESSEL"
 fi
 
@@ -309,13 +382,13 @@ if [ -t 0 ] && [ "$CHIMERA_MODE" = "replace" ] && [ -z "$VESSEL_REPLACE_RANGE" ]
     echo -e "  [2] Ligate to N-Terminus: Fuse donor motif to vessel N-terminus"
     echo -e "  [3] Ligate to C-Terminus: Fuse donor motif to vessel C-terminus"
     echo -e "  [4] Insert into Loop: Insert donor motif at an internal split point"
-    read -p "▶ 5. Choose Mode [1/2/3/4, Default: 1]: " MODE_CHOICE
+    read -r -p "▶ 5. Choose Mode [1/2/3/4, Default: 1]: " MODE_CHOICE
     MODE_CHOICE=${MODE_CHOICE:-1}
 
     case "$MODE_CHOICE" in
         1)
             CHIMERA_MODE="replace"
-            read -p "     Vessel range to excise / replace (e.g. 55-70): " VESSEL_REPLACE_RANGE
+            read -r -p "     Vessel range to excise / replace (e.g. 55-70): " VESSEL_REPLACE_RANGE
             ;;
         2)
             CHIMERA_MODE="ligate_nterm"
@@ -325,28 +398,100 @@ if [ -t 0 ] && [ "$CHIMERA_MODE" = "replace" ] && [ -z "$VESSEL_REPLACE_RANGE" ]
             ;;
         4)
             CHIMERA_MODE="insert_loop"
-            read -p "     Split vessel after residue number (e.g. 54): " VESSEL_SPLIT_AFTER
+            read -r -p "     Split vessel after residue number (e.g. 54): " VESSEL_SPLIT_AFTER
             ;;
     esac
 fi
 
+# Validate parameters against unexpected syntax or command injection characters
+if [ -n "$VESSEL_REPLACE_RANGE" ] && [[ ! "$VESSEL_REPLACE_RANGE" =~ ^[a-zA-Z0-9\-]+$ ]]; then
+    echo -e "${RED}[ERROR] Invalid vessel_replace_range '$VESSEL_REPLACE_RANGE'. Expected 'START-END'.${NC}"
+    exit 1
+fi
+if [ -n "$VESSEL_SPLIT_AFTER" ] && [[ ! "$VESSEL_SPLIT_AFTER" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}[ERROR] Invalid vessel_split_after '$VESSEL_SPLIT_AFTER'. Must be integer.${NC}"
+    exit 1
+fi
+
 if [ -t 0 ]; then
+    echo -e "\n${CYAN}======================================================${NC}"
+    echo -e "${CYAN} 📏 MEASURING 3D JUNCTION GAPS & LINKER BUDGETING     ${NC}"
+    echo -e "${CYAN}======================================================${NC}"
+
+    MEASURE_CMD=(
+        python "$SCRIPT_DIR/scripts/chimera_scaffold.py" measure_junctions
+        "--donor_id" "$DONOR_ID"
+        "--vessel_id" "$VESSEL_ID"
+        "--motif_residues" "$MOTIF_RESIDUES"
+        "--chimera_mode" "$CHIMERA_MODE"
+    )
+    if [ -n "$ABS_INPUT_FILE" ]; then
+        MEASURE_CMD+=("--input_file" "$ABS_INPUT_FILE")
+    fi
+    if [ -n "$VESSEL_REPLACE_RANGE" ]; then
+        MEASURE_CMD+=("--vessel_replace_range" "$VESSEL_REPLACE_RANGE")
+    fi
+    if [ -n "$VESSEL_SPLIT_AFTER" ]; then
+        MEASURE_CMD+=("--vessel_split_after" "$VESSEL_SPLIT_AFTER")
+    fi
+
+    MEASURE_JSON=$("${MEASURE_CMD[@]}" 2>/dev/null || true)
+
+    if [ -n "$MEASURE_JSON" ] && echo "$MEASURE_JSON" | grep -q "junctions"; then
+        echo -e "${GREEN}[✓] Calculated 3D Junction Distances:${NC}"
+
+        # Parse recommended linkers and display summary in a single Python call to avoid redundant forks
+        PARSED_RECOMMENDATIONS=$(echo "$MEASURE_JSON" | python -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    j = data.get('junctions', {})
+    rec_n = ''
+    rec_c = ''
+    for k, v in j.items():
+        desc = v.get('description', k)
+        d = v.get('distance_angstrom', 0.0)
+        ext = v.get('ext_min', 0)
+        glob = v.get('recommended_range', '')
+        param = v.get('param', '')
+        if param == 'linker_n' and not rec_n:
+            rec_n = glob
+        elif param == 'linker_c' and not rec_c:
+            rec_c = glob
+        print(f'  • {desc}: Measured 3D gap: {d} Å')
+        print(f'    - Theoretical minimum: {ext} aa (fully extended @ 3.8 Å/aa)')
+        print(f'    - Recommended globular span: {glob} aa')
+    print(f'__REC_N__={rec_n}')
+    print(f'__REC_C__={rec_c}')
+except Exception:
+    pass
+" 2>/dev/null || true)
+        echo -e "------------------------------------------------------------"
+
+        REC_LINKER_N=$(echo "$PARSED_RECOMMENDATIONS" | sed -n 's/^__REC_N__=//p')
+        REC_LINKER_C=$(echo "$PARSED_RECOMMENDATIONS" | sed -n 's/^__REC_C__=//p')
+        echo "$PARSED_RECOMMENDATIONS" | grep -v '^__REC_' || true
+
+        [ -n "$REC_LINKER_N" ] && LINKER_N="$REC_LINKER_N"
+        [ -n "$REC_LINKER_C" ] && LINKER_C="$REC_LINKER_C"
+    fi
+
     echo -e "\n${YELLOW}--- Linker Flexibility & Sampling Budget ---${NC}"
-    read -p "▶ 6. N-terminal linker length [Default: $LINKER_N]: " INP_LN
+    read -r -p "▶ 6. N-terminal linker length [Default: $LINKER_N]: " INP_LN
     LINKER_N=${INP_LN:-$LINKER_N}
-    read -p "▶ 7. C-terminal linker length [Default: $LINKER_C]: " INP_LC
+    read -r -p "▶ 7. C-terminal linker length [Default: $LINKER_C]: " INP_LC
     LINKER_C=${INP_LC:-$LINKER_C}
-    read -p "▶ 8. Number of RFdiffusion backbones [Default: $NUM_DESIGNS]: " INP_ND
+    read -r -p "▶ 8. Number of RFdiffusion backbones [Default: $NUM_DESIGNS]: " INP_ND
     NUM_DESIGNS=${INP_ND:-$NUM_DESIGNS}
-    read -p "▶ 9. ProteinMPNN sequences per backbone [Default: $NUM_SEQS]: " INP_NS
+    read -r -p "▶ 9. ProteinMPNN sequences per backbone [Default: $NUM_SEQS]: " INP_NS
     NUM_SEQS=${INP_NS:-$NUM_SEQS}
-    read -p "▶ 10. ProteinMPNN parallel GPU batch size [Default: $MPNN_BATCH_SIZE]: " INP_BS
+    read -r -p "▶ 10. ProteinMPNN parallel GPU batch size [Default: $MPNN_BATCH_SIZE]: " INP_BS
     MPNN_BATCH_SIZE=${INP_BS:-$MPNN_BATCH_SIZE}
-    read -e -p "▶ 11. Output directory [Default: $OUT_DIR]: " INP_OD
+    read -r -e -p "▶ 11. Output directory [Default: $OUT_DIR]: " INP_OD
     OUT_DIR=${INP_OD:-$OUT_DIR}
 fi
 
-ABS_OUT_DIR=$(realpath "$OUT_DIR" 2>/dev/null || echo "$OUT_DIR")
+ABS_OUT_DIR="$(fast_realpath "$OUT_DIR")"
 if [ -z "$ABS_OUT_DIR" ] || [ "$ABS_OUT_DIR" = "/" ] || [ "$ABS_OUT_DIR" = "\\" ] || [[ "$ABS_OUT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
     echo -e "${RED}[ERROR] Invalid or dangerous output directory specified: '$OUT_DIR'.${NC}"
     exit 1
@@ -360,12 +505,11 @@ LOG_FILE="$ABS_OUT_DIR/run.log"
 # 3.5 Background Execution Option
 # ------------------------------------------------------------------------------
 if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ]; then
-    read -p "▶ Do you want to run this workflow in the background? [y/N]: " RUN_BG
+    read -r -p "▶ Do you want to run this workflow in the background? [y/N]: " RUN_BG
     if [[ "$RUN_BG" =~ ^[Yy]$ ]]; then
         BACKGROUND_MODE=true
         if [ ${#ORIG_ARGS[@]} -eq 0 ]; then
             BG_ARGS=(
-                "--input" "$ABS_INPUT_FILE"
                 "--donor_id" "$DONOR_ID"
                 "--vessel_id" "$VESSEL_ID"
                 "--motif_residues" "$MOTIF_RESIDUES"
@@ -380,6 +524,9 @@ if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ]; then
                 "--plddt_threshold" "$PLDDT_THRESHOLD"
                 "--out_dir" "$ABS_OUT_DIR"
             )
+            [ -n "$ABS_INPUT_FILE" ] && BG_ARGS+=("--input" "$ABS_INPUT_FILE")
+            [ -n "$DONOR_PDB" ] && BG_ARGS+=("--donor_pdb" "$DONOR_PDB")
+            [ -n "$VESSEL_PDB" ] && BG_ARGS+=("--vessel_pdb" "$VESSEL_PDB")
             [ -n "$VESSEL_REPLACE_RANGE" ] && BG_ARGS+=("--replace_range" "$VESSEL_REPLACE_RANGE")
             [ -n "$VESSEL_SPLIT_AFTER" ] && BG_ARGS+=("--split_after" "$VESSEL_SPLIT_AFTER")
             [ -n "$DRY_RUN" ] && BG_ARGS+=("$DRY_RUN")
@@ -387,7 +534,7 @@ if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ]; then
         else
             BG_ARGS=("${ORIG_ARGS[@]}")
         fi
-        nohup bash "$0" "${BG_ARGS[@]}" --background < /dev/null > "$LOG_FILE" 2>&1 &
+        nohup bash "$SCRIPT_DIR/chimera_scaffold.sh" "${BG_ARGS[@]}" --background < /dev/null > "$LOG_FILE" 2>&1 &
         BG_PID=$!
         echo "$BG_PID" > "$PID_FILE"
         echo -e "\n${CYAN}======================================================================${NC}"
@@ -408,7 +555,6 @@ echo -e "\n${CYAN}>>> Executing Chimera Scaffolding Pipeline <<<${NC}\n"
 
 CMD_ARGS=(
     "python" "$SCRIPT_DIR/scripts/chimera_scaffold.py"
-    "--input_file" "$ABS_INPUT_FILE"
     "--donor_id" "$DONOR_ID"
     "--vessel_id" "$VESSEL_ID"
     "--motif_residues" "$MOTIF_RESIDUES"
@@ -423,6 +569,18 @@ CMD_ARGS=(
     "--plddt_threshold" "$PLDDT_THRESHOLD"
     "--out_dir" "$ABS_OUT_DIR"
 )
+
+if [ -n "$ABS_INPUT_FILE" ]; then
+    CMD_ARGS+=("--input_file" "$ABS_INPUT_FILE")
+fi
+
+if [ -n "$DONOR_PDB" ]; then
+    CMD_ARGS+=("--donor_pdb" "$DONOR_PDB")
+fi
+
+if [ -n "$VESSEL_PDB" ]; then
+    CMD_ARGS+=("--vessel_pdb" "$VESSEL_PDB")
+fi
 
 if [ -n "$VESSEL_REPLACE_RANGE" ]; then
     CMD_ARGS+=("--vessel_replace_range" "$VESSEL_REPLACE_RANGE")

@@ -31,9 +31,13 @@ trap 'echo -e "\n\n${YELLOW}[!] Installation/Operation cancelled by user.${NC}";
 
 # Resolve target installation directory (where install.sh resides, or PWD if piped via bash)
 if [ -n "${BASH_SOURCE[0]}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-    INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    INSTALL_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 else
-    INSTALL_DIR="$(pwd)"
+    INSTALL_DIR="$(pwd -P 2>/dev/null || pwd)"
+fi
+if [ -z "$INSTALL_DIR" ] || [ "$INSTALL_DIR" = "/" ] || [ "$INSTALL_DIR" = "\\" ] || [[ "$INSTALL_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+    echo -e "${RED}[ERROR] Dangerous or root installation directory: '$INSTALL_DIR'. Refusing to proceed.${NC}"
+    exit 1
 fi
 
 REPO_URL="https://github.com/Thinnil/autoscaffold.git"
@@ -317,6 +321,97 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
+# Task 8: Global CLI Launcher Shortcut Installation
+# ------------------------------------------------------------------------------
+install_launcher() {
+    echo -e "\n${CYAN}======================================================================${NC}"
+    echo -e "${CYAN}     🔗 GLOBAL SHORTCUT INSTALLATION ('autoscaffold' CLI)             ${NC}"
+    echo -e "${CYAN}======================================================================${NC}"
+
+    local TARGET_BIN
+    if [ "${EUID:-$(id -u 2>/dev/null || echo 1000)}" -eq 0 ]; then
+        TARGET_BIN="/usr/local/bin"
+    else
+        if [ -z "$HOME" ] || [ "$HOME" = "/" ] || [ "$HOME" = "\\" ]; then
+            echo -e "${RED}[ERROR] User HOME directory is invalid or unset: '$HOME'${NC}"
+            return 1
+        fi
+        TARGET_BIN="$HOME/.local/bin"
+    fi
+
+    mkdir -p "$TARGET_BIN"
+    TARGET_BIN="$(cd -P "$TARGET_BIN" 2>/dev/null && pwd)"
+    if [ -z "$TARGET_BIN" ] || [ "$TARGET_BIN" = "/" ] || [ "$TARGET_BIN" = "\\" ] || [[ "$TARGET_BIN" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+        echo -e "${RED}[ERROR] Invalid or dangerous TARGET_BIN directory: '$TARGET_BIN'.${NC}"
+        return 1
+    fi
+
+    local LAUNCHER_SRC="$INSTALL_DIR/autoscaffold"
+    if [ ! -f "$LAUNCHER_SRC" ]; then
+        echo -e "${RED}[ERROR] Launcher script not found at: $LAUNCHER_SRC${NC}"
+        return 1
+    fi
+    LAUNCHER_SRC="$(cd -P "$(dirname "$LAUNCHER_SRC")" && pwd)/$(basename "$LAUNCHER_SRC")"
+
+    chmod 755 "$LAUNCHER_SRC" 2>/dev/null || true
+    # Safely remove existing symlink or file to prevent symlink traversal
+    rm -f "$TARGET_BIN/autoscaffold"
+    ln -sf "$LAUNCHER_SRC" "$TARGET_BIN/autoscaffold" 2>/dev/null || true
+
+    # If ln -sf did not produce a true symlink (common on Windows Git Bash without native symlink rights),
+    # write a canonical launcher wrapper script that explicitly points to LAUNCHER_SRC.
+    if [ ! -L "$TARGET_BIN/autoscaffold" ]; then
+        cat << 'EOF' > "$TARGET_BIN/autoscaffold"
+#!/usr/bin/env bash
+AUTOSCAFFOLD_TARGET="REPLACE_REPO_SRC"
+if [ -f "$AUTOSCAFFOLD_TARGET" ]; then
+    export AUTOSCAFFOLD_DIR="$(dirname "$AUTOSCAFFOLD_TARGET")"
+    exec bash "$AUTOSCAFFOLD_TARGET" "$@"
+fi
+echo -e "\033[0;31m[ERROR] AutoScaffold target not found at: $AUTOSCAFFOLD_TARGET\033[0m"
+exit 1
+EOF
+        sed -i "s|REPLACE_REPO_SRC|$LAUNCHER_SRC|g" "$TARGET_BIN/autoscaffold"
+    fi
+    chmod 755 "$TARGET_BIN/autoscaffold" 2>/dev/null || true
+
+    # Persist repository location marker in user home
+    if [ -n "$HOME" ] && [ "$HOME" != "/" ]; then
+        echo "$INSTALL_DIR" > "$HOME/.autoscaffold_home" 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}[✓] Global shortcut established:${NC} $TARGET_BIN/autoscaffold -> $LAUNCHER_SRC"
+
+    # Verify TARGET_BIN in PATH
+    if [[ ":$PATH:" != *":$TARGET_BIN:"* ]]; then
+        echo -e "${YELLOW}[!] Notice: '$TARGET_BIN' is not currently in your system PATH.${NC}"
+        local ADDED=false
+        local RC_FILE
+        for RC_FILE in "$HOME/.bashrc" "$HOME/.zshrc"; do
+            # Verify RC_FILE exists and is a regular file (not a symlink) to prevent arbitrary file overwrite
+            if [ -f "$RC_FILE" ] && [ ! -L "$RC_FILE" ]; then
+                if ! grep -q "$TARGET_BIN" "$RC_FILE" 2>/dev/null; then
+                    echo -e "\n# AutoScaffold Global CLI Launcher" >> "$RC_FILE"
+                    echo "export PATH=\"$TARGET_BIN:\$PATH\"" >> "$RC_FILE"
+                    echo -e "${GREEN}[✓] Appended PATH export to $RC_FILE${NC}"
+                    ADDED=true
+                fi
+            fi
+        done
+        if [ "$ADDED" = true ]; then
+            echo -e "${CYAN}[i] Run 'source ~/.bashrc' or reload your shell to activate the global command.${NC}"
+        else
+            echo -e "${YELLOW}[i] Please add '$TARGET_BIN' to your PATH manually:${NC}"
+            echo -e "    export PATH=\"$TARGET_BIN:\$PATH\""
+        fi
+    else
+        echo -e "${GREEN}[✓] Target directory '$TARGET_BIN' is already active in your PATH.${NC}"
+    fi
+
+    echo -e "${GREEN}[✓] You can now run 'autoscaffold' directly from any directory!${NC}\n"
+}
+
+# ------------------------------------------------------------------------------
 # Express Setup Routine (Runs all installation tasks)
 # ------------------------------------------------------------------------------
 express_setup() {
@@ -330,11 +425,23 @@ express_setup() {
     download_weights
     build_environments
     write_config
+
+    if [ -t 0 ]; then
+        echo ""
+        read -r -p "▶ Would you like to create a global 'autoscaffold' shortcut in ~/.local/bin? [Y/n]: " PROMPT_SHORTCUT
+        PROMPT_SHORTCUT=${PROMPT_SHORTCUT:-Y}
+        if [[ "$PROMPT_SHORTCUT" =~ ^[Yy]$ ]]; then
+            install_launcher
+        fi
+    else
+        install_launcher || true
+    fi
+
     echo -e "\n${GREEN}======================================================================${NC}"
     echo -e "${GREEN}  🎉 AUTOSCAFFOLD INSTALLATION & ENVIRONMENT SETUP COMPLETE! 🎉       ${NC}"
     echo -e "${GREEN}======================================================================${NC}"
     echo -e "You can now launch the master suite at any time by running:"
-    echo -e "  ${BOLD}./autoscaffold_suite.sh${NC}\n"
+    echo -e "  ${BOLD}autoscaffold${NC} (or ${BOLD}./autoscaffold_suite.sh${NC})\n"
 }
 
 # ------------------------------------------------------------------------------
@@ -343,6 +450,10 @@ express_setup() {
 case "$1" in
     --express|--all|--full|-y|install)
         express_setup
+        exit 0
+        ;;
+    --launcher|launcher|--shortcut|shortcut)
+        install_launcher
         exit 0
         ;;
     --update|update|upgrade)
@@ -368,6 +479,7 @@ case "$1" in
         echo -e "  $0 [command]"
         echo -e "\nCommands:"
         echo -e "  install, --full, -y  Perform full autonomous installation (code, micromamba, tools, weights, envs)"
+        echo -e "  shortcut, launcher   Install global 'autoscaffold' CLI shortcut in ~/.local/bin"
         echo -e "  update, --update     Check for and merge latest updates from GitHub in-place"
         echo -e "  diagnostics, --diag  Run hardware and environment health check"
         echo -e "  weights              Download official RFdiffusion model checkpoints"
@@ -406,25 +518,27 @@ while true; do
     echo -e "  ${GREEN}[4]${NC} ⬇️  Download / Verify RFdiffusion Model Checkpoints (~1.5GB)"
     echo -e "  ${GREEN}[5]${NC} 🧬 Build Virtual Environments (SE3nv, mlfold, colabfold)"
     echo -e "  ${GREEN}[6]${NC} 🩺 Run System & Hardware Diagnostics"
-    echo -e "  ${GREEN}[7]${NC} 🚀 Launch AutoScaffold Master Suite (./autoscaffold_suite.sh)"
+    echo -e "  ${GREEN}[7]${NC} 🔗 Install Global 'autoscaffold' Shortcut (~/.local/bin)"
+    echo -e "  ${GREEN}[8]${NC} 🚀 Launch AutoScaffold Master Suite (./autoscaffold_suite.sh)"
     echo -e "  ${GREEN}[0]${NC} 🚪 Exit"
     echo -e ""
 
-    read -p "▶ Enter selection [0-7]: " CHOICE
+    read -r -p "▶ Enter selection [0-8]: " CHOICE
 
     case "$CHOICE" in
-        1) express_setup; read -p "Press Enter to return to menu...";;
-        2) sync_codebase; read -p "Press Enter to return to menu...";;
-        3) setup_tools; write_config; read -p "Press Enter to return to menu...";;
-        4) download_weights; read -p "Press Enter to return to menu...";;
-        5) build_environments; write_config; read -p "Press Enter to return to menu...";;
-        6) run_diagnostics; read -p "Press Enter to return to menu...";;
-        7)
+        1) express_setup; read -r -p "Press Enter to return to menu...";;
+        2) sync_codebase; read -r -p "Press Enter to return to menu...";;
+        3) setup_tools; write_config; read -r -p "Press Enter to return to menu...";;
+        4) download_weights; read -r -p "Press Enter to return to menu...";;
+        5) build_environments; write_config; read -r -p "Press Enter to return to menu...";;
+        6) run_diagnostics; read -r -p "Press Enter to return to menu...";;
+        7) install_launcher; read -r -p "Press Enter to return to menu...";;
+        8)
             if [ -f "$INSTALL_DIR/autoscaffold_suite.sh" ]; then
                 exec bash "$INSTALL_DIR/autoscaffold_suite.sh"
             else
                 echo -e "${RED}[ERROR] autoscaffold_suite.sh not found. Run option 1 or 2 first.${NC}"
-                read -p "Press Enter to continue..."
+                read -r -p "Press Enter to continue..."
             fi
             ;;
         0|q|quit|exit)

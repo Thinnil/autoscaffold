@@ -97,7 +97,10 @@ def safe_join_path(base_dir: str, *paths: str) -> str:
         clean_parts.append(sanitized)
 
     target_abs = os.path.realpath(os.path.abspath(os.path.join(base_abs, *clean_parts)))
-    if not (target_abs == base_abs or target_abs.startswith(base_abs + os.sep)):
+    try:
+        if os.path.commonpath([base_abs, target_abs]) != base_abs:
+            raise ValueError(f"Path traversal detected: {paths} resolves outside {base_dir}")
+    except ValueError:
         raise ValueError(f"Path traversal detected: {paths} resolves outside {base_dir}")
     return target_abs
 
@@ -697,16 +700,20 @@ def main():
         info = inspect_file(args.input)
         json_output = json.dumps(info, indent=2)
         if args.out_json:
-            out_json_path = os.path.abspath(args.out_json)
+            out_json_path = os.path.realpath(os.path.abspath(args.out_json))
+            if out_json_path in ("/", "\\") or (len(out_json_path) <= 3 and out_json_path.endswith(":\\")):
+                raise ValueError(f"Dangerous output JSON path: {out_json_path}")
             out_json_dir = os.path.dirname(out_json_path)
             if out_json_dir:
                 os.makedirs(out_json_dir, exist_ok=True)
-            with open(out_json_path, "w", encoding="utf-8") as f:
+            with open(out_json_path, "w", encoding="utf-8", buffering=65536) as f:
                 f.write(json_output)
         print(json_output)
 
     elif args.command == "extract":
-        out_dir = os.path.abspath(args.out_dir)
+        out_dir = os.path.realpath(os.path.abspath(args.out_dir))
+        if out_dir in ("/", "\\") or (len(out_dir) <= 3 and out_dir.endswith(":\\")):
+            raise ValueError(f"Dangerous output directory: {out_dir}")
         os.makedirs(out_dir, exist_ok=True)
         extracted = extract_file(args.input, out_dir)
         print(json.dumps({"status": "SUCCESS", "extracted_files": extracted}, indent=2))

@@ -12,7 +12,11 @@ set -e
 trap 'echo -e "\n\n${YELLOW}[!] Operation cancelled by user.${NC}"; exit 130' INT
 
 # Resolve script directory and source shared environment
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" = "/" ] || [ "$SCRIPT_DIR" = "\\" ] || [[ "$SCRIPT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+    echo -e "\033[0;31m[ERROR] Invalid or dangerous SCRIPT_DIR root: '$SCRIPT_DIR'.\033[0m"
+    exit 1
+fi
 
 # Verify and self-heal scripts directory if missing
 if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
@@ -45,7 +49,7 @@ if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
                 wget -qO "$SCRIPT_DIR/scripts/$s" "$RAW_BASE/$s" 2>/dev/null || true
             fi
         done
-        chmod +x "$SCRIPT_DIR"/scripts/*.sh "$SCRIPT_DIR"/scripts/*.py 2>/dev/null || true
+        chmod 755 "$SCRIPT_DIR"/scripts/*.sh "$SCRIPT_DIR"/scripts/*.py 2>/dev/null || true
     fi
     if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
         echo -e "\033[0;31m[ERROR] Could not locate or download 'scripts/env_setup.sh'.\033[0m"
@@ -106,6 +110,13 @@ if [ ${#ARGS[@]} -gt 0 ]; then
                 exec bash "$SCRIPT_DIR/scripts/install_dependencies.sh" "${CMD_REST[@]}"
             fi
             ;;
+        shortcut|launcher)
+            if [ -f "$SCRIPT_DIR/install.sh" ]; then
+                exec bash "$SCRIPT_DIR/install.sh" launcher "${CMD_REST[@]}"
+            else
+                echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/install.sh${NC}"; exit 1
+            fi
+            ;;
         update|upgrade)
             if [ -f "$SCRIPT_DIR/install.sh" ]; then
                 exec bash "$SCRIPT_DIR/install.sh" update "${CMD_REST[@]}"
@@ -125,6 +136,7 @@ if [ ${#ARGS[@]} -gt 0 ]; then
             echo -e "  chimera           Chimera Scaffolding: Graft Motif into Vessel Protein (PDB/PSE)"
             echo -e "  diagnostics       Run environment & dependency diagnostic checks"
             echo -e "  install           Run automated dependency, tool, and environment installer"
+            echo -e "  launcher          Install global 'autoscaffold' shortcut into ~/.local/bin"
             echo -e "  update            Check and apply in-place updates from GitHub"
             echo -e "\nOptions:"
             echo -e "  --background, -b  Run selected workflow in background"
@@ -160,7 +172,7 @@ echo -e "  ${GREEN}[7]${NC} 🔄 In-Place Self-Update & GitHub Upgrade"
 echo -e "  ${GREEN}[8]${NC} 🚪 Exit"
 echo -e ""
 
-read -p "▶ Enter selection [1-8]: " WORKFLOW_CHOICE
+read -r -p "▶ Enter selection [1-8]: " WORKFLOW_CHOICE
 
 case "$WORKFLOW_CHOICE" in
     1)

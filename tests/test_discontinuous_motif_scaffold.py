@@ -1,9 +1,16 @@
 import unittest
 import os
+import sys
 import shutil
 import tempfile
-from scripts.discontinuous_motif_scaffold import DiscontinuousMotifScaffolder
-from tests.test_chimera_scaffold import create_sample_pdb
+
+# Add repository root to sys.path for standalone and test-runner execution
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from scripts.discontinuous_motif_scaffold import DiscontinuousMotifScaffolder  # noqa: E402
+from tests.test_chimera_scaffold import create_sample_pdb  # noqa: E402
 
 
 class TestDiscontinuousMotifScaffold(unittest.TestCase):

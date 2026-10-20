@@ -63,16 +63,24 @@ def kabsch_fit(
     # Translation vector
     t = q_center - np.dot(p_center, R)
 
-    # Calculate aligned coordinates and RMSD with minimal intermediate allocations
-    P_aligned = np.dot(P, R)
-    P_aligned += t
-    diff = P_aligned - Q
-    sq_dist = np.sum(diff ** 2, axis=1)
-    rmsd = float(np.sqrt(np.mean(sq_dist)))
-
+    # Calculate aligned coordinates and RMSD with minimal intermediate allocations and in-place operations
     if return_aligned:
+        P_aligned = np.dot(P, R)
+        P_aligned += t
+        diff = P_aligned - Q
+        diff *= diff  # in-place squaring avoids extra intermediate array allocation
+        sq_dist = np.sum(diff, axis=1)
+        rmsd = float(np.sqrt(np.mean(sq_dist)))
         return R, t, rmsd, P_aligned, sq_dist
-    return R, t, rmsd
+    else:
+        # Re-use temporary array in-place without allocating diff
+        P_tmp = np.dot(P, R)
+        P_tmp += t
+        P_tmp -= Q
+        P_tmp *= P_tmp
+        sq_dist = np.sum(P_tmp, axis=1)
+        rmsd = float(np.sqrt(np.mean(sq_dist)))
+        return R, t, rmsd
 
 
 def extract_coordinates(
@@ -171,8 +179,9 @@ def calculate_motif_rmsd(
 
     R, t, rmsd, _, sq_dist = kabsch_fit(query_coords, ref_coords, return_aligned=True)
 
-    # Per-residue deviations derived directly from in-memory squared distance array
-    dists = np.sqrt(sq_dist).tolist()
+    # In-place square root on squared distances array for deviation metrics
+    np.sqrt(sq_dist, out=sq_dist)
+    dists = sq_dist.tolist()
 
     return {
         "rmsd": round(float(rmsd), 4),

@@ -24,28 +24,168 @@ Performs:
 - Export passing models to results/ and output metrics_summary.csv
 """
 
-import sys
-import os
-import re
+import argparse
 import csv
 import json
+import math
+import os
+import re
 import shlex
 import shutil
-import argparse
 import subprocess
-from typing import Dict, List, Any, Optional, Tuple
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 # Add script directory to sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-import numpy as np
 from pse_pdb_extractor import extract_file, parse_pdb_file  # noqa: E402
 from extract_fixed_motif import parse_residue_spec  # noqa: E402
 from kabsch_rmsd import calculate_motif_rmsd, extract_coordinates  # noqa: E402
 from format_complex_fasta import make_fixed_positions_dict  # noqa: E402
 from methodology_reporter import generate_methodology_report  # noqa: E402
+
+# In-memory session cache for parsed PDB residue coordinates:
+# Key: (real_path, mtime) -> {(chain, resi): np.ndarray}
+_CA_COORDS_CACHE: Dict[Tuple[str, float], Dict[Tuple[str, int], np.ndarray]] = {}
+_FALLBACK_COORDS_CACHE: Dict[Tuple[str, float], Dict[Tuple[str, int], np.ndarray]] = {}
+
+
+def clear_ca_coords_cache() -> None:
+    """Clears the in-memory parsed coordinate session cache."""
+    _CA_COORDS_CACHE.clear()
+    _FALLBACK_COORDS_CACHE.clear()
+
+
+def get_residue_ca_coords(
+    pdb_path: str,
+    chain_id: Optional[str] = None,
+    resi: int = 1,
+    buffer_size: int = 65536,
+    use_cache: bool = True
+) -> Optional[np.ndarray]:
+    """
+    Returns 3D coordinates [x, y, z] of the CA atom for given chain and residue number.
+    Falls back to the geometric center (mean coordinates of all atoms) of the residue
+    if the CA atom is missing. Returns None if residue is not found.
+    Caches parsed coordinates per file session so multi-megabyte PDB files are not
+    re-parsed on multiple anchor queries.
+    """
+    if not pdb_path:
+        return None
+
+    try:
+        real_path = os.path.realpath(pdb_path)
+        if not os.path.isfile(real_path):
+            return None
+        mtime = os.path.getmtime(real_path)
+    except (OSError, ValueError):
+        return None
+
+    cache_key = (real_path, mtime)
+    if not use_cache or cache_key not in _CA_COORDS_CACHE:
+        ca_map: Dict[Tuple[str, int], np.ndarray] = {}
+        all_atom_accum: Dict[Tuple[str, int], List[float]] = {}
+
+        with open(real_path, "r", encoding="utf-8", errors="ignore", buffering=buffer_size) as f:
+            for line in f:
+                if line.startswith("ATOM  ") or line.startswith("HETATM"):
+                    ch = line[21].strip() or "A"
+                    try:
+                        r = int(line[22:26])
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                    except ValueError:
+                        continue
+
+                    key = (ch, r)
+                    atom_name = line[12:16].strip().upper()
+                    if atom_name == "CA" and key not in ca_map:
+                        ca_map[key] = np.array([x, y, z], dtype=float)
+
+                    acc = all_atom_accum.get(key)
+                    if acc is None:
+                        all_atom_accum[key] = [x, y, z, 1.0]
+                    else:
+                        acc[0] += x
+                        acc[1] += y
+                        acc[2] += z
+                        acc[3] += 1.0
+
+        fallback_map: Dict[Tuple[str, int], np.ndarray] = {}
+        for key, acc in all_atom_accum.items():
+            if key not in ca_map and acc[3] > 0:
+                fallback_map[key] = np.array([acc[0] / acc[3], acc[1] / acc[3], acc[2] / acc[3]], dtype=float)
+
+        if use_cache:
+            _CA_COORDS_CACHE[cache_key] = ca_map
+            _FALLBACK_COORDS_CACHE[cache_key] = fallback_map
+    else:
+        ca_map = _CA_COORDS_CACHE[cache_key]
+        fallback_map = _FALLBACK_COORDS_CACHE[cache_key]
+
+    target_resi = int(resi)
+    clean_chain = str(chain_id).strip() if chain_id is not None else None
+
+    if clean_chain is not None:
+        coord = ca_map.get((clean_chain, target_resi))
+        if coord is not None:
+            return coord.copy()
+        fallback = fallback_map.get((clean_chain, target_resi))
+        if fallback is not None:
+            return fallback.copy()
+        return None
+    else:
+        # Search across all chains for matching residue number
+        for (ch, r), coord in ca_map.items():
+            if r == target_resi:
+                return coord.copy()
+        for (ch, r), fallback in fallback_map.items():
+            if r == target_resi:
+                return fallback.copy()
+        return None
+
+
+def calculate_anchor_distance(coord1: Any, coord2: Any) -> float:
+    """
+    Computes standard Euclidean distance ||coord2 - coord1||_2 in Angstroms.
+    Uses scalar math with zero intermediate array allocations for 3D coordinates.
+    """
+    try:
+        dx = float(coord2[0]) - float(coord1[0])
+        dy = float(coord2[1]) - float(coord1[1])
+        dz = float(coord2[2]) - float(coord1[2])
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+    except (IndexError, TypeError):
+        c1 = np.asarray(coord1, dtype=float)
+        c2 = np.asarray(coord2, dtype=float)
+        diff = c2 - c1
+        return float(np.sqrt(np.dot(diff, diff)))
+
+
+def compute_recommended_linker(distance_angstrom: float) -> Tuple[int, int]:
+    """
+    Calculates physically realistic linker residue bounds:
+    min_len = max(3, ceil(distance / 3.0))
+    max_len = min_len + max(6, ceil(0.25 * min_len))
+    """
+    if distance_angstrom <= 0:
+        return (3, 9)
+    min_len = max(3, int(math.ceil(distance_angstrom / 3.0)))
+    max_len = min_len + max(6, int(math.ceil(0.25 * min_len)))
+    return (min_len, max_len)
+
+
+def compute_extension_minimum(distance_angstrom: float) -> int:
+    """Calculates absolute physical extension limit L_ext_min = ceil(d / 3.8)."""
+    if distance_angstrom <= 0:
+        return 1
+    return max(1, int(math.ceil(distance_angstrom / 3.8)))
 
 
 class ChimeraScaffolder:
@@ -72,15 +212,20 @@ class ChimeraScaffolder:
         rmsd_threshold: float = 1.0,
         plddt_threshold: float = 75.0,
         lock_vessel: bool = True,
+        clamp_linkers: bool = True,
         out_dir: str = "outputs/chimera_scaffold",
         dry_run: bool = False,
         rfdiff_script: Optional[str] = None,
         mpnn_script: Optional[str] = None,
         colabfold_cmd: Optional[str] = None
     ):
-        self.input_file = input_file
-        self.donor_pdb = donor_pdb
-        self.vessel_pdb = vessel_pdb
+        self.input_file = os.path.realpath(input_file) if input_file else None
+        self.donor_pdb = os.path.realpath(donor_pdb) if donor_pdb else None
+        self.vessel_pdb = os.path.realpath(vessel_pdb) if vessel_pdb else None
+        for p_label, p_val in [("input_file", self.input_file), ("donor_pdb", self.donor_pdb), ("vessel_pdb", self.vessel_pdb)]:
+            if p_val and (p_val in ("/", "\\") or (len(p_val) <= 3 and p_val.endswith(":\\"))):
+                raise ValueError(f"Dangerous or root file specified for {p_label}: '{p_val}'")
+
         self.donor_id = donor_id
         self.vessel_id = vessel_id
         self.motif_residues = motif_residues
@@ -96,13 +241,14 @@ class ChimeraScaffolder:
         self.rmsd_threshold = rmsd_threshold
         self.plddt_threshold = plddt_threshold
         self.lock_vessel = lock_vessel
+        self.clamp_linkers = clamp_linkers
         self.out_dir = os.path.realpath(out_dir)
         if self.out_dir in ("/", "\\") or (len(self.out_dir) <= 3 and self.out_dir.endswith(":\\")):
             raise ValueError(f"Invalid or root output directory specified: '{out_dir}'")
         self.dry_run = dry_run
 
-        self.rfdiff_script = rfdiff_script
-        self.mpnn_script = mpnn_script
+        self.rfdiff_script = os.path.realpath(rfdiff_script) if rfdiff_script else None
+        self.mpnn_script = os.path.realpath(mpnn_script) if mpnn_script else None
         self.colabfold_cmd = colabfold_cmd
 
         # Internal state
@@ -205,20 +351,331 @@ class ChimeraScaffolder:
         self.preserved_donor_segments = intervals
         return intervals
 
+    def parse_vessel_intervals(self) -> List[Tuple[int, int]]:
+        """
+        Parses vessel residue intervals from vessel_metadata['intervals'] or range.
+        Handles unmodeled crystallographic loops and gaps.
+        Returns list of sorted (start, end) tuples.
+        """
+        raw_intervals = self.vessel_metadata.get("intervals", [])
+        intervals: List[Tuple[int, int]] = []
+        if raw_intervals:
+            for item in raw_intervals:
+                if isinstance(item, (tuple, list)) and len(item) == 2:
+                    intervals.append((int(item[0]), int(item[1])))
+                elif isinstance(item, str):
+                    m = re.match(r'^[A-Za-z]?(\d+)(?:\s*-\s*[A-Za-z]?(\d+))?$', item.strip())
+                    if m:
+                        s = int(m.group(1))
+                        e = int(m.group(2)) if m.group(2) is not None else s
+                        intervals.append((min(s, e), max(s, e)))
+        if not intervals:
+            v_min, v_max = self.vessel_metadata.get("range", (1, 100))
+            intervals = [(v_min, v_max)]
+
+        intervals.sort(key=lambda x: x[0])
+        return intervals
+
+    @staticmethod
+    def slice_intervals(intervals: List[Tuple[int, int]], keep_min: Optional[int], keep_max: Optional[int]) -> List[Tuple[int, int]]:
+        """
+        Clips a list of (start, end) intervals to [keep_min, keep_max] (inclusive).
+        Returns only the segments that fall within the bounds.
+        """
+        sliced = []
+        for s, e in intervals:
+            cur_s = s if keep_min is None else max(s, keep_min)
+            cur_e = e if keep_max is None else min(e, keep_max)
+            if cur_s <= cur_e:
+                sliced.append((cur_s, cur_e))
+        return sliced
+
+    @staticmethod
+    def format_segments_to_contig(segments: List[Tuple[int, int]], chain_label: str) -> str:
+        """
+        Formats a list of contiguous segments into an RFdiffusion contig string part.
+        Preserves internal gaps (e.g. crystallographic voids) between segments as 'gap-gap'.
+        """
+        parts = []
+        for idx, (s, e) in enumerate(segments):
+            if idx > 0:
+                prev_e = segments[idx - 1][1]
+                gap = s - prev_e - 1
+                if gap > 0:
+                    parts.append(f"{gap}-{gap}")
+            parts.append(f"{chain_label}{s}-{e}")
+        return "/".join(parts)
+
+    @staticmethod
+    def check_and_clamp_linker(
+        user_val: str,
+        param_name: str,
+        distance_angstrom: Optional[float],
+        junction_label: str
+    ) -> str:
+        """
+        Validates linker against physical Euclidean distance and applies biophysical clamping.
+        If user_val is 'auto', automatically injects the recommended range.
+        If max_len < L_ext_min, prints a prominent warning and auto-clamps to feasible span.
+        """
+        user_clean = str(user_val).strip()
+        if distance_angstrom is None or distance_angstrom <= 0:
+            if user_clean.lower() == "auto":
+                return "6-10"
+            return user_clean
+
+        l_ext_min = compute_extension_minimum(distance_angstrom)
+        rec_min, rec_max = compute_recommended_linker(distance_angstrom)
+        rec_str = f"{rec_min}-{rec_max}"
+
+        if user_clean.lower() == "auto":
+            print(f"[+] Dynamic linker budgeting for {param_name} ({junction_label}): {rec_str} (measured gap: {distance_angstrom:.1f} Å)")
+            return rec_str
+
+        # Parse user min and max
+        m = re.match(r'^(\d+)(?:-(\d+))?$', user_clean)
+        if not m:
+            return rec_str
+
+        u_min = int(m.group(1))
+        u_max = int(m.group(2)) if m.group(2) is not None else u_min
+        if u_min > u_max:
+            u_min, u_max = u_max, u_min
+
+        if u_max < l_ext_min:
+            print(
+                f"\n[WARNING] Physical Euclidean distance at {junction_label} is {distance_angstrom:.1f} Å.\n"
+                f"Specified {param_name} '{user_clean}' is physically incapable of spanning {distance_angstrom:.1f} Å "
+                f"(max reach = {u_max * 3.8:.1f} Å, requires at least {l_ext_min} aa).\n"
+                f"This WILL produce unphysical chain breaks and dotted lines in PyMOL!\n"
+                f"--> Auto-adjusting {param_name} to physically feasible span: '{rec_str}'\n"
+            )
+            return rec_str
+        elif u_min < l_ext_min:
+            u_min = l_ext_min
+            return f"{u_min}-{u_max}"
+
+        return user_clean
+
+    def measure_junctions(self) -> Dict[str, Any]:
+        """
+        Calculates exact 3D Euclidean distances and recommended linker lengths
+        for all junctions in the specified chimera mode.
+        """
+        if not self.working_donor_pdb or not self.working_vessel_pdb:
+            self.prepare_input_structures()
+
+        motif_segments = self.parse_motif_ranges()
+        vessel_intervals = self.parse_vessel_intervals()
+        v_min, v_max = self.vessel_metadata["range"]
+
+        donor_n_res = motif_segments[0][0]
+        donor_c_res = motif_segments[-1][1]
+
+        donor_n_coord = get_residue_ca_coords(self.working_donor_pdb, self.donor_chain_id, donor_n_res)
+        donor_c_coord = get_residue_ca_coords(self.working_donor_pdb, self.donor_chain_id, donor_c_res)
+
+        junctions: Dict[str, Any] = {}
+
+        if self.chimera_mode in ["replace", "graft"]:
+            if not self.vessel_replace_range:
+                mid = (v_min + v_max) // 2
+                rep_start = max(v_min + 5, mid - 10)
+                rep_end = min(v_max - 5, mid + 10)
+            else:
+                rep_match = re.match(r'^[A-Za-z]?(\d+)\s*-\s*[A-Za-z]?(\d+)$', str(self.vessel_replace_range).strip())
+                if not rep_match:
+                    raise ValueError(
+                        f"Invalid vessel_replace_range: '{self.vessel_replace_range}'. "
+                        "Expected format: 'START-END' (e.g. '55-70')."
+                    )
+                rep_start = int(rep_match.group(1))
+                rep_end = int(rep_match.group(2))
+                if rep_start > rep_end:
+                    rep_start, rep_end = rep_end, rep_start
+
+            left_segs = self.slice_intervals(vessel_intervals, None, rep_start - 1)
+            right_segs = self.slice_intervals(vessel_intervals, rep_end + 1, None)
+
+            if left_segs:
+                v_left_res = left_segs[-1][1]
+                v_left_coord = get_residue_ca_coords(self.working_vessel_pdb, self.vessel_chain_id, v_left_res)
+                if v_left_coord is not None and donor_n_coord is not None:
+                    d_n = calculate_anchor_distance(v_left_coord, donor_n_coord)
+                    r_min, r_max = compute_recommended_linker(d_n)
+                    junctions["n_term"] = {
+                        "param": "linker_n",
+                        "description": f"N-terminal Junction (Vessel res {v_left_res} -> Donor res {donor_n_res})",
+                        "distance_angstrom": round(d_n, 2),
+                        "ext_min": compute_extension_minimum(d_n),
+                        "glob_min": max(3, int(math.ceil(d_n / 3.0))),
+                        "recommended_range": f"{r_min}-{r_max}",
+                        "recommended_min": r_min,
+                        "recommended_max": r_max,
+                        "vessel_anchor": {"resi": v_left_res, "chain": self.vessel_chain_id, "coord": v_left_coord.tolist()},
+                        "donor_anchor": {"resi": donor_n_res, "chain": self.donor_chain_id, "coord": donor_n_coord.tolist()}
+                    }
+
+            if right_segs:
+                v_right_res = right_segs[0][0]
+                v_right_coord = get_residue_ca_coords(self.working_vessel_pdb, self.vessel_chain_id, v_right_res)
+                if donor_c_coord is not None and v_right_coord is not None:
+                    d_c = calculate_anchor_distance(donor_c_coord, v_right_coord)
+                    r_min, r_max = compute_recommended_linker(d_c)
+                    junctions["c_term"] = {
+                        "param": "linker_c",
+                        "description": f"C-terminal Junction (Donor res {donor_c_res} -> Vessel res {v_right_res})",
+                        "distance_angstrom": round(d_c, 2),
+                        "ext_min": compute_extension_minimum(d_c),
+                        "glob_min": max(3, int(math.ceil(d_c / 3.0))),
+                        "recommended_range": f"{r_min}-{r_max}",
+                        "recommended_min": r_min,
+                        "recommended_max": r_max,
+                        "donor_anchor": {"resi": donor_c_res, "chain": self.donor_chain_id, "coord": donor_c_coord.tolist()},
+                        "vessel_anchor": {"resi": v_right_res, "chain": self.vessel_chain_id, "coord": v_right_coord.tolist()}
+                    }
+
+        elif self.chimera_mode in ["insert_loop", "loop", "insert"]:
+            split_at = self.vessel_split_after
+            if split_at is None:
+                split_at = (v_min + v_max) // 2
+
+            left_segs = self.slice_intervals(vessel_intervals, None, split_at)
+            right_segs = self.slice_intervals(vessel_intervals, split_at + 1, None)
+
+            if left_segs:
+                v_left_res = left_segs[-1][1]
+                v_left_coord = get_residue_ca_coords(self.working_vessel_pdb, self.vessel_chain_id, v_left_res)
+                if v_left_coord is not None and donor_n_coord is not None:
+                    d_n = calculate_anchor_distance(v_left_coord, donor_n_coord)
+                    r_min, r_max = compute_recommended_linker(d_n)
+                    junctions["n_term"] = {
+                        "param": "linker_n",
+                        "description": f"N-terminal Junction (Vessel split res {v_left_res} -> Donor res {donor_n_res})",
+                        "distance_angstrom": round(d_n, 2),
+                        "ext_min": compute_extension_minimum(d_n),
+                        "glob_min": max(3, int(math.ceil(d_n / 3.0))),
+                        "recommended_range": f"{r_min}-{r_max}",
+                        "recommended_min": r_min,
+                        "recommended_max": r_max,
+                        "vessel_anchor": {"resi": v_left_res, "chain": self.vessel_chain_id, "coord": v_left_coord.tolist()},
+                        "donor_anchor": {"resi": donor_n_res, "chain": self.donor_chain_id, "coord": donor_n_coord.tolist()}
+                    }
+
+            if right_segs:
+                v_right_res = right_segs[0][0]
+                v_right_coord = get_residue_ca_coords(self.working_vessel_pdb, self.vessel_chain_id, v_right_res)
+                if donor_c_coord is not None and v_right_coord is not None:
+                    d_c = calculate_anchor_distance(donor_c_coord, v_right_coord)
+                    r_min, r_max = compute_recommended_linker(d_c)
+                    junctions["c_term"] = {
+                        "param": "linker_c",
+                        "description": f"C-terminal Junction (Donor res {donor_c_res} -> Vessel res {v_right_res})",
+                        "distance_angstrom": round(d_c, 2),
+                        "ext_min": compute_extension_minimum(d_c),
+                        "glob_min": max(3, int(math.ceil(d_c / 3.0))),
+                        "recommended_range": f"{r_min}-{r_max}",
+                        "recommended_min": r_min,
+                        "recommended_max": r_max,
+                        "donor_anchor": {"resi": donor_c_res, "chain": self.donor_chain_id, "coord": donor_c_coord.tolist()},
+                        "vessel_anchor": {"resi": v_right_res, "chain": self.vessel_chain_id, "coord": v_right_coord.tolist()}
+                    }
+
+        elif self.chimera_mode in ["ligate_nterm", "nterm"]:
+            v_n_res = vessel_intervals[0][0]
+            v_n_coord = get_residue_ca_coords(self.working_vessel_pdb, self.vessel_chain_id, v_n_res)
+            if donor_c_coord is not None and v_n_coord is not None:
+                d = calculate_anchor_distance(donor_c_coord, v_n_coord)
+                r_min, r_max = compute_recommended_linker(d)
+                junctions["c_term"] = {
+                    "param": "linker_c",
+                    "description": f"N-terminal Ligation (Donor C-term res {donor_c_res} -> Vessel N-term res {v_n_res})",
+                    "distance_angstrom": round(d, 2),
+                    "ext_min": compute_extension_minimum(d),
+                    "glob_min": max(3, int(math.ceil(d / 3.0))),
+                    "recommended_range": f"{r_min}-{r_max}",
+                    "recommended_min": r_min,
+                    "recommended_max": r_max,
+                    "donor_anchor": {"resi": donor_c_res, "chain": self.donor_chain_id, "coord": donor_c_coord.tolist()},
+                    "vessel_anchor": {"resi": v_n_res, "chain": self.vessel_chain_id, "coord": v_n_coord.tolist()}
+                }
+
+        elif self.chimera_mode in ["ligate_cterm", "cterm"]:
+            v_c_res = vessel_intervals[-1][1]
+            v_c_coord = get_residue_ca_coords(self.working_vessel_pdb, self.vessel_chain_id, v_c_res)
+            if v_c_coord is not None and donor_n_coord is not None:
+                d = calculate_anchor_distance(v_c_coord, donor_n_coord)
+                r_min, r_max = compute_recommended_linker(d)
+                junctions["n_term"] = {
+                    "param": "linker_n",
+                    "description": f"C-terminal Ligation (Vessel C-term res {v_c_res} -> Donor N-term res {donor_n_res})",
+                    "distance_angstrom": round(d, 2),
+                    "ext_min": compute_extension_minimum(d),
+                    "glob_min": max(3, int(math.ceil(d / 3.0))),
+                    "recommended_range": f"{r_min}-{r_max}",
+                    "recommended_min": r_min,
+                    "recommended_max": r_max,
+                    "vessel_anchor": {"resi": v_c_res, "chain": self.vessel_chain_id, "coord": v_c_coord.tolist()},
+                    "donor_anchor": {"resi": donor_n_res, "chain": self.donor_chain_id, "coord": donor_n_coord.tolist()}
+                }
+
+        return {
+            "mode": self.chimera_mode,
+            "junctions": junctions
+        }
+
+    # Efficient alias for junction measurement
+    measure_junction_distances = measure_junctions
+
     def compute_contigs_and_segments(self) -> Tuple[str, List[Tuple[int, int]], List[Tuple[int, int]]]:
         """
         Computes RFdiffusion contigs and list of preserved donor & vessel segments
         based on the selected chimera_mode.
+        Applies crystallographic gap awareness and biophysical linker clamping.
 
         Returns (contig_string, preserved_donor_segments, preserved_vessel_segments).
         """
+        if not self.working_donor_pdb or not self.working_vessel_pdb:
+            self.prepare_input_structures()
+
         motif_segments = self.parse_motif_ranges()
+        vessel_intervals = self.parse_vessel_intervals()
         v_min, v_max = self.vessel_metadata["range"]
 
-        # Validate linker specifications
+        # Validate linker specifications initially
         for lname, lval in [("linker_n", self.linker_n), ("linker_c", self.linker_c)]:
-            if not re.match(r'^\d+(-\d+)?$', str(lval).strip()):
-                raise ValueError(f"Invalid format for {lname}: '{lval}'. Expected format: 'LEN' or 'MIN-MAX' (e.g. '6-10').")
+            if not re.match(r'^(auto|\d+(-\d+)?)$', str(lval).strip(), re.IGNORECASE):
+                raise ValueError(f"Invalid format for {lname}: '{lval}'. Expected format: 'auto', 'LEN', or 'MIN-MAX' (e.g. '6-10').")
+
+        # Measure junctions for distances and clamping
+        measure_info = self.measure_junctions()
+        junctions = measure_info.get("junctions", {})
+
+        if self.clamp_linkers:
+            if "n_term" in junctions and junctions["n_term"].get("param") == "linker_n":
+                j = junctions["n_term"]
+                self.linker_n = self.check_and_clamp_linker(self.linker_n, "linker_n", j["distance_angstrom"], j["description"])
+            elif "c_term" in junctions and junctions["c_term"].get("param") == "linker_n":
+                j = junctions["c_term"]
+                self.linker_n = self.check_and_clamp_linker(self.linker_n, "linker_n", j["distance_angstrom"], j["description"])
+            elif str(self.linker_n).strip().lower() == "auto":
+                self.linker_n = "6-10"
+
+            if "c_term" in junctions and junctions["c_term"].get("param") == "linker_c":
+                j = junctions["c_term"]
+                self.linker_c = self.check_and_clamp_linker(self.linker_c, "linker_c", j["distance_angstrom"], j["description"])
+            elif "n_term" in junctions and junctions["n_term"].get("param") == "linker_c":
+                j = junctions["n_term"]
+                self.linker_c = self.check_and_clamp_linker(self.linker_c, "linker_c", j["distance_angstrom"], j["description"])
+            elif str(self.linker_c).strip().lower() == "auto":
+                self.linker_c = "6-10"
+        else:
+            if str(self.linker_n).strip().lower() == "auto":
+                j = junctions.get("n_term", {}) if junctions.get("n_term", {}).get("param") == "linker_n" else junctions.get("c_term", {})
+                self.linker_n = j.get("recommended_range", "6-10")
+            if str(self.linker_c).strip().lower() == "auto":
+                j = junctions.get("c_term", {}) if junctions.get("c_term", {}).get("param") == "linker_c" else junctions.get("n_term", {})
+                self.linker_c = j.get("recommended_range", "6-10")
 
         # Donor chain label in seed PDB will be 'D', Vessel will be 'V'
         d_label = "D"
@@ -251,61 +708,61 @@ class ChimeraScaffolder:
             else:
                 rep_match = re.match(r'^[A-Za-z]?(\d+)\s*-\s*[A-Za-z]?(\d+)$', str(self.vessel_replace_range).strip())
                 if not rep_match:
-                    raise ValueError(f"Invalid vessel_replace_range: '{self.vessel_replace_range}'. Expected format: 'START-END' (e.g. '55-70').")
+                    raise ValueError(
+                        f"Invalid vessel_replace_range: '{self.vessel_replace_range}'. "
+                        "Expected format: 'START-END' (e.g. '55-70')."
+                    )
                 rep_start = int(rep_match.group(1))
                 rep_end = int(rep_match.group(2))
                 if rep_start > rep_end:
                     rep_start, rep_end = rep_end, rep_start
 
-            # Left flank: v_min to rep_start - 1
-            left_end = rep_start - 1
-            # Right flank: rep_end + 1 to v_max
-            right_start = rep_end + 1
+            left_segs = self.slice_intervals(vessel_intervals, None, rep_start - 1)
+            right_segs = self.slice_intervals(vessel_intervals, rep_end + 1, None)
 
             contig_pieces = []
-            if left_end >= v_min:
-                contig_pieces.append(f"{v_label}{v_min}-{left_end}")
-                vessel_segments.append((v_min, left_end))
+            if left_segs:
+                contig_pieces.append(self.format_segments_to_contig(left_segs, v_label))
+                vessel_segments.extend(left_segs)
             contig_pieces.append(self.linker_n)
             contig_pieces.append(motif_contig_str)
             contig_pieces.append(self.linker_c)
-            if right_start <= v_max:
-                contig_pieces.append(f"{v_label}{right_start}-{v_max}")
-                vessel_segments.append((right_start, v_max))
+            if right_segs:
+                contig_pieces.append(self.format_segments_to_contig(right_segs, v_label))
+                vessel_segments.extend(right_segs)
 
             self.contig_string = "/".join(contig_pieces)
 
         elif self.chimera_mode in ["ligate_nterm", "nterm"]:
-            # Motif -> Linker -> Full Vessel
-            vessel_segments.append((v_min, v_max))
-            self.contig_string = f"{motif_contig_str}/{self.linker_c}/{v_label}{v_min}-{v_max}"
+            vessel_segments.extend(vessel_intervals)
+            v_contig = self.format_segments_to_contig(vessel_intervals, v_label)
+            self.contig_string = f"{motif_contig_str}/{self.linker_c}/{v_contig}"
 
         elif self.chimera_mode in ["ligate_cterm", "cterm"]:
-            # Full Vessel -> Linker -> Motif
-            vessel_segments.append((v_min, v_max))
-            self.contig_string = f"{v_label}{v_min}-{v_max}/{self.linker_n}/{motif_contig_str}"
+            vessel_segments.extend(vessel_intervals)
+            v_contig = self.format_segments_to_contig(vessel_intervals, v_label)
+            self.contig_string = f"{v_contig}/{self.linker_n}/{motif_contig_str}"
 
         elif self.chimera_mode in ["insert_loop", "loop", "insert"]:
-            # Split vessel at split point
             split_at = self.vessel_split_after
             if split_at is None:
                 split_at = (v_min + v_max) // 2
             elif not (v_min <= split_at <= v_max):
                 raise ValueError(f"vessel_split_after ({split_at}) is out of vessel residue range [{v_min}, {v_max}].")
 
-            left_end = split_at
-            right_start = split_at + 1
+            left_segs = self.slice_intervals(vessel_intervals, None, split_at)
+            right_segs = self.slice_intervals(vessel_intervals, split_at + 1, None)
 
             contig_pieces = []
-            if left_end >= v_min:
-                contig_pieces.append(f"{v_label}{v_min}-{left_end}")
-                vessel_segments.append((v_min, left_end))
+            if left_segs:
+                contig_pieces.append(self.format_segments_to_contig(left_segs, v_label))
+                vessel_segments.extend(left_segs)
             contig_pieces.append(self.linker_n)
             contig_pieces.append(motif_contig_str)
             contig_pieces.append(self.linker_c)
-            if right_start <= v_max:
-                contig_pieces.append(f"{v_label}{right_start}-{v_max}")
-                vessel_segments.append((right_start, v_max))
+            if right_segs:
+                contig_pieces.append(self.format_segments_to_contig(right_segs, v_label))
+                vessel_segments.extend(right_segs)
 
             self.contig_string = "/".join(contig_pieces)
 
@@ -444,28 +901,28 @@ class ChimeraScaffolder:
                 self.working_vessel_pdb, chain_id=self.vessel_chain_id, residue_list=ref_vessel_res, atom_names=["CA"], extract_meta=False
             )
 
-            # Map donor residues by distance matching (< 0.20 Å for pinned coordinates)
+            # Map donor residues by distance matching (< 0.20 Å for pinned coordinates, sq_dist < 0.04)
             if len(bb_ca_coords) > 0 and len(donor_ca_coords) > 0:
                 d_found = []
                 for d_coord in donor_ca_coords:
                     diffs = bb_ca_coords - d_coord
-                    dists = np.linalg.norm(diffs, axis=1)
-                    min_idx = int(np.argmin(dists))
-                    if dists[min_idx] < 0.20:
+                    sq_dists = np.sum(diffs * diffs, axis=1)
+                    min_idx = int(np.argmin(sq_dists))
+                    if sq_dists[min_idx] < 0.04:  # (0.20 Å)^2 avoids square root calculations
                         res_num_1based = min_idx + 1  # 1-based sequential residue index in backbone
                         d_found.append(res_num_1based)
                 if len(d_found) == len(ref_donor_res):
                     donor_fixed = d_found
                     matched_via_coords = True
 
-            # Map vessel residues by distance matching (< 0.20 Å for pinned coordinates)
+            # Map vessel residues by distance matching (< 0.20 Å for pinned coordinates, sq_dist < 0.04)
             if self.lock_vessel and len(bb_ca_coords) > 0 and len(vessel_ca_coords) > 0:
                 v_found = []
                 for v_coord in vessel_ca_coords:
                     diffs = bb_ca_coords - v_coord
-                    dists = np.linalg.norm(diffs, axis=1)
-                    min_idx = int(np.argmin(dists))
-                    if dists[min_idx] < 0.20:
+                    sq_dists = np.sum(diffs * diffs, axis=1)
+                    min_idx = int(np.argmin(sq_dists))
+                    if sq_dists[min_idx] < 0.04:  # (0.20 Å)^2 avoids square root calculations
                         res_num_1based = min_idx + 1
                         v_found.append(res_num_1based)
                 if len(v_found) == len(ref_vessel_res):
@@ -553,6 +1010,17 @@ class ChimeraScaffolder:
 
         # Step 1: Formulate RFdiffusion execution command
         # Pin coordinates with noise_scale=0.0 to prevent drifting of preserved atoms
+        work_prep = os.path.join(self.out_dir, "0_prep")
+        contig_plan_path = os.path.realpath(os.path.join(work_prep, "contig_plan.txt"))
+        with open(contig_plan_path, "w", encoding="utf-8", buffering=65536) as cpf:
+            cpf.write(f"Contig Formula: {self.contig_string}\n")
+            cpf.write(f"Chimera Mode: {self.chimera_mode}\n")
+            cpf.write(f"Linker N: {self.linker_n}\n")
+            cpf.write(f"Linker C: {self.linker_c}\n")
+            cpf.write(f"Preserved Donor Segments: {self.preserved_donor_segments}\n")
+            cpf.write(f"Preserved Vessel Segments: {self.preserved_vessel_segments}\n")
+        summary_data["contig_plan"] = contig_plan_path
+
         rfdiff_cmd = [
             sys.executable,
             self.rfdiff_script or "scripts/run_inference.py",
@@ -578,7 +1046,7 @@ class ChimeraScaffolder:
             # Create synthetic/mock backbone placeholder in dry_run or fallback
             # RFdiffusion outputs single-chain designs (usually Chain A) with contiguous residues
             mock_bb = os.path.join(work_rfdiff, "chimera_design_0.pdb")
-            with open(self.seed_pdb_path, "r", encoding="utf-8") as sf, open(mock_bb, "w", encoding="utf-8") as mf:
+            with open(self.seed_pdb_path, "r", encoding="utf-8", buffering=65536) as sf, open(mock_bb, "w", encoding="utf-8", buffering=65536) as mf:
                 curr_resi = 0
                 prev_orig_resi = None
                 prev_orig_ch = None
@@ -674,17 +1142,17 @@ class ChimeraScaffolder:
             metrics_rows.append(row)
 
             if passed:
-                res_dest = os.path.abspath(os.path.join(work_results, f"{safe_bb_base}_passed.pdb"))
-                if not (res_dest.startswith(os.path.abspath(work_results) + os.sep)):
+                res_dest = os.path.realpath(os.path.join(work_results, f"{safe_bb_base}_passed.pdb"))
+                if os.path.commonpath([os.path.realpath(work_results), res_dest]) != os.path.realpath(work_results):
                     raise ValueError(f"Path traversal detected in model destination: {res_dest}")
                 shutil.copyfile(bb_path, res_dest)
                 passing_models.append(res_dest)
 
-        # Output metrics_summary.csv strictly within out_dir
+        # Output metrics_summary.csv strictly within out_dir using 64KB buffering
         csv_path = os.path.realpath(os.path.join(self.out_dir, "metrics_summary.csv"))
-        if not (csv_path.startswith(self.out_dir + os.sep) or csv_path.startswith(self.out_dir + "/")):
+        if os.path.commonpath([self.out_dir, csv_path]) != self.out_dir:
             raise ValueError(f"Path traversal detected in metrics CSV destination: {csv_path}")
-        with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
+        with open(csv_path, "w", newline="", encoding="utf-8", buffering=65536) as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=["model_id", "backbone_path", "motif_rmsd", "plddt", "verdict"])
             writer.writeheader()
             for r in metrics_rows:
@@ -696,11 +1164,11 @@ class ChimeraScaffolder:
         summary_data["total_candidates"] = len(metrics_rows)
         summary_data["passing_candidates"] = len(passing_models)
 
-        # Output chimera_summary.json strictly within out_dir
+        # Output chimera_summary.json strictly within out_dir using 64KB buffering
         summary_json = os.path.realpath(os.path.join(self.out_dir, "chimera_summary.json"))
-        if not (summary_json.startswith(self.out_dir + os.sep) or summary_json.startswith(self.out_dir + "/")):
+        if os.path.commonpath([self.out_dir, summary_json]) != self.out_dir:
             raise ValueError(f"Path traversal detected in summary JSON destination: {summary_json}")
-        with open(summary_json, "w", encoding="utf-8") as f:
+        with open(summary_json, "w", encoding="utf-8", buffering=65536) as f:
             json.dump(summary_data, f, indent=2)
 
         # Generate Automated Methodology & Reproducibility Report
@@ -769,28 +1237,126 @@ class ChimeraScaffolder:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Chimera Scaffolding: Graft active motifs into host scaffold proteins.")
-    parser.add_argument("--input_file", "-i", help="Input multi-chain PDB or PyMOL session (.pse) file")
+    if len(sys.argv) > 1 and sys.argv[1] == "measure_junctions":
+        meas_parser = argparse.ArgumentParser(
+            description="Measure 3D junction distances and recommend linker bounds."
+        )
+        meas_parser.add_argument("cmd", choices=["measure_junctions"], help="Subcommand")
+        meas_parser.add_argument("--input_file", "--input", "-i", dest="input_file", help="Input PDB or PSE file")
+        meas_parser.add_argument("--donor_pdb", help="Standalone donor PDB")
+        meas_parser.add_argument("--vessel_pdb", help="Standalone vessel PDB")
+        meas_parser.add_argument("--donor_id", default="A", help="Donor chain ID or object name [Default: A]")
+        meas_parser.add_argument("--vessel_id", default="B", help="Vessel chain ID or object name [Default: B]")
+        meas_parser.add_argument("--motif_residues", "-m", default="all", help="Donor motif residues [Default: all]")
+        meas_parser.add_argument(
+            "--chimera_mode", "--mode", dest="chimera_mode", default="replace",
+            choices=["replace", "ligate_nterm", "ligate_cterm", "insert_loop"],
+            help="Chimera mode"
+        )
+        meas_parser.add_argument(
+            "--vessel_replace_range", "--replace_range", dest="vessel_replace_range",
+            help="Residue range to excise on vessel"
+        )
+        meas_parser.add_argument(
+            "--vessel_split_after", "--split_after", dest="vessel_split_after", type=int,
+            help="Split residue for insert_loop"
+        )
+        meas_parser.add_argument("--out_dir", "-o", default="outputs/chimera_scaffold", help="Output directory")
+
+        meas_args = meas_parser.parse_args()
+        scaffolder = ChimeraScaffolder(
+            input_file=meas_args.input_file,
+            donor_pdb=meas_args.donor_pdb,
+            vessel_pdb=meas_args.vessel_pdb,
+            donor_id=meas_args.donor_id,
+            vessel_id=meas_args.vessel_id,
+            motif_residues=meas_args.motif_residues,
+            chimera_mode=meas_args.chimera_mode,
+            vessel_replace_range=meas_args.vessel_replace_range,
+            vessel_split_after=meas_args.vessel_split_after,
+            out_dir=meas_args.out_dir,
+            clamp_linkers=False,
+            dry_run=True
+        )
+        res = scaffolder.measure_junctions()
+        print(json.dumps(res, indent=2))
+        sys.exit(0)
+
+    parser = argparse.ArgumentParser(
+        description="Chimera Scaffolding: Graft active motifs into host scaffold proteins."
+    )
+    parser.add_argument(
+        "--input_file", "--input", "-i", dest="input_file",
+        help="Input multi-chain PDB or PyMOL session (.pse) file"
+    )
     parser.add_argument("--donor_pdb", help="Path to standalone donor PDB")
     parser.add_argument("--vessel_pdb", help="Path to standalone vessel PDB")
     parser.add_argument("--donor_id", default="A", help="Donor chain ID or object name [Default: A]")
     parser.add_argument("--vessel_id", default="B", help="Vessel chain ID or object name [Default: B]")
-    parser.add_argument("--motif_residues", "-m", required=True, help="Donor motif residue range(s) (e.g. '30-45' or '30-45,78-82')")
-    parser.add_argument("--chimera_mode", choices=["replace", "ligate_nterm", "ligate_cterm", "insert_loop"], default="replace", help="Chimera architecture mode")
-    parser.add_argument("--vessel_replace_range", help="Residue range to excise on vessel (e.g. '55-70')")
-    parser.add_argument("--vessel_split_after", type=int, help="Residue after which to split vessel for loop insertion (e.g. 54)")
+    parser.add_argument(
+        "--motif_residues", "-m", required=True,
+        help="Donor motif residue range(s) (e.g. '30-45' or '30-45,78-82')"
+    )
+    parser.add_argument(
+        "--chimera_mode", "--mode", dest="chimera_mode",
+        choices=["replace", "ligate_nterm", "ligate_cterm", "insert_loop"],
+        default="replace", help="Chimera architecture mode"
+    )
+    parser.add_argument(
+        "--vessel_replace_range", "--replace_range", dest="vessel_replace_range",
+        help="Residue range to excise on vessel (e.g. '55-70')"
+    )
+    parser.add_argument(
+        "--vessel_split_after", "--split_after", dest="vessel_split_after", type=int,
+        help="Residue after which to split vessel for loop insertion (e.g. 54)"
+    )
     parser.add_argument("--linker_n", default="6-10", help="N-terminal linker length or range [Default: 6-10]")
     parser.add_argument("--linker_c", default="6-10", help="C-terminal linker length or range [Default: 6-10]")
-    parser.add_argument("--lock_vessel", action="store_true", default=True, help="Lock vessel framework residue positions in ProteinMPNN [Default: True]")
-    parser.add_argument("--no_lock_vessel", dest="lock_vessel", action="store_false", help="Allow ProteinMPNN to redesign vessel framework residues")
-    parser.add_argument("--num_designs", type=int, default=10, help="Number of RFdiffusion backbones [Default: 10]")
-    parser.add_argument("--mpnn_seqs_per_bb", type=int, default=2, help="ProteinMPNN sequences per backbone [Default: 2]")
-    parser.add_argument("--mpnn_temp", type=float, default=0.1, help="ProteinMPNN temperature [Default: 0.1]")
-    parser.add_argument("--mpnn_batch_size", type=int, default=1, help="Parallel GPU batch size for ProteinMPNN [Default: 1]")
-    parser.add_argument("--rmsd_threshold", type=float, default=1.0, help="Kabsch RMSD cutoff in Å [Default: 1.0]")
-    parser.add_argument("--plddt_threshold", type=float, default=75.0, help="pLDDT quality cutoff [Default: 75.0]")
+    parser.add_argument(
+        "--lock_vessel", action="store_true", default=True,
+        help="Lock vessel framework residue positions in ProteinMPNN [Default: True]"
+    )
+    parser.add_argument(
+        "--no_lock_vessel", dest="lock_vessel", action="store_false",
+        help="Allow ProteinMPNN to redesign vessel framework residues"
+    )
+    parser.add_argument(
+        "--clamp_linkers", dest="clamp_linkers", action="store_true", default=True,
+        help="Biophysically clamp impossible linkers [Default: True]"
+    )
+    parser.add_argument(
+        "--no_clamp_linkers", dest="clamp_linkers", action="store_false",
+        help="Disable biophysical clamping of linkers"
+    )
+    parser.add_argument(
+        "--num_designs", type=int, default=10,
+        help="Number of RFdiffusion backbones [Default: 10]"
+    )
+    parser.add_argument(
+        "--mpnn_seqs_per_bb", type=int, default=2,
+        help="ProteinMPNN sequences per backbone [Default: 2]"
+    )
+    parser.add_argument(
+        "--mpnn_temp", type=float, default=0.1,
+        help="ProteinMPNN temperature [Default: 0.1]"
+    )
+    parser.add_argument(
+        "--mpnn_batch_size", type=int, default=1,
+        help="Parallel GPU batch size for ProteinMPNN [Default: 1]"
+    )
+    parser.add_argument(
+        "--rmsd_threshold", type=float, default=1.0,
+        help="Kabsch RMSD cutoff in Å [Default: 1.0]"
+    )
+    parser.add_argument(
+        "--plddt_threshold", type=float, default=75.0,
+        help="pLDDT quality cutoff [Default: 75.0]"
+    )
     parser.add_argument("--out_dir", "-o", default="outputs/chimera_scaffold", help="Output directory")
-    parser.add_argument("--dry_run", action="store_true", help="Prepare contigs, seed, and masks without GPU inference")
+    parser.add_argument(
+        "--dry_run", action="store_true",
+        help="Prepare contigs, seed, and masks without GPU inference"
+    )
 
     args = parser.parse_args()
 
@@ -807,6 +1373,7 @@ def main():
         linker_n=args.linker_n,
         linker_c=args.linker_c,
         lock_vessel=args.lock_vessel,
+        clamp_linkers=args.clamp_linkers,
         num_designs=args.num_designs,
         mpnn_seqs_per_bb=args.mpnn_seqs_per_bb,
         mpnn_temp=args.mpnn_temp,

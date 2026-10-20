@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# autoscaffold - Root Global Executable Launcher
+# Resolves canonical directory of AutoScaffold across symlinks
+# and forwards all invocations transparently to autoscaffold_suite.sh.
+set -e
+
+# Fast canonical directory resolution avoiding redundant external process forks
+resolve_target() {
+    local source="${BASH_SOURCE[0]}"
+    while [ -h "$source" ]; do
+        local clean="${source//\\//}"
+        local dir="${clean%/*}"
+        [ "$dir" = "$clean" ] && dir="$(dirname "$source")"
+        dir="$(cd -P "$dir" 2>/dev/null && echo "$PWD")"
+        source="$(readlink "$source")"
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    local clean="${source//\\//}"
+    local final_dir="${clean%/*}"
+    [ "$final_dir" = "$clean" ] && final_dir="$(dirname "$source")"
+    (cd -P "$final_dir" 2>/dev/null && echo "$PWD")
+}
+
+LAUNCHER_DIR="$(resolve_target)"
+
+# If installed via symlink into ~/.local/bin or /usr/local/bin, resolve target repository root
+if [ -f "$LAUNCHER_DIR/autoscaffold_suite.sh" ]; then
+    AUTOSCAFFOLD_HOME="$LAUNCHER_DIR"
+elif [ -n "$AUTOSCAFFOLD_DIR" ] && [ -f "$AUTOSCAFFOLD_DIR/autoscaffold_suite.sh" ]; then
+    AUTOSCAFFOLD_HOME="$AUTOSCAFFOLD_DIR"
+elif [ -n "$HOME" ] && [ -f "$HOME/.autoscaffold_home" ] && [ -f "$(head -n 1 "$HOME/.autoscaffold_home" 2>/dev/null)/autoscaffold_suite.sh" ]; then
+    AUTOSCAFFOLD_HOME="$(head -n 1 "$HOME/.autoscaffold_home" 2>/dev/null)"
+else
+    # Fallback to configured install target or parent directory
+    clean_launcher="${LAUNCHER_DIR//\\//}"
+    PARENT_DIR="${clean_launcher%/*}"
+    [ "$PARENT_DIR" = "$clean_launcher" ] && PARENT_DIR="$(dirname "$LAUNCHER_DIR")"
+    if [ -f "$PARENT_DIR/autoscaffold_suite.sh" ]; then
+        AUTOSCAFFOLD_HOME="$(cd -P "$PARENT_DIR" 2>/dev/null && echo "$PWD")"
+    else
+        echo -e "\033[0;31m[ERROR] AutoScaffold repository root could not be located.\033[0m"
+        echo -e "Please set export AUTOSCAFFOLD_DIR=/path/to/autoscaffold in your environment."
+        exit 1
+    fi
+fi
+
+if [ -z "$AUTOSCAFFOLD_HOME" ] || [ "$AUTOSCAFFOLD_HOME" = "/" ] || [ "$AUTOSCAFFOLD_HOME" = "\\" ] || [[ "$AUTOSCAFFOLD_HOME" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+    echo -e "\033[0;31m[ERROR] Invalid or dangerous repository root: '$AUTOSCAFFOLD_HOME'.\033[0m"
+    exit 1
+fi
+export AUTOSCAFFOLD_HOME
+export AUTOSCAFFOLD_CALLER_PWD="${PWD}"
+
+# Execute master suite with transparent argument forwarding
+exec bash "$AUTOSCAFFOLD_HOME/autoscaffold_suite.sh" "$@"
