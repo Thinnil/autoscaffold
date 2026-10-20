@@ -20,6 +20,7 @@ import gzip
 import zlib
 import pickle
 import json
+import math
 import argparse
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -46,6 +47,7 @@ class SafeSessionUnpickler(pickle.Unpickler):
         # Codecs / reconstruction
         ("_codecs", "encode"),
         ("copy_reg", "_reconstructor"),
+        ("copyreg", "_reconstructor"),
         # NumPy data structures (scientific metadata & RFdiffusion .trb)
         ("numpy", "ndarray"), ("numpy", "dtype"),
         ("numpy.core.multiarray", "_reconstruct"),
@@ -60,6 +62,7 @@ class SafeSessionUnpickler(pickle.Unpickler):
             class DummySessionClass:
                 def __init__(self, *args, **kwargs):
                     pass
+
                 def __setstate__(self, state):
                     if isinstance(state, dict):
                         self.__dict__.update(state)
@@ -104,6 +107,41 @@ def safe_join_path(base_dir: str, *paths: str) -> str:
         raise ValueError(f"Path traversal detected: {paths} resolves outside {base_dir}")
     return target_abs
 
+
+def validate_output_dir(out_dir: str) -> str:
+    """
+    Validates that out_dir is non-empty, not root, and not a dangerous system directory.
+    Returns canonical real path.
+    """
+    if not out_dir or not str(out_dir).strip():
+        raise ValueError("Output directory cannot be empty.")
+    raw_str = str(out_dir).strip()
+    real_out = os.path.realpath(os.path.abspath(raw_str))
+    if real_out in ("/", "\\") or (len(real_out) <= 3 and real_out.endswith(":\\")):
+        raise ValueError(f"Dangerous or root output directory specified: '{out_dir}'")
+
+    # Check normalized paths with forward slashes across POSIX and Windows drives
+    norm_posix = real_out.replace("\\", "/").lower()
+    raw_posix = raw_str.replace("\\", "/").lower()
+    drive_stripped = re.sub(r'^[a-zA-Z]:', '', norm_posix)
+
+    for sys_dir in ("/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/windows", "/program files"):
+        if (norm_posix == sys_dir or norm_posix.startswith(sys_dir + "/") or
+            drive_stripped == sys_dir or drive_stripped.startswith(sys_dir + "/") or
+            raw_posix == sys_dir or raw_posix.startswith(sys_dir + "/")):
+            raise ValueError(f"Output directory cannot be in system directory: '{out_dir}'")
+    return real_out
+
+
+def validate_pse_safety(pse_path: str) -> None:
+    """
+    Strictly pre-validates that a .pse file does not contain unsafe pickle classes
+    by executing parse_pse_standalone with SafeSessionUnpickler.
+    Raises RuntimeError or pickle.UnpicklingError if prohibited classes are present.
+    """
+    parse_pse_standalone(pse_path)
+
+
 # Standard 3-letter to 1-letter amino acid conversion dictionary
 AA_3TO1 = {
     "ALA": "A", "CYS": "C", "ASP": "D", "GLU": "E", "PHE": "F",
@@ -118,18 +156,45 @@ def aa_to_one_letter(resn: str) -> str:
     return AA_3TO1.get(resn.strip().upper(), "X")
 
 
+# In-memory session cache for parsed PDB metadata:
+# Key: (real_path, mtime) -> dict
+_PDB_PARSE_CACHE: Dict[Tuple[str, float], Dict[str, Any]] = {}
+
+
+def clear_pdb_parse_cache() -> None:
+    """Clears the in-memory parsed PDB file metadata cache."""
+    _PDB_PARSE_CACHE.clear()
+
+
 # -----------------------------------------------------------------------------
 # PDB Parsing and Extraction Routines
 # -----------------------------------------------------------------------------
 
-def parse_pdb_file(pdb_path: str, buffer_size: int = 65536) -> Dict[str, Any]:
+def parse_pdb_file(pdb_path: str, buffer_size: int = 65536, use_cache: bool = True) -> Dict[str, Any]:
     """
     Parses a PDB file and groups atom records by chain ID in a single streaming pass.
     Uses buffered stream reading and avoids redundant line allocations in memory.
+    Caches parsed metadata by file mtime to avoid redundant re-reading across the session.
     Returns metadata including residue ranges, sequence lengths, and sequences.
     """
     if not os.path.isfile(pdb_path):
         raise FileNotFoundError(f"PDB file not found: {pdb_path}")
+
+    real_path = os.path.realpath(pdb_path)
+    try:
+        mtime = os.path.getmtime(real_path)
+    except OSError:
+        mtime = 0.0
+
+    cache_key = (real_path, mtime)
+    if use_cache and cache_key in _PDB_PARSE_CACHE:
+        # Return a copy of cached metadata so caller modifications don't mutate cache
+        cached = _PDB_PARSE_CACHE[cache_key]
+        return {
+            "file_type": cached["file_type"],
+            "file_path": pdb_path,
+            "objects": {k: dict(v) for k, v in cached["objects"].items()}
+        }
 
     chains_data: Dict[str, Dict[str, Any]] = {}
     # chain_id -> {res_seq: res_name}
@@ -186,11 +251,16 @@ def parse_pdb_file(pdb_path: str, buffer_size: int = 65536) -> Dict[str, Any]:
             "residue_seqs": sorted_res_seqs
         }
 
-    return {
+    result = {
         "file_type": "pdb",
         "file_path": pdb_path,
         "objects": chains_data
     }
+
+    if use_cache:
+        _PDB_PARSE_CACHE[cache_key] = result
+
+    return result
 
 
 def extract_pdb_chains(pdb_path: str, out_dir: str, buffer_size: int = 65536) -> Dict[str, str]:
@@ -202,6 +272,7 @@ def extract_pdb_chains(pdb_path: str, out_dir: str, buffer_size: int = 65536) ->
     """
     if not os.path.isfile(pdb_path):
         raise FileNotFoundError(f"PDB file not found: {pdb_path}")
+    out_dir = validate_output_dir(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     base_name = os.path.splitext(os.path.basename(pdb_path))[0]
@@ -236,7 +307,16 @@ def extract_pdb_chains(pdb_path: str, out_dir: str, buffer_size: int = 65536) ->
 def try_extract_pse_with_pymol(pse_path: str, out_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Attempts to use headless PyMOL if installed in the current environment.
+    Strictly pre-validates the session file using SafeSessionUnpickler to prevent
+    arbitrary code execution prior to invoking PyMOL's native loader.
     """
+    if out_dir:
+        out_dir = validate_output_dir(out_dir)
+
+    # Security Pre-Validation: strictly enforce SafeSessionUnpickler on the session file
+    # before allowing PyMOL to load or unpickle it.
+    validate_pse_safety(pse_path)
+
     try:
         import pymol
         pymol.finish_launching(['pymol', '-cq'])
@@ -591,24 +671,20 @@ def parse_pse_standalone(pse_path: str) -> Dict[str, Any]:
     }
 
 
-def write_atoms_to_pdb(atoms: List[Dict[str, Any]], out_path: str, buffer_size: int = 65536):
-    """Writes atom dictionaries to a standard formatted PDB file using 64KB buffered I/O."""
-    lines = []
-    for idx, a in enumerate(atoms, start=1):
-        name = a["atom_name"]
-        atom_fmt = f" {name:<3}" if len(name) < 4 else f"{name[:4]}"
-        resn = a["resn"][:3]
-        chain = a["chain"][:1] if a["chain"] else "A"
-        resi = a["resi"]
-        x, y, z = a["x"], a["y"], a["z"]
-        b_factor = a.get("b_factor", 20.0)
-        elem = a.get("element", "C")[:2]
-        line = f"ATOM  {idx:>5} {atom_fmt} {resn:>3} {chain}{resi:>4}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00{b_factor:6.2f}          {elem:>2}\n"
-        lines.append(line)
-    lines.append("TER\nEND\n")
-
+def write_atoms_to_pdb(atoms: List[Dict[str, Any]], out_path: str, buffer_size: int = 65536) -> None:
+    """Writes atom dictionaries to a standard formatted PDB file using 64KB buffered stream I/O."""
     with open(out_path, "w", encoding="utf-8", buffering=buffer_size) as out:
-        out.writelines(lines)
+        for idx, a in enumerate(atoms, start=1):
+            name = a["atom_name"]
+            atom_fmt = f" {name:<3}" if len(name) < 4 else f"{name[:4]}"
+            resn = a["resn"][:3]
+            chain = a["chain"][:1] if a["chain"] else "A"
+            resi = a["resi"]
+            x, y, z = a["x"], a["y"], a["z"]
+            b_factor = a.get("b_factor", 20.0)
+            elem = a.get("element", "C")[:2]
+            out.write(f"ATOM  {idx:>5} {atom_fmt} {resn:>3} {chain}{resi:>4}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00{b_factor:6.2f}          {elem:>2}\n")
+        out.write("TER\nEND\n")
 
 
 def extract_pse_objects(pse_path: str, out_dir: str) -> Dict[str, str]:
@@ -616,6 +692,7 @@ def extract_pse_objects(pse_path: str, out_dir: str) -> Dict[str, str]:
     Extracts each object in the PSE file to an individual PDB file.
     Tries headless PyMOL first, falls back to standalone pickle parser.
     """
+    out_dir = validate_output_dir(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     # Try headless PyMOL
@@ -636,6 +713,273 @@ def extract_pse_objects(pse_path: str, out_dir: str) -> Dict[str, str]:
         extracted_files[obj_name] = out_file
 
     return extracted_files
+
+
+def extract_and_merge_objects(
+    input_path: str,
+    target_ids: Any,
+    out_dir: str,
+    prefix: str = "merged_donor",
+    buffer_size: int = 65536,
+    entities_atoms: Optional[Dict[str, List[Dict[str, Any]]]] = None
+) -> Dict[str, Any]:
+    """
+    Extracts and merges multiple designated objects or chains from a PDB or PSE file.
+    Re-indexes residues contiguously onto a unified chain 'D' to prevent residue collisions,
+    preserves exact 3D Cartesian coordinates (x,y,z) with zero distortion or translation,
+    and writes both the merged PDB and 'donor_segments_manifest.json' with 64KB buffering.
+    Permits passing pre-parsed entities_atoms to eliminate redundant disk re-reading.
+    """
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    out_dir = validate_output_dir(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Parse target_ids into clean token list with path traversal validation
+    tokens: List[str] = []
+    if isinstance(target_ids, str):
+        for part in re.split(r'[,]+', target_ids.strip()):
+            p = part.strip()
+            if p:
+                if ".." in p or "/" in p or "\\" in p:
+                    raise ValueError(f"Path traversal detected in target ID: '{p}'")
+                tokens.append(p)
+    elif isinstance(target_ids, (list, tuple)):
+        for item in target_ids:
+            for part in re.split(r'[,]+', str(item).strip()):
+                p = part.strip()
+                if p:
+                    if ".." in p or "/" in p or "\\" in p:
+                        raise ValueError(f"Path traversal detected in target ID: '{p}'")
+                    tokens.append(p)
+    else:
+        p = str(target_ids).strip()
+        if ".." in p or "/" in p or "\\" in p:
+            raise ValueError(f"Path traversal detected in target ID: '{p}'")
+        tokens = [p]
+
+    if not tokens:
+        raise ValueError("No target IDs specified for extraction and merge.")
+
+    # Collect available objects/chains and their raw atoms if not provided
+    if entities_atoms is None:
+        entities_atoms = {}
+        ext = os.path.splitext(input_path)[1].lower()
+
+        if ext == ".pse":
+            parsed = parse_pse_standalone(input_path)
+            for obj_name, obj_meta in parsed.get("objects", {}).items():
+                atoms = obj_meta.get("_atoms", [])
+                if atoms:
+                    entities_atoms[obj_name] = atoms
+        else:
+            # Standard PDB file: read atoms grouped by chain in a single buffered pass
+            with open(input_path, "r", encoding="utf-8", errors="ignore", buffering=buffer_size) as f:
+                for line in f:
+                    if line.startswith("ATOM  ") or line.startswith("HETATM"):
+                        chain = line[21].strip() or "A"
+                        atom_name = line[12:16].strip()
+                        resn = line[17:20].strip()
+                        try:
+                            resi = int(line[22:26])
+                            x = float(line[30:38])
+                            y = float(line[38:46])
+                            z = float(line[46:54])
+                        except ValueError:
+                            continue
+                        b_factor = float(line[60:66]) if len(line) >= 66 and line[60:66].strip() else 20.0
+                        elem = line[76:78].strip() if len(line) >= 78 and line[76:78].strip() else (atom_name[0] if atom_name else "C")
+
+                        atom_dict = {
+                            "atom_name": atom_name,
+                            "resn": resn,
+                            "resi": resi,
+                            "chain": chain,
+                            "x": x,
+                            "y": y,
+                            "z": z,
+                            "b_factor": b_factor,
+                            "element": elem
+                        }
+                        if chain not in entities_atoms:
+                            entities_atoms[chain] = []
+                        entities_atoms[chain].append(atom_dict)
+
+    available_keys = list(entities_atoms.keys())
+    if not available_keys:
+        raise ValueError(f"No structural entities or atom records found in: {input_path}")
+
+    # Match tokens to entities
+    matched_entities: List[str] = []
+    for tok in tokens:
+        matched_key = None
+        # Exact match
+        if tok in entities_atoms:
+            matched_key = tok
+        elif tok.isdigit():
+            # 1-based index first
+            idx = int(tok) - 1
+            if 0 <= idx < len(available_keys):
+                matched_key = available_keys[idx]
+            elif 0 <= int(tok) < len(available_keys):
+                matched_key = available_keys[int(tok)]
+        if not matched_key:
+            # Case-insensitive match
+            for k in available_keys:
+                if k.lower() == tok.lower():
+                    matched_key = k
+                    break
+        if not matched_key:
+            # Suffix / chain match (e.g. 'A' matching 'Chain_A' or 'obj_chain_A')
+            for k in available_keys:
+                if k.lower().endswith(f"_{tok.lower()}") or k.lower() == f"chain_{tok.lower()}":
+                    matched_key = k
+                    break
+        if matched_key and matched_key not in matched_entities:
+            matched_entities.append(matched_key)
+
+    if not matched_entities:
+        # Fallback to first available if none matched
+        matched_entities = [available_keys[0]]
+
+    # Process segments and atoms
+    all_merged_atoms: List[Dict[str, Any]] = []
+    manifest_segments: List[Dict[str, Any]] = []
+    total_aa = 0
+    new_resi_counter = 1
+
+    for obj_idx, obj_name in enumerate(matched_entities, start=1):
+        raw_atoms = entities_atoms[obj_name]
+        # Group atoms by residue (preserving original order of residues)
+        res_groups: Dict[int, List[Dict[str, Any]]] = {}
+        res_names: Dict[int, str] = {}
+        res_chains: Dict[int, str] = {}
+        res_ca_coords: Dict[int, Tuple[float, float, float]] = {}
+
+        for a in raw_atoms:
+            r = a["resi"]
+            if r not in res_groups:
+                res_groups[r] = []
+                res_names[r] = a["resn"]
+                res_chains[r] = a["chain"]
+            res_groups[r].append(a)
+            if a["atom_name"].upper() == "CA" and r not in res_ca_coords:
+                res_ca_coords[r] = (a["x"], a["y"], a["z"])
+
+        sorted_res_seqs = sorted(res_groups.keys())
+        if not sorted_res_seqs:
+            continue
+
+        # Partition this entity's residues into continuous segments:
+        # Break on Delta resi > 1 OR Euclidean CA distance > 4.20 Angstrom (sq_dist > 17.64)
+        segments_resis: List[List[int]] = []
+        cur_seg: List[int] = [sorted_res_seqs[0]]
+
+        for i in range(1, len(sorted_res_seqs)):
+            prev_r = sorted_res_seqs[i - 1]
+            curr_r = sorted_res_seqs[i]
+            delta_resi = curr_r - prev_r
+
+            sq_dist = 0.0
+            has_ca = (prev_r in res_ca_coords and curr_r in res_ca_coords)
+            if has_ca:
+                c1 = res_ca_coords[prev_r]
+                c2 = res_ca_coords[curr_r]
+                dx, dy, dz = c2[0] - c1[0], c2[1] - c1[1], c2[2] - c1[2]
+                sq_dist = dx * dx + dy * dy + dz * dz
+
+            if delta_resi > 1 or (has_ca and sq_dist > 17.64):  # 4.20^2 = 17.64 avoids sqrt
+                segments_resis.append(cur_seg)
+                cur_seg = [curr_r]
+            else:
+                cur_seg.append(curr_r)
+
+        if cur_seg:
+            segments_resis.append(cur_seg)
+
+        # Merge segments into unified chain 'D'
+        for seg_idx, s_resis in enumerate(segments_resis, start=1):
+            seg_start_new = new_resi_counter
+            orig_start = s_resis[0]
+            orig_end = s_resis[-1]
+            seg_seq = "".join(aa_to_one_letter(res_names[r]) for r in s_resis)
+            source_chain = res_chains[s_resis[0]]
+
+            for r in s_resis:
+                for a in res_groups[r]:
+                    merged_atom = {
+                        "atom_name": a["atom_name"],
+                        "resn": a["resn"],
+                        "resi": new_resi_counter,
+                        "chain": "D",
+                        "x": a["x"],
+                        "y": a["y"],
+                        "z": a["z"],
+                        "b_factor": a.get("b_factor", 20.0),
+                        "element": a.get("element", "C")
+                    }
+                    all_merged_atoms.append(merged_atom)
+                new_resi_counter += 1
+
+            seg_end_new = new_resi_counter - 1
+            seg_len = len(s_resis)
+            total_aa += seg_len
+
+            manifest_segments.append({
+                "segment_id": f"D{obj_idx}_S{seg_idx}",
+                "source_object": obj_name,
+                "source_chain": source_chain,
+                "residue_range": [orig_start, orig_end],
+                "new_residue_range": [seg_start_new, seg_end_new],
+                "length": seg_len,
+                "sequence": seg_seq
+            })
+
+    # Write merged PDB with 64KB buffering
+    safe_prefix = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(prefix).strip()) or "merged_donor"
+    out_merged_pdb = safe_join_path(out_dir, f"{safe_prefix}.pdb")
+    write_atoms_to_pdb(all_merged_atoms, out_merged_pdb, buffer_size=buffer_size)
+
+    # Write manifest JSON with 64KB buffering
+    manifest_data = {
+        "donor_sources": matched_entities,
+        "total_amino_acids": total_aa,
+        "segments": manifest_segments
+    }
+    manifest_path = safe_join_path(out_dir, "donor_segments_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8", buffering=buffer_size) as mf:
+        json.dump(manifest_data, mf, indent=2)
+
+    return {
+        "status": "SUCCESS",
+        "merged_pdb": out_merged_pdb,
+        "manifest_path": manifest_path,
+        "manifest": manifest_data,
+        "donor_sources": matched_entities,
+        "total_amino_acids": total_aa,
+        "segments": manifest_segments,
+        "entities_atoms": entities_atoms
+    }
+
+
+def extract_and_merge_donors(
+    input_path: str,
+    donor_ids: Any,
+    out_merged_pdb: str,
+    buffer_size: int = 65536
+) -> Dict[str, Any]:
+    """
+    Alias/wrapper for extract_and_merge_objects conforming to MULTI_DONOR_CHIMERA_SPEC.md signature.
+    """
+    out_dir = validate_output_dir(os.path.dirname(os.path.realpath(out_merged_pdb)))
+    prefix = os.path.splitext(os.path.basename(out_merged_pdb))[0]
+    return extract_and_merge_objects(
+        input_path=input_path,
+        target_ids=donor_ids,
+        out_dir=out_dir,
+        prefix=prefix,
+        buffer_size=buffer_size
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -680,7 +1024,7 @@ def extract_file(input_path: str, out_dir: str) -> Dict[str, str]:
         return extract_pdb_chains(input_path, out_dir)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect and extract chains/objects from PDB or PyMOL session (.pse) files.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -693,6 +1037,8 @@ def main():
     extract_parser = subparsers.add_parser("extract", help="Extract individual chains/objects to PDBs")
     extract_parser.add_argument("--input", "-i", required=True, help="Input PDB or PSE file")
     extract_parser.add_argument("--out_dir", "-d", required=True, help="Directory to save extracted PDB files")
+    extract_parser.add_argument("--target_ids", "-t", help="Comma-separated IDs/names/indices to extract and merge into a single donor PDB")
+    extract_parser.add_argument("--prefix", default="merged_donor", help="Prefix for merged output PDB [Default: merged_donor]")
 
     args = parser.parse_args()
 
@@ -715,8 +1061,12 @@ def main():
         if out_dir in ("/", "\\") or (len(out_dir) <= 3 and out_dir.endswith(":\\")):
             raise ValueError(f"Dangerous output directory: {out_dir}")
         os.makedirs(out_dir, exist_ok=True)
-        extracted = extract_file(args.input, out_dir)
-        print(json.dumps({"status": "SUCCESS", "extracted_files": extracted}, indent=2))
+        if args.target_ids:
+            merge_res = extract_and_merge_objects(args.input, args.target_ids, out_dir, prefix=args.prefix)
+            print(json.dumps(merge_res, indent=2))
+        else:
+            extracted = extract_file(args.input, out_dir)
+            print(json.dumps({"status": "SUCCESS", "extracted_files": extracted}, indent=2))
 
 
 if __name__ == "__main__":

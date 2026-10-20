@@ -2,6 +2,7 @@ import unittest
 import os
 import sys
 import json
+import math
 import shutil
 import tempfile
 import subprocess
@@ -12,17 +13,30 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from scripts.pse_pdb_extractor import parse_pdb_file, extract_pdb_chains  # noqa: E402
+from scripts.pse_pdb_extractor import (  # noqa: E402
+    parse_pdb_file,
+    extract_pdb_chains,
+    extract_and_merge_objects,
+    extract_and_merge_donors,
+    SafeSessionUnpickler,
+    safe_pickle_loads,
+    safe_join_path,
+    validate_output_dir,
+    validate_pse_safety,
+    clear_pdb_parse_cache
+)
 from scripts.extract_fixed_motif import parse_residue_spec  # noqa: E402
 from scripts.kabsch_rmsd import kabsch_fit  # noqa: E402
 from scripts.chimera_scaffold import (  # noqa: E402
     ChimeraScaffolder,
     get_residue_ca_coords,
     calculate_anchor_distance,
+    batch_anchor_distances,
     compute_recommended_linker,
     compute_extension_minimum,
     clear_ca_coords_cache,
-    _CA_COORDS_CACHE
+    _CA_COORDS_CACHE,
+    _RESI_COORDS_CACHE
 )
 
 
@@ -529,10 +543,8 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         """
         vessel_gap_pdb = os.path.join(self.test_dir, "vessel_gap.pdb")
         # Vessel has residues 1-30 and 61-100 (gap of 30 missing residues)
-        v_res = (
-            [(r, "ALA", [0.0, float(r), 0.0]) for r in range(1, 31)] +
-            [(r, "ALA", [0.0, float(r), 0.0]) for r in range(61, 101)]
-        )
+        v_res = [(r, "ALA", [0.0, float(r), 0.0]) for r in range(1, 31)]
+        v_res.extend([(r, "ALA", [0.0, float(r), 0.0]) for r in range(61, 101)])
         create_sample_pdb(vessel_gap_pdb, {"B": v_res})
 
         parsed = parse_pdb_file(vessel_gap_pdb)
@@ -683,6 +695,499 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         # Array input
         d_arr = calculate_anchor_distance(np.array(c1), np.array(c2))
         self.assertAlmostEqual(d_arr, 5.0, places=5)
+
+    def test_multi_object_donor_merge(self):
+        """Test multi-object extraction and coordinate-preserving merge into merged_donor.pdb."""
+        multi_pdb = os.path.join(self.test_dir, "multi_donor_source.pdb")
+        chain_a_res = [(r, "ALA", [float(r), 10.0, 20.0]) for r in range(1, 11)]
+        chain_b_res = [(r, "GLY", [float(r) + 50.0, 30.0, 40.0]) for r in range(1, 11)]
+        create_sample_pdb(multi_pdb, {"A": chain_a_res, "B": chain_b_res})
+
+        merge_out = os.path.join(self.test_dir, "merged_donor_out")
+        res = extract_and_merge_objects(multi_pdb, "A,B", merge_out, prefix="merged_donor")
+
+        self.assertEqual(res["status"], "SUCCESS")
+        merged_pdb = res["merged_pdb"]
+        self.assertTrue(os.path.isfile(merged_pdb))
+        manifest_path = res["manifest_path"]
+        self.assertTrue(os.path.isfile(manifest_path))
+
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertEqual(manifest["total_amino_acids"], 20)
+        self.assertEqual(len(manifest["segments"]), 2)
+        self.assertEqual(manifest["segments"][0]["residue_range"], [1, 10])
+        self.assertEqual(manifest["segments"][0]["new_residue_range"], [1, 10])
+        self.assertEqual(manifest["segments"][1]["residue_range"], [1, 10])
+        self.assertEqual(manifest["segments"][1]["new_residue_range"], [11, 20])
+
+        # Verify exact Cartesian coordinates preservation in merged PDB
+        parsed_merged = parse_pdb_file(merged_pdb)
+        self.assertIn("D", parsed_merged["objects"])
+        self.assertEqual(parsed_merged["objects"]["D"]["length"], 20)
+
+        # Check coordinates of first 10 residues (from chain A)
+        for r in range(1, 11):
+            coord = get_residue_ca_coords(merged_pdb, "D", r)
+            self.assertIsNotNone(coord)
+            np.testing.assert_allclose(coord, [float(r), 10.0, 20.0], atol=1e-3)
+
+        # Check coordinates of next 10 residues (from chain B, reindexed to 11-20)
+        for r in range(1, 11):
+            coord = get_residue_ca_coords(merged_pdb, "D", r + 10)
+            self.assertIsNotNone(coord)
+            np.testing.assert_allclose(coord, [float(r) + 50.0, 30.0, 40.0], atol=1e-3)
+
+    def test_extract_and_merge_donors_wrapper(self):
+        """Test extract_and_merge_donors wrapper function with custom output path."""
+        multi_pdb = os.path.join(self.test_dir, "wrapper_source.pdb")
+        chain_a_res = [(r, "ALA", [float(r), 10.0, 20.0]) for r in range(1, 6)]
+        create_sample_pdb(multi_pdb, {"A": chain_a_res})
+        out_merged = os.path.join(self.test_dir, "wrapper_out", "custom_donor.pdb")
+        res = extract_and_merge_donors(multi_pdb, "A", out_merged)
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertTrue(os.path.isfile(out_merged))
+        self.assertEqual(res["total_amino_acids"], 5)
+
+    def test_discontinuous_motif_auto_segmentation(self):
+        """Test auto-segmentation on discontinuous donor with motif_residues='all'."""
+        disc_pdb = os.path.join(self.test_dir, "discontinuous_donor.pdb")
+        seg1 = [(r, "ALA", [float(r), 0.0, 0.0]) for r in range(10, 16)]
+        # Distance between residue 15 (15.0, 0, 0) and residue 80 (40.0, 0, 0) is 25.0 Å (> 4.2 Å)
+        seg2 = [(r, "GLY", [40.0 + float(r - 80), 0.0, 0.0]) for r in range(80, 86)]
+        create_sample_pdb(disc_pdb, {"A": seg1 + seg2})
+
+        scaffolder = ChimeraScaffolder(
+            donor_pdb=disc_pdb,
+            vessel_pdb=self.vessel_pdb,
+            donor_id="A",
+            vessel_id="B",
+            motif_residues="all",
+            chimera_mode="replace",
+            vessel_replace_range="40-60",
+            out_dir=os.path.join(self.test_dir, "out_disc_seg"),
+            dry_run=True
+        )
+        scaffolder.prepare_input_structures()
+        segments = scaffolder.parse_motif_ranges()
+        self.assertEqual(segments, [(10, 15), (80, 85)])
+
+    def test_internal_linker_budgeting(self):
+        """Test internal linker budgeting for a measured 3D gap of 21.0 Å."""
+        l_ext = compute_extension_minimum(21.0)
+        l_glob = max(3, int(math.ceil(21.0 / 3.0)))
+        l_max = l_glob + 6
+        self.assertEqual(l_ext, 6)
+        self.assertEqual(l_glob, 7)
+        self.assertEqual(f"{l_glob}-{l_max}", "7-13")
+
+        disc_pdb = os.path.join(self.test_dir, "gap21_donor.pdb")
+        seg1 = [(r, "ALA", [0.0, 0.0, 0.0]) for r in range(1, 6)]
+        # Seg1 end at (0,0,0). Seg2 start at (21.0, 0, 0) -> distance = 21.0 Å
+        seg2 = [(r, "GLY", [21.0 + float(r - 10), 0.0, 0.0]) for r in range(10, 16)]
+        create_sample_pdb(disc_pdb, {"D": seg1 + seg2})
+
+        scaffolder = ChimeraScaffolder(
+            donor_pdb=disc_pdb,
+            vessel_pdb=self.vessel_pdb,
+            donor_id="D",
+            vessel_id="B",
+            motif_residues="all",
+            chimera_mode="replace",
+            vessel_replace_range="40-60",
+            linker_n="8-12",
+            linker_c="8-12",
+            clamp_linkers=False,
+            out_dir=os.path.join(self.test_dir, "out_gap21"),
+            dry_run=True
+        )
+        scaffolder.prepare_input_structures()
+        contig, donor_segs, _ = scaffolder.compute_contigs_and_segments()
+        self.assertEqual(donor_segs, [(1, 5), (10, 15)])
+        self.assertIn("/7-13/", contig)
+        self.assertEqual(contig, "V1-39/8-12/D1-5/7-13/D10-15/8-12/V61-100")
+
+    def test_fixed_positions_masking_multi_segment(self):
+        """Test ProteinMPNN fixed position masking across 3 donor segments, 2 internal linkers, and 2 external linkers."""
+        donor_pdb = os.path.join(self.test_dir, "mask_donor.pdb")
+        s1 = [(r, "ALA", [float(r), 0.0, 0.0]) for r in range(1, 6)]
+        s2 = [(r, "ALA", [float(r) + 20.0, 0.0, 0.0]) for r in range(10, 15)]
+        s3 = [(r, "ALA", [float(r) + 40.0, 0.0, 0.0]) for r in range(20, 26)]
+        create_sample_pdb(donor_pdb, {"D": s1 + s2 + s3})
+
+        vessel_pdb = os.path.join(self.test_dir, "mask_vessel.pdb")
+        v_res = [(r, "VAL", [0.0, float(r), 0.0]) for r in range(1, 21)]
+        create_sample_pdb(vessel_pdb, {"V": v_res})
+
+        # Mock chimeric backbone with:
+        # V_left (1-10) -> fixed
+        # Linker N (11-13) -> unfixed
+        # S1 (14-18) -> fixed
+        # Int Linker 1 (19-21) -> unfixed
+        # S2 (22-26) -> fixed
+        # Int Linker 2 (27-29) -> unfixed
+        # S3 (30-35) -> fixed
+        # Linker C (36-38) -> unfixed
+        # V_right (39-48) -> fixed
+        bb_pdb = os.path.join(self.test_dir, "mock_chimeric_bb.pdb")
+        bb_res = []
+        cur_idx = 1
+        for r in range(1, 11):
+            bb_res.append((cur_idx, "VAL", [0.0, float(r), 0.0]))
+            cur_idx += 1
+        for _ in range(3):
+            bb_res.append((cur_idx, "GLY", [999.0, 999.0, 999.0]))
+            cur_idx += 1
+        for r in range(1, 6):
+            bb_res.append((cur_idx, "ALA", [float(r), 0.0, 0.0]))
+            cur_idx += 1
+        for _ in range(3):
+            bb_res.append((cur_idx, "GLY", [998.0, 998.0, 998.0]))
+            cur_idx += 1
+        for r in range(10, 15):
+            bb_res.append((cur_idx, "ALA", [float(r) + 20.0, 0.0, 0.0]))
+            cur_idx += 1
+        for _ in range(3):
+            bb_res.append((cur_idx, "GLY", [997.0, 997.0, 997.0]))
+            cur_idx += 1
+        for r in range(20, 26):
+            bb_res.append((cur_idx, "ALA", [float(r) + 40.0, 0.0, 0.0]))
+            cur_idx += 1
+        for _ in range(3):
+            bb_res.append((cur_idx, "GLY", [996.0, 996.0, 996.0]))
+            cur_idx += 1
+        for r in range(11, 21):
+            bb_res.append((cur_idx, "VAL", [0.0, float(r), 0.0]))
+            cur_idx += 1
+
+        create_sample_pdb(bb_pdb, {"A": bb_res})
+
+        scaffolder = ChimeraScaffolder(
+            donor_pdb=donor_pdb,
+            vessel_pdb=vessel_pdb,
+            donor_id="D",
+            vessel_id="V",
+            motif_residues="all",
+            chimera_mode="replace",
+            vessel_replace_range="11-15",
+            lock_vessel=True,
+            out_dir=os.path.join(self.test_dir, "out_mask"),
+            dry_run=True
+        )
+        scaffolder.prepare_input_structures()
+        scaffolder.parse_motif_ranges()
+        scaffolder.preserved_vessel_segments = [(1, 10), (11, 20)]
+
+        fixed_dict = scaffolder.map_fixed_positions_for_mpnn(bb_pdb)
+        fixed_indices = set(fixed_dict["A"])
+
+        expected_fixed = set(range(1, 11)).union(
+            range(14, 19),
+            range(22, 27),
+            range(30, 36),
+            range(39, 49)
+        )
+        self.assertEqual(fixed_indices, expected_fixed)
+
+        unfixed_indices = set(range(1, 49)) - fixed_indices
+        expected_unfixed = {11, 12, 13, 19, 20, 21, 27, 28, 29, 36, 37, 38}
+        self.assertEqual(unfixed_indices, expected_unfixed)
+
+    def test_all_four_modes_with_discontinuous_donor(self):
+        """Test master contig assembly for replace, ligate_nterm, ligate_cterm, insert_loop with discontinuous donor."""
+        disc_pdb = os.path.join(self.test_dir, "modes_disc_donor.pdb")
+        seg1 = [(r, "ALA", [0.0, 0.0, 0.0]) for r in range(1, 6)]
+        seg2 = [(r, "GLY", [15.0 + float(r - 10), 0.0, 0.0]) for r in range(10, 16)]
+        create_sample_pdb(disc_pdb, {"D": seg1 + seg2})
+
+        modes = ["replace", "ligate_nterm", "ligate_cterm", "insert_loop"]
+        for mode in modes:
+            scaffolder = ChimeraScaffolder(
+                donor_pdb=disc_pdb,
+                vessel_pdb=self.vessel_pdb,
+                donor_id="D",
+                vessel_id="B",
+                motif_residues="all",
+                chimera_mode=mode,
+                vessel_replace_range="40-60",
+                vessel_split_after=50,
+                linker_n="8-12",
+                linker_c="8-12",
+                clamp_linkers=False,
+                out_dir=os.path.join(self.test_dir, f"out_mode_{mode}"),
+                dry_run=True
+            )
+            scaffolder.prepare_input_structures()
+            contig, donor_segs, vessel_segs = scaffolder.compute_contigs_and_segments()
+
+            # Verify no empty components or consecutive slashes
+            self.assertNotIn("//", contig)
+            self.assertFalse(contig.startswith("/"))
+            self.assertFalse(contig.endswith("/"))
+
+            # Verify donor segments present
+            self.assertEqual(donor_segs, [(1, 5), (10, 15)])
+            self.assertIn("D1-5", contig)
+            self.assertIn("D10-15", contig)
+
+            # Verify internal linker is embedded between D1-5 and D10-15
+            # 15.0 Å void -> L_glob = ceil(15/3) = 5 -> linker is 5-11
+            self.assertIn("D1-5/5-11/D10-15", contig)
+
+            if mode == "replace":
+                self.assertTrue(contig.startswith("V1-39/"))
+                self.assertTrue(contig.endswith("/V61-100"))
+            elif mode == "ligate_nterm":
+                self.assertTrue(contig.startswith("D1-5/5-11/D10-15/"))
+                self.assertTrue(contig.endswith("/V1-100"))
+            elif mode == "ligate_cterm":
+                self.assertTrue(contig.startswith("V1-100/"))
+                self.assertTrue(contig.endswith("/D1-5/5-11/D10-15"))
+            elif mode == "insert_loop":
+                self.assertTrue(contig.startswith("V1-50/"))
+                self.assertTrue(contig.endswith("/V51-100"))
+
+
+class TestSecurityHardening(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_safe_session_unpickler_blocks_rce(self):
+        """Verify SafeSessionUnpickler rejects arbitrary class instantiation and RCE payloads."""
+        import pickle
+        import os
+        import subprocess
+
+        # Test built-in functions
+        for dangerous_target in [eval, exec, __import__, os.system, subprocess.Popen]:
+            payload = pickle.dumps(dangerous_target)
+            with self.assertRaises(pickle.UnpicklingError):
+                safe_pickle_loads(payload)
+
+    def test_safe_session_unpickler_allows_safe_primitives_and_numpy(self):
+        """Verify SafeSessionUnpickler permits safe scientific data structures, primitives, and numpy arrays."""
+        import pickle
+
+        safe_obj = {
+            "name": "test_session",
+            "values": [1, 2.5, "alpha", True, b"raw_bytes"],
+            "coords": np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=float),
+            "nested": {"a": (1, 2, 3)}
+        }
+        pickled = pickle.dumps(safe_obj)
+        unpickled = safe_pickle_loads(pickled)
+        self.assertEqual(unpickled["name"], "test_session")
+        self.assertEqual(unpickled["values"], [1, 2.5, "alpha", True, b"raw_bytes"])
+        np.testing.assert_allclose(unpickled["coords"], safe_obj["coords"])
+
+    def test_try_extract_pse_prevalidation_blocks_malicious_session(self):
+        """Verify try_extract_pse_with_pymol and validate_pse_safety block malicious .pse files."""
+        import pickle
+        import gzip
+        from scripts.pse_pdb_extractor import try_extract_pse_with_pymol
+
+        malicious_pse = os.path.join(self.test_dir, "malicious.pse")
+        malicious_payload = gzip.compress(pickle.dumps(os.system))
+        with open(malicious_pse, "wb") as f:
+            f.write(malicious_payload)
+
+        # validate_pse_safety must raise an exception
+        with self.assertRaises((RuntimeError, pickle.UnpicklingError)):
+            validate_pse_safety(malicious_pse)
+
+        # try_extract_pse_with_pymol must also reject it
+        with self.assertRaises((RuntimeError, pickle.UnpicklingError)):
+            try_extract_pse_with_pymol(malicious_pse)
+
+    def test_safe_join_path_prevents_directory_traversal(self):
+        """Verify safe_join_path strictly bounds output paths within the base directory."""
+        base = os.path.join(self.test_dir, "base_dir")
+        os.makedirs(base, exist_ok=True)
+
+        # Normal child path
+        child = safe_join_path(base, "valid_file.pdb")
+        self.assertTrue(os.path.commonpath([base, child]) == os.path.realpath(base))
+
+        # Relative traversal within filename
+        traversal = safe_join_path(base, "../../etc/passwd")
+        # Basename sanitization strips ../../ and retains sanitized basename strictly inside base
+        self.assertTrue(os.path.commonpath([base, traversal]) == os.path.realpath(base))
+        self.assertTrue(traversal.startswith(os.path.realpath(base)))
+
+    def test_validate_output_dir_rejects_dangerous_paths(self):
+        """Verify validate_output_dir rejects root, empty, and system directories."""
+        with self.assertRaises(ValueError):
+            validate_output_dir("")
+
+        with self.assertRaises(ValueError):
+            validate_output_dir("   ")
+
+        with self.assertRaises(ValueError):
+            validate_output_dir("/")
+
+        with self.assertRaises(ValueError):
+            validate_output_dir("C:\\")
+
+        with self.assertRaises(ValueError):
+            validate_output_dir("/etc")
+
+        with self.assertRaises(ValueError):
+            validate_output_dir("/usr/local")
+
+        # Valid directory should succeed
+        valid_dir = os.path.join(self.test_dir, "valid_output")
+        res = validate_output_dir(valid_dir)
+        self.assertEqual(res, os.path.realpath(os.path.abspath(valid_dir)))
+
+    def test_chimera_scaffolder_rejects_path_traversal_ids(self):
+        """Verify ChimeraScaffolder rejects donor_id and vessel_id with directory traversal characters."""
+        with self.assertRaises(ValueError):
+            ChimeraScaffolder(
+                donor_pdb=self.donor_pdb if hasattr(self, 'donor_pdb') else "donor.pdb",
+                vessel_pdb=self.vessel_pdb if hasattr(self, 'vessel_pdb') else "vessel.pdb",
+                donor_id="../../etc",
+                motif_residues="30-40"
+            )
+
+        with self.assertRaises(ValueError):
+            ChimeraScaffolder(
+                donor_pdb="donor.pdb",
+                vessel_pdb="vessel.pdb",
+                vessel_id="../bad_vessel",
+                motif_residues="30-40"
+            )
+
+        with self.assertRaises(ValueError):
+            ChimeraScaffolder(
+                donor_pdb="donor.pdb",
+                vessel_pdb="vessel.pdb",
+                donor_id=["A", "../../evil"],
+                motif_residues="30-40"
+            )
+
+    def test_extract_and_merge_objects_rejects_traversal_target_ids(self):
+        """Verify extract_and_merge_objects rejects target_ids containing traversal strings."""
+        sample_pdb = os.path.join(self.test_dir, "sample.pdb")
+        create_sample_pdb(sample_pdb, {"A": [(1, "ALA", [0.0, 0.0, 0.0])]})
+        out_sub = os.path.join(self.test_dir, "merge_out")
+
+        with self.assertRaises(ValueError):
+            extract_and_merge_objects(sample_pdb, "../../etc", out_sub)
+
+        with self.assertRaises(ValueError):
+            extract_and_merge_objects(sample_pdb, ["A", "../evil"], out_sub)
+
+
+class TestPerformanceOptimizations(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_kdtree_coordinate_matching_large_scale(self):
+        """
+        Verify KDTree-accelerated coordinate matching for large multi-domain complexes
+        (1200+ residues) executes in milliseconds without O(N^2) bottlenecks.
+        """
+        import time
+        # Generate a large 1200-residue backbone
+        bb_pdb = os.path.join(self.test_dir, "large_bb_1200.pdb")
+        bb_res = [(r, "ALA", [float(r % 100), float((r // 100) * 3), 0.0]) for r in range(1, 1201)]
+        create_sample_pdb(bb_pdb, {"A": bb_res})
+
+        # Donor has 150 residues matching specific coordinates
+        donor_pdb = os.path.join(self.test_dir, "large_donor_150.pdb")
+        donor_res = [(r, "GLY", [float((r + 400) % 100), float(((r + 400) // 100) * 3), 0.0]) for r in range(1, 151)]
+        create_sample_pdb(donor_pdb, {"D": donor_res})
+
+        # Vessel has 900 residues matching coordinates
+        vessel_pdb = os.path.join(self.test_dir, "large_vessel_900.pdb")
+        vessel_res = [(r, "VAL", [float(r % 100), float((r // 100) * 3), 0.0]) for r in range(1, 901)]
+        create_sample_pdb(vessel_pdb, {"V": vessel_res})
+
+        scaffolder = ChimeraScaffolder(
+            donor_pdb=donor_pdb,
+            vessel_pdb=vessel_pdb,
+            donor_id="D",
+            vessel_id="V",
+            motif_residues="all",
+            chimera_mode="replace",
+            lock_vessel=True,
+            out_dir=os.path.join(self.test_dir, "out_perf"),
+            dry_run=True
+        )
+        scaffolder.prepare_input_structures()
+        scaffolder.parse_motif_ranges()
+        scaffolder.preserved_vessel_segments = [(1, 900)]
+
+        # Time the coordinate matching
+        t0 = time.perf_counter()
+        fixed_dict = scaffolder.map_fixed_positions_for_mpnn(bb_pdb)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Must execute in under 100 milliseconds (typically < 10 ms with cKDTree)
+        self.assertLess(elapsed_ms, 100.0, f"KDTree coordinate matching took too long: {elapsed_ms:.2f} ms")
+        self.assertIn("A", fixed_dict)
+        self.assertGreater(len(fixed_dict["A"]), 800)
+
+    def test_ca_coords_o1_indexing_and_cache(self):
+        """Verify _RESI_COORDS_CACHE provides O(1) residue coordinate lookups without chain_id."""
+        clear_ca_coords_cache()
+        sample_pdb = os.path.join(self.test_dir, "sample_indexed.pdb")
+        res_list = [(r, "ALA", [float(r), 0.0, 0.0]) for r in range(1, 201)]
+        create_sample_pdb(sample_pdb, {"A": res_list})
+
+        # Query with chain_id=None
+        c1 = get_residue_ca_coords(sample_pdb, chain_id=None, resi=150)
+        self.assertIsNotNone(c1)
+        np.testing.assert_allclose(c1, [150.0, 0.0, 0.0])
+
+        # Verify resi_map is cached
+        real_p = os.path.realpath(sample_pdb)
+        mtime = os.path.getmtime(real_p)
+        self.assertIn((real_p, mtime), _RESI_COORDS_CACHE)
+        self.assertIn(150, _RESI_COORDS_CACHE[(real_p, mtime)])
+
+    def test_batch_anchor_distances_vectorization(self):
+        """Verify batch_anchor_distances calculates accurate vectorized Euclidean distances."""
+        c1 = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [5.0, 0.0, 0.0]])
+        c2 = np.array([[3.0, 4.0, 0.0], [1.0, 1.0, 10.0], [5.0, 0.0, 0.0]])
+        dists = batch_anchor_distances(c1, c2)
+        np.testing.assert_allclose(dists, [5.0, 9.0, 0.0], atol=1e-5)
+
+    def test_reusing_parsed_entities_atoms(self):
+        """Verify passing entities_atoms avoids disk re-reading and yields identical results."""
+        multi_pdb = os.path.join(self.test_dir, "entities_test.pdb")
+        chain_a_res = [(r, "ALA", [float(r), 1.0, 2.0]) for r in range(1, 11)]
+        create_sample_pdb(multi_pdb, {"A": chain_a_res})
+
+        out1 = os.path.join(self.test_dir, "out1")
+        res1 = extract_and_merge_objects(multi_pdb, "A", out1, prefix="first")
+        self.assertIn("entities_atoms", res1)
+
+        # Second merge reusing parsed entities_atoms
+        out2 = os.path.join(self.test_dir, "out2")
+        res2 = extract_and_merge_objects(
+            multi_pdb, "A", out2, prefix="second", entities_atoms=res1["entities_atoms"]
+        )
+        self.assertEqual(res1["total_amino_acids"], res2["total_amino_acids"])
+        self.assertEqual(res1["manifest"]["segments"], res2["manifest"]["segments"])
+
+    def test_parse_pdb_file_caching(self):
+        """Verify parse_pdb_file session caching and invalidation."""
+        clear_pdb_parse_cache()
+        sample_pdb = os.path.join(self.test_dir, "cache_sample.pdb")
+        create_sample_pdb(sample_pdb, {"A": [(1, "ALA", [0.0, 0.0, 0.0])]})
+
+        meta1 = parse_pdb_file(sample_pdb)
+        meta2 = parse_pdb_file(sample_pdb)
+        self.assertEqual(meta1["objects"]["A"]["length"], meta2["objects"]["A"]["length"])
+
+        clear_pdb_parse_cache()
 
 
 if __name__ == "__main__":

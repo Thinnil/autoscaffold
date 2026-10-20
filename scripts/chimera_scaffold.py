@@ -43,7 +43,13 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from pse_pdb_extractor import extract_file, parse_pdb_file  # noqa: E402
+from pse_pdb_extractor import (  # noqa: E402
+    extract_file,
+    parse_pdb_file,
+    extract_and_merge_objects,
+    safe_join_path,
+    validate_output_dir
+)
 from extract_fixed_motif import parse_residue_spec  # noqa: E402
 from kabsch_rmsd import calculate_motif_rmsd, extract_coordinates  # noqa: E402
 from format_complex_fasta import make_fixed_positions_dict  # noqa: E402
@@ -53,12 +59,14 @@ from methodology_reporter import generate_methodology_report  # noqa: E402
 # Key: (real_path, mtime) -> {(chain, resi): np.ndarray}
 _CA_COORDS_CACHE: Dict[Tuple[str, float], Dict[Tuple[str, int], np.ndarray]] = {}
 _FALLBACK_COORDS_CACHE: Dict[Tuple[str, float], Dict[Tuple[str, int], np.ndarray]] = {}
+_RESI_COORDS_CACHE: Dict[Tuple[str, float], Dict[int, np.ndarray]] = {}
 
 
 def clear_ca_coords_cache() -> None:
     """Clears the in-memory parsed coordinate session cache."""
     _CA_COORDS_CACHE.clear()
     _FALLBACK_COORDS_CACHE.clear()
+    _RESI_COORDS_CACHE.clear()
 
 
 def get_residue_ca_coords(
@@ -73,7 +81,7 @@ def get_residue_ca_coords(
     Falls back to the geometric center (mean coordinates of all atoms) of the residue
     if the CA atom is missing. Returns None if residue is not found.
     Caches parsed coordinates per file session so multi-megabyte PDB files are not
-    re-parsed on multiple anchor queries.
+    re-parsed on multiple anchor queries. Uses O(1) residue indexing when chain_id is None.
     """
     if not pdb_path:
         return None
@@ -90,6 +98,7 @@ def get_residue_ca_coords(
     if not use_cache or cache_key not in _CA_COORDS_CACHE:
         ca_map: Dict[Tuple[str, int], np.ndarray] = {}
         all_atom_accum: Dict[Tuple[str, int], List[float]] = {}
+        resi_map: Dict[int, np.ndarray] = {}
 
         with open(real_path, "r", encoding="utf-8", errors="ignore", buffering=buffer_size) as f:
             for line in f:
@@ -106,7 +115,10 @@ def get_residue_ca_coords(
                     key = (ch, r)
                     atom_name = line[12:16].strip().upper()
                     if atom_name == "CA" and key not in ca_map:
-                        ca_map[key] = np.array([x, y, z], dtype=float)
+                        coord_arr = np.array([x, y, z], dtype=float)
+                        ca_map[key] = coord_arr
+                        if r not in resi_map:
+                            resi_map[r] = coord_arr
 
                     acc = all_atom_accum.get(key)
                     if acc is None:
@@ -120,14 +132,19 @@ def get_residue_ca_coords(
         fallback_map: Dict[Tuple[str, int], np.ndarray] = {}
         for key, acc in all_atom_accum.items():
             if key not in ca_map and acc[3] > 0:
-                fallback_map[key] = np.array([acc[0] / acc[3], acc[1] / acc[3], acc[2] / acc[3]], dtype=float)
+                fallback_coord = np.array([acc[0] / acc[3], acc[1] / acc[3], acc[2] / acc[3]], dtype=float)
+                fallback_map[key] = fallback_coord
+                if key[1] not in resi_map:
+                    resi_map[key[1]] = fallback_coord
 
         if use_cache:
             _CA_COORDS_CACHE[cache_key] = ca_map
             _FALLBACK_COORDS_CACHE[cache_key] = fallback_map
+            _RESI_COORDS_CACHE[cache_key] = resi_map
     else:
         ca_map = _CA_COORDS_CACHE[cache_key]
         fallback_map = _FALLBACK_COORDS_CACHE[cache_key]
+        resi_map = _RESI_COORDS_CACHE.get(cache_key, {})
 
     target_resi = int(resi)
     clean_chain = str(chain_id).strip() if chain_id is not None else None
@@ -141,10 +158,10 @@ def get_residue_ca_coords(
             return fallback.copy()
         return None
     else:
-        # Search across all chains for matching residue number
-        for (ch, r), coord in ca_map.items():
-            if r == target_resi:
-                return coord.copy()
+        # Fast O(1) indexed lookup across chains for matching residue number
+        coord = resi_map.get(target_resi)
+        if coord is not None:
+            return coord.copy()
         for (ch, r), fallback in fallback_map.items():
             if r == target_resi:
                 return fallback.copy()
@@ -166,6 +183,17 @@ def calculate_anchor_distance(coord1: Any, coord2: Any) -> float:
         c2 = np.asarray(coord2, dtype=float)
         diff = c2 - c1
         return float(np.sqrt(np.dot(diff, diff)))
+
+
+def batch_anchor_distances(coords1: Any, coords2: Any) -> np.ndarray:
+    """
+    Computes vectorized Euclidean distances between pairs of 3D coordinates using NumPy.
+    Supports (N, 3) arrays or single (3,) coordinates.
+    """
+    c1 = np.asarray(coords1, dtype=float)
+    c2 = np.asarray(coords2, dtype=float)
+    diff = c2 - c1
+    return np.sqrt(np.sum(diff * diff, axis=-1))
 
 
 def compute_recommended_linker(distance_angstrom: float) -> Tuple[int, int]:
@@ -226,6 +254,16 @@ class ChimeraScaffolder:
             if p_val and (p_val in ("/", "\\") or (len(p_val) <= 3 and p_val.endswith(":\\"))):
                 raise ValueError(f"Dangerous or root file specified for {p_label}: '{p_val}'")
 
+        # Validate donor_id and vessel_id against directory traversal
+        for id_label, id_val in [("donor_id", donor_id), ("vessel_id", vessel_id)]:
+            if isinstance(id_val, str):
+                if ".." in id_val or "/" in id_val or "\\" in id_val:
+                    raise ValueError(f"Path traversal detected in {id_label}: '{id_val}'")
+            elif isinstance(id_val, (list, tuple)):
+                for item in id_val:
+                    if ".." in str(item) or "/" in str(item) or "\\" in str(item):
+                        raise ValueError(f"Path traversal detected in {id_label}: '{item}'")
+
         self.donor_id = donor_id
         self.vessel_id = vessel_id
         self.motif_residues = motif_residues
@@ -242,9 +280,7 @@ class ChimeraScaffolder:
         self.plddt_threshold = plddt_threshold
         self.lock_vessel = lock_vessel
         self.clamp_linkers = clamp_linkers
-        self.out_dir = os.path.realpath(out_dir)
-        if self.out_dir in ("/", "\\") or (len(self.out_dir) <= 3 and self.out_dir.endswith(":\\")):
-            raise ValueError(f"Invalid or root output directory specified: '{out_dir}'")
+        self.out_dir = validate_output_dir(out_dir)
         self.dry_run = dry_run
 
         self.rfdiff_script = os.path.realpath(rfdiff_script) if rfdiff_script else None
@@ -266,12 +302,64 @@ class ChimeraScaffolder:
     def prepare_input_structures(self):
         """
         Extracts or validates donor and vessel PDB files.
+        Supports multi-donor selection by merging multiple objects/chains into 'merged_donor.pdb'.
         """
         os.makedirs(self.out_dir, exist_ok=True)
         work_prep = os.path.join(self.out_dir, "0_prep")
         os.makedirs(work_prep, exist_ok=True)
 
-        if self.input_file:
+        is_multi_donor = False
+        if isinstance(self.donor_id, (list, tuple)) and len(self.donor_id) > 1:
+            is_multi_donor = True
+        elif isinstance(self.donor_id, str) and "," in self.donor_id:
+            is_multi_donor = True
+
+        if is_multi_donor:
+            source_input = self.input_file or self.donor_pdb
+            if not source_input or not os.path.exists(source_input):
+                raise FileNotFoundError(f"Input file for multi-donor extraction not found: {source_input}")
+            merge_res = extract_and_merge_objects(source_input, self.donor_id, work_prep, prefix="merged_donor")
+            self.working_donor_pdb = merge_res["merged_pdb"]
+            self.donor_chain_id = "D"
+
+            if self.input_file:
+                # Reuse parsed entities_atoms from merge_res to avoid redundant PDB re-reading
+                entities_atoms = merge_res.get("entities_atoms")
+                if entities_atoms and os.path.abspath(source_input) == os.path.abspath(self.input_file):
+                    extracted = {}
+                    from pse_pdb_extractor import write_atoms_to_pdb
+                    for k, atoms in entities_atoms.items():
+                        safe_k = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(k).strip()) or "chain"
+                        out_path = safe_join_path(work_prep, f"{safe_k}.pdb")
+                        if not os.path.exists(out_path):
+                            write_atoms_to_pdb(atoms, out_path, buffer_size=65536)
+                        extracted[k] = out_path
+                else:
+                    extracted = extract_file(self.input_file, work_prep)
+                keys_list = list(extracted.keys())
+
+                def resolve_entity(val: str, fallback_idx: int = 1) -> str:
+                    s = str(val).strip()
+                    if s.isdigit():
+                        idx = int(s) - 1
+                        if 0 <= idx < len(keys_list):
+                            return extracted[keys_list[idx]]
+                    if s in extracted:
+                        return extracted[s]
+                    matched = [extracted[k] for k in keys_list if k.lower() == s.lower()]
+                    if matched:
+                        return matched[0]
+                    if 0 <= fallback_idx < len(keys_list):
+                        return extracted[keys_list[fallback_idx]]
+                    return list(extracted.values())[0] if extracted else ""
+
+                self.working_vessel_pdb = resolve_entity(self.vessel_id, 1 if len(keys_list) > 1 else 0)
+            else:
+                if not self.vessel_pdb or not os.path.isfile(self.vessel_pdb):
+                    raise FileNotFoundError(f"Vessel PDB not found: {self.vessel_pdb}")
+                self.working_vessel_pdb = self.vessel_pdb
+
+        elif self.input_file:
             # Single input (PSE or multi-chain PDB)
             extracted = extract_file(self.input_file, work_prep)
             keys_list = list(extracted.keys())
@@ -302,9 +390,12 @@ class ChimeraScaffolder:
             self.working_donor_pdb = self.donor_pdb
             self.working_vessel_pdb = self.vessel_pdb
 
-        # Parse both structures
+        # Parse both structures (reusing if same file)
         donor_parsed = parse_pdb_file(self.working_donor_pdb)
-        vessel_parsed = parse_pdb_file(self.working_vessel_pdb)
+        if os.path.abspath(self.working_vessel_pdb) == os.path.abspath(self.working_donor_pdb):
+            vessel_parsed = donor_parsed
+        else:
+            vessel_parsed = parse_pdb_file(self.working_vessel_pdb)
 
         # Detect primary chain IDs
         d_objs = list(donor_parsed["objects"].values())
@@ -323,31 +414,65 @@ class ChimeraScaffolder:
     def parse_motif_ranges(self) -> List[Tuple[int, int]]:
         """
         Parses motif residue intervals, e.g. '30-45,78-82' or 'all'.
+        Partitions into contiguous segments based on Delta resi > 1 OR
+        Euclidean CA distance > 4.20 Angstrom.
         Returns sorted contiguous intervals [(start, end), ...].
         """
         motif_clean = str(self.motif_residues).strip().lower()
         if motif_clean in ("all", "full", "whole", "100%", "*"):
-            d_min, d_max = self.donor_metadata["range"]
-            intervals = [(d_min, d_max)]
-            self.preserved_donor_segments = intervals
-            return intervals
+            res_nums = self.donor_metadata.get("residue_seqs", [])
+            if not res_nums:
+                donor_parsed = parse_pdb_file(self.working_donor_pdb)
+                for obj in donor_parsed["objects"].values():
+                    res_nums.extend(obj.get("residue_seqs", []))
+                res_nums = sorted(list(set(res_nums)))
+        else:
+            ordered_tuples = parse_residue_spec(self.motif_residues, default_chain=self.donor_chain_id)
+            if not ordered_tuples:
+                raise ValueError(f"No valid residues found in motif specification: '{self.motif_residues}'")
+            res_nums = sorted(list(set(r for _, r in ordered_tuples)))
 
-        ordered_tuples = parse_residue_spec(self.motif_residues, default_chain=self.donor_chain_id)
-        if not ordered_tuples:
-            raise ValueError(f"No valid residues found in motif specification: '{self.motif_residues}'")
+        if not res_nums:
+            raise ValueError(f"No residue numbers resolved for motif in donor structure: {self.working_donor_pdb}")
 
-        res_nums = sorted(list(set(r for _, r in ordered_tuples)))
-        intervals = []
-        cur_start = res_nums[0]
-        prev = res_nums[0]
-        for r in res_nums[1:]:
-            if r == prev + 1:
-                prev = r
-            else:
-                intervals.append((cur_start, prev))
-                cur_start = r
-                prev = r
-        intervals.append((cur_start, prev))
+        intervals: List[Tuple[int, int]] = []
+        # Pre-fetch all CA coordinates once to avoid redundant cache queries
+        coords_list = [get_residue_ca_coords(self.working_donor_pdb, self.donor_chain_id, r) for r in res_nums]
+
+        if len(res_nums) > 1 and all(c is not None for c in coords_list):
+            # Vectorized fast path using NumPy (sq_dist > 17.64 avoids sqrt)
+            arr_res = np.array(res_nums, dtype=int)
+            delta_resis = arr_res[1:] - arr_res[:-1]
+            coords_arr = np.array(coords_list, dtype=float)
+            diffs = coords_arr[1:] - coords_arr[:-1]
+            sq_dists = np.sum(diffs * diffs, axis=1)
+            breaks = (delta_resis > 1) | (sq_dists > 17.64)
+
+            break_indices = np.where(breaks)[0]
+            cur_start_idx = 0
+            for b_idx in break_indices:
+                intervals.append((res_nums[cur_start_idx], res_nums[b_idx]))
+                cur_start_idx = b_idx + 1
+            intervals.append((res_nums[cur_start_idx], res_nums[-1]))
+        else:
+            # Fallback path if any CA coordinate is missing
+            cur_start = res_nums[0]
+            for i in range(len(res_nums) - 1):
+                curr_r = res_nums[i]
+                next_r = res_nums[i + 1]
+                delta_resi = next_r - curr_r
+
+                c1 = coords_list[i]
+                c2 = coords_list[i + 1]
+                has_ca = (c1 is not None and c2 is not None)
+                ca_dist = calculate_anchor_distance(c1, c2) if has_ca else 0.0
+
+                if delta_resi > 1 or (has_ca and ca_dist > 4.20):
+                    intervals.append((cur_start, curr_r))
+                    cur_start = next_r
+
+            intervals.append((cur_start, res_nums[-1]))
+
         self.preserved_donor_segments = intervals
         return intervals
 
@@ -619,9 +744,64 @@ class ChimeraScaffolder:
                     "donor_anchor": {"resi": donor_n_res, "chain": self.donor_chain_id, "coord": donor_n_coord.tolist()}
                 }
 
+        # Measure internal gaps between consecutive donor segments
+        internal_gaps: List[Dict[str, Any]] = []
+        if len(motif_segments) > 1:
+            seg_ends = [motif_segments[k][1] for k in range(len(motif_segments) - 1)]
+            seg_next_starts = [motif_segments[k + 1][0] for k in range(len(motif_segments) - 1)]
+            c_ends = [get_residue_ca_coords(self.working_donor_pdb, self.donor_chain_id, r) for r in seg_ends]
+            n_starts = [get_residue_ca_coords(self.working_donor_pdb, self.donor_chain_id, r) for r in seg_next_starts]
+
+            for k in range(len(motif_segments) - 1):
+                seg_k_end = seg_ends[k]
+                seg_next_start = seg_next_starts[k]
+                c_k = c_ends[k]
+                n_next = n_starts[k]
+                if c_k is not None and n_next is not None:
+                    d_k = calculate_anchor_distance(c_k, n_next)
+                else:
+                    seq_gap = max(1, seg_next_start - seg_k_end - 1)
+                    d_k = float(seq_gap * 3.8)
+
+                l_ext = compute_extension_minimum(d_k)
+                l_glob = max(3, int(math.ceil(d_k / 3.0)))
+                l_max = l_glob + 6
+                rec_range = f"{l_glob}-{l_max}"
+
+                internal_gaps.append({
+                    "bridge_idx": k + 1,
+                    "from_segment": k + 1,
+                    "to_segment": k + 2,
+                    "from_resi": seg_k_end,
+                    "to_resi": seg_next_start,
+                    "distance_angstrom": round(d_k, 2),
+                    "ext_min": l_ext,
+                    "glob_min": l_glob,
+                    "recommended_range": rec_range,
+                    "description": f"Internal Bridge {k + 1} (Segment S{k + 1} res {seg_k_end} -> Segment S{k + 2} res {seg_next_start})"
+                })
+
+        donor_segments_breakdown: List[Dict[str, Any]] = []
+        for idx, (s, e) in enumerate(motif_segments, start=1):
+            next_dist_str = "Terminal (Junction C)"
+            if idx <= len(internal_gaps):
+                gap_item = internal_gaps[idx - 1]
+                next_dist_str = f"{gap_item['distance_angstrom']} Å -> Linker: {gap_item['recommended_range']}"
+            donor_segments_breakdown.append({
+                "segment_id": f"S{idx}",
+                "start": s,
+                "end": e,
+                "range_str": f"{s} - {e}",
+                "length": e - s + 1,
+                "distance_to_next": next_dist_str
+            })
+
         return {
             "mode": self.chimera_mode,
-            "junctions": junctions
+            "junctions": junctions,
+            "internal_gaps": internal_gaps,
+            "donor_segments": donor_segments_breakdown,
+            "total_donor_residues": sum(e - s + 1 for s, e in motif_segments)
         }
 
     # Efficient alias for junction measurement
@@ -631,7 +811,8 @@ class ChimeraScaffolder:
         """
         Computes RFdiffusion contigs and list of preserved donor & vessel segments
         based on the selected chimera_mode.
-        Applies crystallographic gap awareness and biophysical linker clamping.
+        Applies crystallographic gap awareness, internal Euclidean linker budgeting,
+        and biophysical linker clamping.
 
         Returns (contig_string, preserved_donor_segments, preserved_vessel_segments).
         """
@@ -681,17 +862,28 @@ class ChimeraScaffolder:
         d_label = "D"
         v_label = "V"
 
-        # Format motif portion in contig (preserving internal spacing if multiple)
+        # Format motif portion in contig, budgeting physical internal linkers across gaps
         motif_contig_parts = []
         for idx, (m_start, m_end) in enumerate(motif_segments):
             if idx > 0:
                 # internal motif linker/bridge
                 prev_end = motif_segments[idx - 1][1]
-                gap = m_start - prev_end - 1
-                if gap > 0:
-                    motif_contig_parts.append(f"{gap}-{gap}")
+                c_prev = get_residue_ca_coords(self.working_donor_pdb, self.donor_chain_id, prev_end)
+                n_curr = get_residue_ca_coords(self.working_donor_pdb, self.donor_chain_id, m_start)
+                if c_prev is not None and n_curr is not None:
+                    d_gap = calculate_anchor_distance(c_prev, n_curr)
+                    l_glob = max(3, int(math.ceil(d_gap / 3.0)))
+                    l_max = l_glob + 6
+                    motif_contig_parts.append(f"{l_glob}-{l_max}")
                 else:
-                    motif_contig_parts.append("3-6")
+                    gap_res = m_start - prev_end - 1
+                    if gap_res > 0:
+                        d_gap = float(gap_res * 3.8)
+                        l_glob = max(3, int(math.ceil(d_gap / 3.0)))
+                        l_max = l_glob + 6
+                        motif_contig_parts.append(f"{l_glob}-{l_max}")
+                    else:
+                        motif_contig_parts.append("3-9")
             motif_contig_parts.append(f"{d_label}{m_start}-{m_end}")
 
         motif_contig_str = "/".join(motif_contig_parts)
@@ -779,9 +971,9 @@ class ChimeraScaffolder:
         Assigns Chain 'D' to donor motif and Chain 'V' to vessel residues.
         Atom numbering is made sequential and clean using 64KB buffered I/O.
         """
-        work_prep = os.path.join(self.out_dir, "0_prep")
+        work_prep = safe_join_path(self.out_dir, "0_prep")
         os.makedirs(work_prep, exist_ok=True)
-        seed_path = os.path.join(work_prep, "chimera_seed.pdb")
+        seed_path = safe_join_path(work_prep, "chimera_seed.pdb")
 
         donor_set = set()
         for s, e in self.preserved_donor_segments:
@@ -809,9 +1001,10 @@ class ChimeraScaffolder:
                             resi = int(line[22:26])
                         except ValueError:
                             continue
-                        if resi in vessel_set:
+                        ch = line[21].strip() or "A"
+                        if (not self.vessel_chain_id or ch == self.vessel_chain_id) and resi in vessel_set:
                             vessel_raw.append(line)
-                        if resi in donor_set:
+                        if (not self.donor_chain_id or ch == self.donor_chain_id) and resi in donor_set:
                             donor_raw.append(line)
 
             for line in vessel_raw:
@@ -831,7 +1024,8 @@ class ChimeraScaffolder:
                             resi = int(line[22:26])
                         except ValueError:
                             continue
-                        if resi in vessel_set:
+                        ch = line[21].strip() or "A"
+                        if (not self.vessel_chain_id or ch == self.vessel_chain_id) and resi in vessel_set:
                             atom_lines.append(f"{line[:6]}{atom_idx:>5}{line[11:21]}V{line[22:80].rstrip()}\n")
                             atom_idx += 1
 
@@ -846,7 +1040,8 @@ class ChimeraScaffolder:
                             resi = int(line[22:26])
                         except ValueError:
                             continue
-                        if resi in donor_set:
+                        ch = line[21].strip() or "A"
+                        if (not self.donor_chain_id or ch == self.donor_chain_id) and resi in donor_set:
                             atom_lines.append(f"{line[:6]}{atom_idx:>5}{line[11:21]}D{line[22:80].rstrip()}\n")
                             atom_idx += 1
 
@@ -884,7 +1079,6 @@ class ChimeraScaffolder:
         ref_donor_res = [r for s, e in self.preserved_donor_segments for r in range(s, e + 1)]
         ref_vessel_res = [r for s, e in self.preserved_vessel_segments for r in range(s, e + 1)]
 
-        matched_via_coords = False
         try:
             # Extract CA across backbone
             bb_ca_coords, bb_meta = extract_coordinates(
@@ -901,72 +1095,96 @@ class ChimeraScaffolder:
                 self.working_vessel_pdb, chain_id=self.vessel_chain_id, residue_list=ref_vessel_res, atom_names=["CA"], extract_meta=False
             )
 
-            # Map donor residues by distance matching (< 0.20 Å for pinned coordinates, sq_dist < 0.04)
-            if len(bb_ca_coords) > 0 and len(donor_ca_coords) > 0:
-                d_found = []
-                for d_coord in donor_ca_coords:
-                    diffs = bb_ca_coords - d_coord
-                    sq_dists = np.sum(diffs * diffs, axis=1)
-                    min_idx = int(np.argmin(sq_dists))
-                    if sq_dists[min_idx] < 0.04:  # (0.20 Å)^2 avoids square root calculations
-                        res_num_1based = min_idx + 1  # 1-based sequential residue index in backbone
-                        d_found.append(res_num_1based)
-                if len(d_found) == len(ref_donor_res):
-                    donor_fixed = d_found
-                    matched_via_coords = True
+            # Map donor residues by fast KDTree (< 0.20 Å for pinned coordinates) or vectorized search
+            if len(bb_ca_coords) > 0:
+                try:
+                    from scipy.spatial import cKDTree
+                    bb_tree = cKDTree(bb_ca_coords)
+                except ImportError:
+                    bb_tree = None
 
-            # Map vessel residues by distance matching (< 0.20 Å for pinned coordinates, sq_dist < 0.04)
-            if self.lock_vessel and len(bb_ca_coords) > 0 and len(vessel_ca_coords) > 0:
-                v_found = []
-                for v_coord in vessel_ca_coords:
-                    diffs = bb_ca_coords - v_coord
-                    sq_dists = np.sum(diffs * diffs, axis=1)
-                    min_idx = int(np.argmin(sq_dists))
-                    if sq_dists[min_idx] < 0.04:  # (0.20 Å)^2 avoids square root calculations
-                        res_num_1based = min_idx + 1
-                        v_found.append(res_num_1based)
-                if len(v_found) == len(ref_vessel_res):
-                    vessel_fixed = v_found
+                if bb_tree is not None:
+                    if len(donor_ca_coords) > 0:
+                        dists, idxs = bb_tree.query(donor_ca_coords, distance_upper_bound=0.20)
+                        valid = idxs < len(bb_ca_coords)
+                        if np.any(valid):
+                            donor_fixed = (idxs[valid] + 1).tolist()
+
+                    if self.lock_vessel and len(vessel_ca_coords) > 0:
+                        v_dists, v_idxs = bb_tree.query(vessel_ca_coords, distance_upper_bound=0.20)
+                        v_valid = v_idxs < len(bb_ca_coords)
+                        if np.any(v_valid):
+                            vessel_fixed = (v_idxs[v_valid] + 1).tolist()
+                else:
+                    # Fallback vectorized search if scipy is unavailable
+                    if len(donor_ca_coords) > 0:
+                        d_found = []
+                        for d_coord in donor_ca_coords:
+                            diffs = bb_ca_coords - d_coord
+                            sq_dists = np.sum(diffs * diffs, axis=1)
+                            min_idx = int(np.argmin(sq_dists))
+                            if sq_dists[min_idx] < 0.04:  # (0.20 Å)^2 avoids square root calculations
+                                d_found.append(min_idx + 1)
+                        if len(d_found) > 0:
+                            donor_fixed = d_found
+
+                    if self.lock_vessel and len(vessel_ca_coords) > 0:
+                        v_found = []
+                        for v_coord in vessel_ca_coords:
+                            diffs = bb_ca_coords - v_coord
+                            sq_dists = np.sum(diffs * diffs, axis=1)
+                            min_idx = int(np.argmin(sq_dists))
+                            if sq_dists[min_idx] < 0.04:  # (0.20 Å)^2 avoids square root calculations
+                                v_found.append(min_idx + 1)
+                        if len(v_found) > 0:
+                            vessel_fixed = v_found
         except Exception:
-            matched_via_coords = False
+            pass
 
-        # Fallback to topology offset calculation if coordinate matching did not match all residues
-        if not matched_via_coords or not donor_fixed:
-            num_motif_res = len(ref_donor_res)
-            v_left_len = 0
-            v_right_len = 0
+        # Fallback to topology offset calculation if coordinate matching did not match residues
+        if not donor_fixed:
+            donor_fixed = []
+            vessel_fixed = []
+            v_left_len = sum(e - s + 1 for s, e in self.preserved_vessel_segments[:1]) if self.preserved_vessel_segments else 0
+            v_right_len = sum(e - s + 1 for s, e in self.preserved_vessel_segments[1:]) if len(self.preserved_vessel_segments) > 1 else 0
+            num_donor_res = sum(e - s + 1 for s, e in self.preserved_donor_segments)
+            num_int_linkers = max(0, len(self.preserved_donor_segments) - 1)
+            est_int_len = 6
+            total_int_len = num_int_linkers * est_int_len
+
             if self.chimera_mode in ["replace", "graft", "insert_loop", "loop", "insert"]:
-                if len(self.preserved_vessel_segments) >= 1:
-                    v_left_len = self.preserved_vessel_segments[0][1] - self.preserved_vessel_segments[0][0] + 1
-                if len(self.preserved_vessel_segments) >= 2:
-                    v_right_len = self.preserved_vessel_segments[1][1] - self.preserved_vessel_segments[1][0] + 1
-
-                # Calculate actual total linker length generated in backbone:
-                # total_len = v_left_len + linker_n_len + num_motif_res + linker_c_len + v_right_len
-                total_linker_budget = max(0, total_len - v_left_len - num_motif_res - v_right_len)
-                actual_linker_n = total_linker_budget // 2
-
-                motif_start = v_left_len + actual_linker_n + 1
-                donor_fixed = list(range(motif_start, motif_start + num_motif_res))
+                rem_len = max(0, total_len - v_left_len - v_right_len - num_donor_res - total_int_len)
+                actual_ln = rem_len // 2
+                cursor = v_left_len + actual_ln + 1
+                for s, e in self.preserved_donor_segments:
+                    seg_len = e - s + 1
+                    donor_fixed.extend(range(cursor, cursor + seg_len))
+                    cursor += seg_len + est_int_len
 
                 if self.lock_vessel:
-                    left_vessel = list(range(1, v_left_len + 1))
-                    right_vessel_start = total_len - v_right_len + 1
-                    right_vessel = list(range(right_vessel_start, total_len + 1))
-                    vessel_fixed = left_vessel + right_vessel
+                    vessel_fixed.extend(range(1, v_left_len + 1))
+                    vessel_fixed.extend(range(total_len - v_right_len + 1, total_len + 1))
 
             elif self.chimera_mode in ["ligate_nterm", "nterm"]:
-                donor_fixed = list(range(1, num_motif_res + 1))
+                cursor = 1
+                for s, e in self.preserved_donor_segments:
+                    seg_len = e - s + 1
+                    donor_fixed.extend(range(cursor, cursor + seg_len))
+                    cursor += seg_len + est_int_len
                 if self.lock_vessel:
                     v_len = sum(e - s + 1 for s, e in self.preserved_vessel_segments)
-                    vessel_fixed = list(range(total_len - v_len + 1, total_len + 1))
+                    vessel_fixed.extend(range(total_len - v_len + 1, total_len + 1))
 
             elif self.chimera_mode in ["ligate_cterm", "cterm"]:
-                start_pos = total_len - num_motif_res + 1
-                donor_fixed = list(range(start_pos, total_len + 1))
+                v_len = sum(e - s + 1 for s, e in self.preserved_vessel_segments)
                 if self.lock_vessel:
-                    v_len = sum(e - s + 1 for s, e in self.preserved_vessel_segments)
-                    vessel_fixed = list(range(1, v_len + 1))
+                    vessel_fixed.extend(range(1, v_len + 1))
+                rem_len = max(0, total_len - v_len - num_donor_res - total_int_len)
+                cursor = v_len + rem_len + 1
+                for s, e in self.preserved_donor_segments:
+                    seg_len = e - s + 1
+                    donor_fixed.extend(range(cursor, cursor + seg_len))
+                    cursor += seg_len + est_int_len
 
         # Combine fixed positions
         all_fixed = set(donor_fixed)
@@ -1010,8 +1228,8 @@ class ChimeraScaffolder:
 
         # Step 1: Formulate RFdiffusion execution command
         # Pin coordinates with noise_scale=0.0 to prevent drifting of preserved atoms
-        work_prep = os.path.join(self.out_dir, "0_prep")
-        contig_plan_path = os.path.realpath(os.path.join(work_prep, "contig_plan.txt"))
+        work_prep = safe_join_path(self.out_dir, "0_prep")
+        contig_plan_path = safe_join_path(work_prep, "contig_plan.txt")
         with open(contig_plan_path, "w", encoding="utf-8", buffering=65536) as cpf:
             cpf.write(f"Contig Formula: {self.contig_string}\n")
             cpf.write(f"Chimera Mode: {self.chimera_mode}\n")
@@ -1045,7 +1263,7 @@ class ChimeraScaffolder:
         else:
             # Create synthetic/mock backbone placeholder in dry_run or fallback
             # RFdiffusion outputs single-chain designs (usually Chain A) with contiguous residues
-            mock_bb = os.path.join(work_rfdiff, "chimera_design_0.pdb")
+            mock_bb = safe_join_path(work_rfdiff, "chimera_design_0.pdb")
             with open(self.seed_pdb_path, "r", encoding="utf-8", buffering=65536) as sf, open(mock_bb, "w", encoding="utf-8", buffering=65536) as mf:
                 curr_resi = 0
                 prev_orig_resi = None
@@ -1072,7 +1290,7 @@ class ChimeraScaffolder:
             bb_name = os.path.splitext(os.path.basename(bb))[0]
             safe_bb_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', bb_name) or "backbone"
             fixed_map = self.map_fixed_positions_for_mpnn(bb)
-            jsonl_path = os.path.join(work_mpnn, f"{safe_bb_name}_fixed_positions.jsonl")
+            jsonl_path = safe_join_path(work_mpnn, f"{safe_bb_name}_fixed_positions.jsonl")
             make_fixed_positions_dict(bb_name, fixed_map, out_jsonl=jsonl_path)
 
             mpnn_cmd = [
@@ -1142,16 +1360,12 @@ class ChimeraScaffolder:
             metrics_rows.append(row)
 
             if passed:
-                res_dest = os.path.realpath(os.path.join(work_results, f"{safe_bb_base}_passed.pdb"))
-                if os.path.commonpath([os.path.realpath(work_results), res_dest]) != os.path.realpath(work_results):
-                    raise ValueError(f"Path traversal detected in model destination: {res_dest}")
+                res_dest = safe_join_path(work_results, f"{safe_bb_base}_passed.pdb")
                 shutil.copyfile(bb_path, res_dest)
                 passing_models.append(res_dest)
 
         # Output metrics_summary.csv strictly within out_dir using 64KB buffering
-        csv_path = os.path.realpath(os.path.join(self.out_dir, "metrics_summary.csv"))
-        if os.path.commonpath([self.out_dir, csv_path]) != self.out_dir:
-            raise ValueError(f"Path traversal detected in metrics CSV destination: {csv_path}")
+        csv_path = safe_join_path(self.out_dir, "metrics_summary.csv")
         with open(csv_path, "w", newline="", encoding="utf-8", buffering=65536) as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=["model_id", "backbone_path", "motif_rmsd", "plddt", "verdict"])
             writer.writeheader()
@@ -1165,9 +1379,7 @@ class ChimeraScaffolder:
         summary_data["passing_candidates"] = len(passing_models)
 
         # Output chimera_summary.json strictly within out_dir using 64KB buffering
-        summary_json = os.path.realpath(os.path.join(self.out_dir, "chimera_summary.json"))
-        if os.path.commonpath([self.out_dir, summary_json]) != self.out_dir:
-            raise ValueError(f"Path traversal detected in summary JSON destination: {summary_json}")
+        summary_json = safe_join_path(self.out_dir, "chimera_summary.json")
         with open(summary_json, "w", encoding="utf-8", buffering=65536) as f:
             json.dump(summary_data, f, indent=2)
 
@@ -1236,7 +1448,7 @@ class ChimeraScaffolder:
         return summary_data
 
 
-def main():
+def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "measure_junctions":
         meas_parser = argparse.ArgumentParser(
             description="Measure 3D junction distances and recommend linker bounds."

@@ -62,6 +62,10 @@ fast_realpath() {
         echo ""
         return
     fi
+    if [[ "$target" =~ ^/ || "$target" =~ ^[a-zA-Z]:[\\/] ]]; then
+        echo "$target"
+        return
+    fi
     if command -v realpath >/dev/null 2>&1; then
         realpath "$target" 2>/dev/null && return
     elif command -v readlink >/dev/null 2>&1; then
@@ -308,28 +312,36 @@ fi
 # ------------------------------------------------------------------------------
 if [ -z "$DONOR_ID" ]; then
     echo -e ""
-    read -r -p "▶ 2. Select Donor Object/Chain ID (contains desired active 3D motif) [e.g. 4 or 7ZUB_chain_D]: " DONOR_ID
+    read -r -p "▶ 2. Select Donor Object/Chain ID(s) [e.g. '6,7' or 'HSP_contact,contacts_objB']: " DONOR_ID
 fi
 DONOR_ID=${DONOR_ID:-A}
-if [[ "$DONOR_ID" =~ ^[0-9]+$ ]]; then
+if [ -n "$INSPECT_JSON" ]; then
     RESOLVED_DONOR=$(echo "$INSPECT_JSON" | python -c "
 import sys, json
+raw_donor = sys.argv[1].strip()
 try:
     data = json.load(sys.stdin)
     objs = list(data.get('objects', {}).keys())
-    idx = int(sys.argv[1]) - 1
-    if 0 <= idx < len(objs):
-        print(objs[idx])
-    else:
-        print(sys.argv[1])
+    parts = [p.strip() for p in raw_donor.split(',') if p.strip()]
+    resolved_parts = []
+    for p in parts:
+        if p.isdigit():
+            idx = int(p) - 1
+            if 0 <= idx < len(objs):
+                resolved_parts.append(objs[idx])
+            else:
+                resolved_parts.append(p)
+        else:
+            resolved_parts.append(p)
+    print(','.join(resolved_parts))
 except Exception:
-    print(sys.argv[1])
+    print(raw_donor)
 " "$DONOR_ID" 2>/dev/null || true)
     [ -n "$RESOLVED_DONOR" ] && DONOR_ID="$RESOLVED_DONOR"
 fi
 
-if [[ ! "$DONOR_ID" =~ ^[a-zA-Z0-9_\-]+$ ]]; then
-    echo -e "${RED}[ERROR] Invalid Donor ID '$DONOR_ID'. Must contain only alphanumeric characters, underscores, or hyphens.${NC}"
+if [[ ! "$DONOR_ID" =~ ^[a-zA-Z0-9_\-,\ ]+$ ]]; then
+    echo -e "${RED}[ERROR] Invalid Donor ID '$DONOR_ID'. Must contain only alphanumeric characters, underscores, hyphens, or commas.${NC}"
     exit 1
 fi
 echo -e "  ${GREEN}[✓] Selected Donor:${NC} ${BOLD}$DONOR_ID${NC}"
@@ -353,7 +365,7 @@ if [ -z "$VESSEL_ID" ]; then
     read -r -p "▶ 4. Select Recipient / Vessel Object/Chain ID [e.g. 1 or 7ZUB_chain_A]: " VESSEL_ID
 fi
 VESSEL_ID=${VESSEL_ID:-B}
-if [[ "$VESSEL_ID" =~ ^[0-9]+$ ]]; then
+if [ -n "$INSPECT_JSON" ] && [[ "$VESSEL_ID" =~ ^[0-9]+$ ]]; then
     RESOLVED_VESSEL=$(echo "$INSPECT_JSON" | python -c "
 import sys, json
 try:
@@ -428,6 +440,12 @@ if [ -t 0 ]; then
     if [ -n "$ABS_INPUT_FILE" ]; then
         MEASURE_CMD+=("--input_file" "$ABS_INPUT_FILE")
     fi
+    if [ -n "$DONOR_PDB" ]; then
+        MEASURE_CMD+=("--donor_pdb" "$DONOR_PDB")
+    fi
+    if [ -n "$VESSEL_PDB" ]; then
+        MEASURE_CMD+=("--vessel_pdb" "$VESSEL_PDB")
+    fi
     if [ -n "$VESSEL_REPLACE_RANGE" ]; then
         MEASURE_CMD+=("--vessel_replace_range" "$VESSEL_REPLACE_RANGE")
     fi
@@ -438,16 +456,46 @@ if [ -t 0 ]; then
     MEASURE_JSON=$("${MEASURE_CMD[@]}" 2>/dev/null || true)
 
     if [ -n "$MEASURE_JSON" ] && echo "$MEASURE_JSON" | grep -q "junctions"; then
-        echo -e "${GREEN}[✓] Calculated 3D Junction Distances:${NC}"
-
-        # Parse recommended linkers and display summary in a single Python call to avoid redundant forks
+        # Parse recommended linkers, fragments table, and display summary in Python
         PARSED_RECOMMENDATIONS=$(echo "$MEASURE_JSON" | python -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
+    donor_segs = data.get('donor_segments', [])
+    int_gaps = data.get('internal_gaps', [])
+    tot_donor = data.get('total_donor_residues', 0)
+
+    if len(donor_segs) > 1 or len(int_gaps) > 0:
+        print('=' * 80)
+        print(' 🧬 MULTI-DONOR DISCONTINUOUS MOTIF BREAKDOWN & INTERNAL GAP ANALYSIS 🧬')
+        print('=' * 80)
+        print(f'[+] Preserving {tot_donor} donor residues partitioned into {len(donor_segs)} segments:')
+        print('  ┌──────────┬──────────────┬──────────────┬────────────────────────────────────────┐')
+        print('  │ Segment  │ Residue Span │ Length (aa)  │ Distance to Next (Å)                   │')
+        print('  ├──────────┼──────────────┼──────────────┼────────────────────────────────────────┤')
+        for s in donor_segs:
+            seg_id = s.get('segment_id', '')
+            r_str = s.get('range_str', '')
+            l_str = f\"{s.get('length', '')} aa\"
+            d_str = s.get('distance_to_next', '')
+            print(f'  │ {seg_id:<8} │ {r_str:<12} │ {l_str:<12} │ {d_str:<38} │')
+        print('  └──────────┴──────────────┴──────────────┴────────────────────────────────────────┘')
+
+        if int_gaps:
+            print('\n[✓] Automated Internal Linker Budget:')
+            for g in int_gaps:
+                b_idx = g.get('bridge_idx', 1)
+                f_s = g.get('from_segment', 1)
+                t_s = g.get('to_segment', 2)
+                rec = g.get('recommended_range', '')
+                dist = g.get('distance_angstrom', 0.0)
+                print(f'  • Bridge {b_idx} (S{f_s} -> S{t_s}): {rec} aa (spanning {dist} Å void)')
+        print('=' * 80 + '\n')
+
     j = data.get('junctions', {})
     rec_n = ''
     rec_c = ''
+    print('[✓] Calculated 3D Outer Junction Distances:')
     for k, v in j.items():
         desc = v.get('description', k)
         d = v.get('distance_angstrom', 0.0)
@@ -468,9 +516,15 @@ except Exception:
 " 2>/dev/null || true)
         echo -e "------------------------------------------------------------"
 
-        REC_LINKER_N=$(echo "$PARSED_RECOMMENDATIONS" | sed -n 's/^__REC_N__=//p')
-        REC_LINKER_C=$(echo "$PARSED_RECOMMENDATIONS" | sed -n 's/^__REC_C__=//p')
-        echo "$PARSED_RECOMMENDATIONS" | grep -v '^__REC_' || true
+        while IFS= read -r rec_line; do
+            if [[ "$rec_line" =~ ^__REC_N__=(.*) ]]; then
+                REC_LINKER_N="${BASH_REMATCH[1]}"
+            elif [[ "$rec_line" =~ ^__REC_C__=(.*) ]]; then
+                REC_LINKER_C="${BASH_REMATCH[1]}"
+            else
+                echo "$rec_line"
+            fi
+        done <<< "$PARSED_RECOMMENDATIONS"
 
         [ -n "$REC_LINKER_N" ] && LINKER_N="$REC_LINKER_N"
         [ -n "$REC_LINKER_C" ] && LINKER_C="$REC_LINKER_C"
@@ -496,6 +550,13 @@ if [ -z "$ABS_OUT_DIR" ] || [ "$ABS_OUT_DIR" = "/" ] || [ "$ABS_OUT_DIR" = "\\" 
     echo -e "${RED}[ERROR] Invalid or dangerous output directory specified: '$OUT_DIR'.${NC}"
     exit 1
 fi
+LOWER_OUT="${ABS_OUT_DIR,,}"
+for SYS_DIR in "/etc" "/usr" "/bin" "/sbin" "/boot" "/dev" "c:\\windows" "c:\\program files"; do
+    if [ "$LOWER_OUT" = "$SYS_DIR" ] || [[ "$LOWER_OUT" == "$SYS_DIR"/* ]] || [[ "$LOWER_OUT" == "$SYS_DIR"\\* ]]; then
+        echo -e "${RED}[ERROR] Output directory cannot be in a system directory: '$OUT_DIR'.${NC}"
+        exit 1
+    fi
+done
 mkdir -p "$ABS_OUT_DIR"
 
 PID_FILE="$ABS_OUT_DIR/run.pid"
