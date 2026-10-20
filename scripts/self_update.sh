@@ -80,9 +80,15 @@ git checkout "$AUTOSCAFFOLD_BRANCH" 2>/dev/null || git checkout -b "$AUTOSCAFFOL
 git pull origin "$AUTOSCAFFOLD_BRANCH"
 
 # Ensure all scripts have safe execute permissions
+chmod 755 "$SCRIPT_DIR/autoscaffold" 2>/dev/null || true
 chmod 755 "$SCRIPT_DIR"/*.sh 2>/dev/null || true
 chmod 755 "$SCRIPT_DIR"/scripts/*.sh 2>/dev/null || true
 chmod 755 "$SCRIPT_DIR"/scripts/*.py 2>/dev/null || true
+
+# Refresh global launcher if install.sh is present
+if [ -f "$SCRIPT_DIR/install.sh" ]; then
+    bash "$SCRIPT_DIR/install.sh" shortcut >/dev/null 2>&1 || true
+fi
 
 echo -e "\n${GREEN}======================================================${NC}"
 echo -e "${GREEN} [✓] AutoScaffold upgraded successfully to ${REMOTE_HASH:0:8}! ${NC}"

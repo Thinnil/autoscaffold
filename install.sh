@@ -354,9 +354,14 @@ install_launcher() {
     LAUNCHER_SRC="$(cd -P "$(dirname "$LAUNCHER_SRC")" && pwd)/$(basename "$LAUNCHER_SRC")"
 
     chmod 755 "$LAUNCHER_SRC" 2>/dev/null || true
-    # Safely remove existing symlink or file to prevent symlink traversal
+    # Safely remove existing symlink or file to prevent symlink traversal or stale targets
     rm -f "$TARGET_BIN/autoscaffold"
     ln -sf "$LAUNCHER_SRC" "$TARGET_BIN/autoscaffold" 2>/dev/null || true
+
+    # Also clean up stale ~/.local/bin/autoscaffold if installed as root, or /usr/local/bin if unprivileged
+    if [ "$TARGET_BIN" != "/usr/local/bin" ] && [ -w "/usr/local/bin" ] && [ -L "/usr/local/bin/autoscaffold" ]; then
+        rm -f "/usr/local/bin/autoscaffold" 2>/dev/null || true
+    fi
 
     # If ln -sf did not produce a true symlink (common on Windows Git Bash without native symlink rights),
     # write a canonical launcher wrapper script that explicitly points to LAUNCHER_SRC.
@@ -374,6 +379,19 @@ EOF
         sed -i "s|REPLACE_REPO_SRC|$LAUNCHER_SRC|g" "$TARGET_BIN/autoscaffold"
     fi
     chmod 755 "$TARGET_BIN/autoscaffold" 2>/dev/null || true
+
+    # Clean up any conflicting legacy shell aliases in rc files
+    for RC_FILE in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_aliases"; do
+        if [ -f "$RC_FILE" ] && [ ! -L "$RC_FILE" ]; then
+            if grep -E "^[[:space:]]*alias[[:space:]]+autoscaffold=" "$RC_FILE" >/dev/null 2>&1; then
+                sed -i -E 's|^([[:space:]]*alias[[:space:]]+autoscaffold=.*)|# [AutoScaffold legacy alias disabled] \1|g' "$RC_FILE" 2>/dev/null || true
+                echo -e "${YELLOW}[!] Disabled legacy 'alias autoscaffold' in $RC_FILE to allow global binary execution.${NC}"
+            fi
+        fi
+    done
+
+    # Reset current shell command cache if supported
+    hash -d autoscaffold 2>/dev/null || hash -r 2>/dev/null || true
 
     # Persist repository location marker in user home
     if [ -n "$HOME" ] && [ "$HOME" != "/" ]; then

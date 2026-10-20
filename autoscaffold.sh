@@ -54,7 +54,7 @@ source "$SCRIPT_DIR/scripts/env_setup.sh"
 echo -e "${CYAN}======================================================${NC}"
 echo -e "${CYAN} 🏗️  AUTOSCAFFOLD: DE NOVO MOTIF SCAFFOLDING 🏗️       ${NC}"
 echo -e "${CYAN}======================================================${NC}"
-echo -e "Tip: Press ${YELLOW}Ctrl + C${NC} at any time to cancel.\n"
+echo -e "Tip: Press ${YELLOW}Ctrl + C${NC} to cancel. (For the Master Suite menu, run ${BOLD}autoscaffold_suite.sh${NC} or ${BOLD}autoscaffold${NC})\n"
 
 BACKGROUND_MODE=false
 ORIG_ARGS=()
