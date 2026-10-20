@@ -55,6 +55,15 @@ class SafeSessionUnpickler(pickle.Unpickler):
     }
 
     def find_class(self, module: str, name: str):
+        # Safely stub PyMOL internal session classes so sessions can be unpickled without pymol installed
+        if module == "pymol" or module.startswith("pymol.") or module.startswith("chempy."):
+            class DummySessionClass:
+                def __init__(self, *args, **kwargs):
+                    pass
+                def __setstate__(self, state):
+                    if isinstance(state, dict):
+                        self.__dict__.update(state)
+            return DummySessionClass
         if (module, name) in self.SAFE_CLASSES:
             return super().find_class(module, name)
         if module in ("builtins", "__builtin__") and name in (
@@ -415,96 +424,117 @@ def parse_pse_standalone(pse_path: str) -> Dict[str, Any]:
         names_entry = find_names(session_dict)
 
     if names_entry is not None:
-        # names_entry is either a dict or list of objects
         items = names_entry.items() if isinstance(names_entry, dict) else enumerate(names_entry)
+        raw_molecules = {}
+        selections = {}
+
         for _, obj_record in items:
             if not isinstance(obj_record, (list, tuple)) or len(obj_record) < 6:
                 continue
 
-            obj_name = str(obj_record[0])
-            obj_type = obj_record[1]
-            # Type 1 in PyMOL is ObjectMolecule
-            if obj_type != 1:
+            obj_name = str(obj_record[0]).strip()
+            if not obj_name or obj_name.lower() in ("none", "null"):
                 continue
 
-            # obj_record[5] is the ObjectMolecule data structure
             mol_data = obj_record[5]
-            if not isinstance(mol_data, (list, tuple)) or len(mol_data) < 8:
+            if not isinstance(mol_data, (list, tuple)):
                 continue
 
-            # mol_data[7] typically contains the atom list
-            atom_list = mol_data[7]
-            # mol_data[3] or mol_data[2] contains coordinate sets
-            # In PyMOL mol structure: mol_data[3] or [2] is CoordSet list or discrete sets
-            coord_sets = None
-            for idx in [2, 3, 4, 5]:
-                if idx < len(mol_data) and isinstance(mol_data[idx], (list, tuple)) and len(mol_data[idx]) > 0:
-                    cand = mol_data[idx][0]
-                    # Coord set list often has coordinate array in cand[2] or cand[1]
-                    if isinstance(cand, (list, tuple)) and len(cand) >= 2:
-                        for c_sub in cand:
-                            if isinstance(c_sub, (list, tuple)) and len(c_sub) >= 3 and isinstance(c_sub[0], (int, float)):
-                                coord_sets = c_sub
+            # Check if this is a PyMOL Selection object (maps to parent object atom indices)
+            if len(mol_data) == 1 and isinstance(mol_data[0], (list, tuple)) and len(mol_data[0]) >= 2:
+                parent_name = str(mol_data[0][0]).strip()
+                atom_indices = mol_data[0][1]
+                if isinstance(atom_indices, (list, tuple)):
+                    selections[obj_name] = (parent_name, set(atom_indices))
+                    continue
+
+            # Check if this is a Molecule object containing an atom list
+            if len(mol_data) > 7 and isinstance(mol_data[7], (list, tuple)) and len(mol_data[7]) > 0:
+                raw_molecules[obj_name] = mol_data
+
+        def parse_atoms_from_mol(atom_list, mol):
+            flat_coords = None
+            idx_map = None
+            for c_idx in [4, 3, 2, 5]:
+                if c_idx < len(mol) and isinstance(mol[c_idx], (list, tuple)) and len(mol[c_idx]) > 0:
+                    cs0 = mol[c_idx][0]
+                    if isinstance(cs0, (list, tuple)) and len(cs0) >= 3:
+                        for sub in cs0:
+                            if isinstance(sub, (list, tuple)) and len(sub) > 10 and isinstance(sub[0], (int, float)):
+                                flat_coords = sub
                                 break
-                    if coord_sets is not None:
+                        if len(cs0) > 4 and isinstance(cs0[4], (list, tuple)) and len(cs0[4]) == len(atom_list):
+                            idx_map = cs0[4]
+                    if flat_coords is not None:
                         break
 
-            # Parse atoms
-            extracted_atoms = []
-            if isinstance(atom_list, (list, tuple)):
-                coord_idx = 0
-                for atom_idx, atom in enumerate(atom_list):
-                    if not isinstance(atom, (list, tuple)) or len(atom) < 15:
-                        continue
-                    # Standard PyMOL Atom Record fields:
-                    # atom[0] = type/flag
-                    # atom[1] = atom name
-                    # atom[2] = resn
-                    # atom[3] = resi / resseq
-                    # atom[4] = chain
-                    # atom[5] = alt
-                    # coordinates may be stored in coord_sets or within atom record
-                    atom_name = str(atom[1]).strip() if len(atom) > 1 else "CA"
-                    resn = str(atom[2]).strip() if len(atom) > 2 else "UNK"
-                    resi_str = str(atom[3]).strip() if len(atom) > 3 else "1"
-                    try:
-                        resi = int(resi_str)
-                    except ValueError:
-                        # Extract leading integer if insertion code exists
-                        digits = "".join([c for c in resi_str if c.isdigit() or c == '-'])
-                        resi = int(digits) if digits else 1
+            atoms = []
+            for at_idx, at in enumerate(atom_list):
+                if not isinstance(at, (list, tuple)) or len(at) < 7:
+                    continue
 
-                    chain = str(atom[4]).strip() if len(atom) > 4 else "A"
-                    if not chain:
-                        chain = "A"
-
-                    # Coordinates
-                    x, y, z = 0.0, 0.0, 0.0
-                    if coord_sets is not None and (coord_idx + 2) < len(coord_sets):
-                        x = float(coord_sets[coord_idx])
-                        y = float(coord_sets[coord_idx + 1])
-                        z = float(coord_sets[coord_idx + 2])
-                        coord_idx += 3
-                    elif len(atom) > 20 and isinstance(atom[20], (list, tuple)) and len(atom[20]) >= 3:
-                        x, y, z = float(atom[20][0]), float(atom[20][1]), float(atom[20][2])
-
-                    b_factor = 20.0
+                if len(at) > 6 and isinstance(at[5], str) and len(at[5]) == 3:
+                    chain = str(at[1]).strip() or (str(at[4]).strip() if len(at) > 4 else "A") or "A"
+                    resn = str(at[5]).strip()
+                    atom_name = str(at[6]).strip()
+                    resi_str = str(at[3]).strip()
+                    elem = str(at[7]).strip() if len(at) > 7 and isinstance(at[7], str) else (atom_name[0] if atom_name else "C")
+                else:
+                    atom_name = str(at[1]).strip() if len(at) > 1 else "CA"
+                    resn = str(at[2]).strip() if len(at) > 2 else "UNK"
+                    resi_str = str(at[3]).strip() if len(at) > 3 else "1"
+                    chain = str(at[4]).strip() if len(at) > 4 else "A"
                     elem = atom_name[0] if atom_name else "C"
 
-                    extracted_atoms.append({
-                        "atom_name": atom_name,
-                        "resn": resn,
-                        "resi": resi,
-                        "chain": chain,
-                        "x": x,
-                        "y": y,
-                        "z": z,
-                        "b_factor": b_factor,
-                        "element": elem
-                    })
+                try:
+                    resi = int(resi_str)
+                except ValueError:
+                    digits = "".join([c for c in resi_str if c.isdigit() or c == '-'])
+                    resi = int(digits) if digits else 1
 
-            if extracted_atoms:
-                extracted_obj_atoms[obj_name] = extracted_atoms
+                coord_idx = idx_map[at_idx] if idx_map is not None and at_idx < len(idx_map) else at_idx
+                if coord_idx < 0 or flat_coords is None or (coord_idx * 3 + 2) >= len(flat_coords):
+                    continue
+                x = float(flat_coords[coord_idx * 3])
+                y = float(flat_coords[coord_idx * 3 + 1])
+                z = float(flat_coords[coord_idx * 3 + 2])
+
+                atoms.append({
+                    "atom_name": atom_name,
+                    "resn": resn,
+                    "resi": resi,
+                    "chain": chain,
+                    "x": x,
+                    "y": y,
+                    "z": z,
+                    "b_factor": 20.0,
+                    "element": elem,
+                    "_orig_idx": at_idx
+                })
+            return atoms
+
+        # Extract atoms for each molecule
+        for obj_name, mol in raw_molecules.items():
+            atoms = parse_atoms_from_mol(mol[7], mol)
+            if not atoms:
+                continue
+            extracted_obj_atoms[obj_name] = atoms
+
+            # If multi-chain, also create discrete sub-entities for each chain
+            chains = sorted(list(set(a["chain"] for a in atoms)))
+            if len(chains) > 1:
+                for ch in chains:
+                    sub_atoms = [a for a in atoms if a["chain"] == ch]
+                    if sub_atoms:
+                        extracted_obj_atoms[f"{obj_name}_chain_{ch}"] = sub_atoms
+
+        # Extract atoms for any selections
+        for sel_name, (parent_name, indices) in selections.items():
+            if parent_name in extracted_obj_atoms:
+                p_atoms = extracted_obj_atoms[parent_name]
+                sel_atoms = [a for a in p_atoms if a.get("_orig_idx") in indices]
+                if sel_atoms:
+                    extracted_obj_atoms[sel_name] = sel_atoms
 
     # Generate metadata for detected objects
     for obj_name, atoms in extracted_obj_atoms.items():
