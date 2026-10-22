@@ -659,6 +659,18 @@ if [ -n "$LOCK_VESSEL_FLAG" ]; then
     CMD_ARGS+=("$LOCK_VESSEL_FLAG")
 fi
 
+if [ -n "$RFDIFF_DIR" ] && [ -f "$RFDIFF_DIR/scripts/run_inference.py" ]; then
+    CMD_ARGS+=("--rfdiff_script" "$RFDIFF_DIR/scripts/run_inference.py")
+elif [ -f "$HOME/programs/RFdiffusion/scripts/run_inference.py" ]; then
+    CMD_ARGS+=("--rfdiff_script" "$HOME/programs/RFdiffusion/scripts/run_inference.py")
+fi
+
+if [ -n "$MPNN_DIR" ] && [ -f "$MPNN_DIR/protein_mpnn_run.py" ]; then
+    CMD_ARGS+=("--mpnn_script" "$MPNN_DIR/protein_mpnn_run.py")
+elif [ -f "$HOME/programs/ProteinMPNN/protein_mpnn_run.py" ]; then
+    CMD_ARGS+=("--mpnn_script" "$HOME/programs/ProteinMPNN/protein_mpnn_run.py")
+fi
+
 # Activate environment if configured
 if [ -n "$CONDA_ENV_RFDIFF" ]; then
     activate_env "$CONDA_ENV_RFDIFF" 2>/dev/null || true

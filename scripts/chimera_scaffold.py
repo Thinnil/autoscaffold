@@ -284,7 +284,33 @@ class ChimeraScaffolder:
         self.dry_run = dry_run
 
         self.rfdiff_script = os.path.realpath(rfdiff_script) if rfdiff_script else None
+        if not self.rfdiff_script:
+            for d in [
+                os.environ.get("RFDIFF_DIR", ""),
+                os.path.expanduser("~/programs/RFdiffusion"),
+                os.path.join(SCRIPT_DIR, "..", "tools", "RFdiffusion"),
+                os.path.join(SCRIPT_DIR, "tools", "RFdiffusion"),
+                os.path.join(SCRIPT_DIR, "..", "RFdiffusion"),
+            ]:
+                cand = os.path.join(d, "scripts", "run_inference.py") if d else ""
+                if cand and os.path.isfile(cand):
+                    self.rfdiff_script = os.path.realpath(cand)
+                    break
+
         self.mpnn_script = os.path.realpath(mpnn_script) if mpnn_script else None
+        if not self.mpnn_script:
+            for d in [
+                os.environ.get("MPNN_DIR", ""),
+                os.path.expanduser("~/programs/ProteinMPNN"),
+                os.path.join(SCRIPT_DIR, "..", "tools", "ProteinMPNN"),
+                os.path.join(SCRIPT_DIR, "tools", "ProteinMPNN"),
+                os.path.join(SCRIPT_DIR, "..", "ProteinMPNN"),
+            ]:
+                cand = os.path.join(d, "protein_mpnn_run.py") if d else ""
+                if cand and os.path.isfile(cand):
+                    self.mpnn_script = os.path.realpath(cand)
+                    break
+
         self.colabfold_cmd = colabfold_cmd
 
         # Internal state
@@ -1206,6 +1232,7 @@ class ChimeraScaffolder:
 
         # Ensure indices are within [1, total_len] and sorted
         fixed_indices = sorted([idx for idx in all_fixed if 1 <= idx <= total_len])
+        self.last_donor_fixed = sorted([idx for idx in donor_fixed if 1 <= idx <= total_len])
 
         return {main_chain: fixed_indices}
 
@@ -1266,13 +1293,21 @@ class ChimeraScaffolder:
 
         # Step 2: Backbone Generation
         generated_backbones = []
-        if not self.dry_run and self.rfdiff_script and os.path.isfile(self.rfdiff_script):
+        if not self.dry_run:
+            if not self.rfdiff_script or not os.path.isfile(self.rfdiff_script):
+                raise FileNotFoundError(
+                    f"RFdiffusion script not found. Looked in: '{self.rfdiff_script}'. "
+                    "Please configure RFDIFF_DIR in config.env or run: autoscaffold install"
+                )
+            rfdiff_repo = os.path.dirname(os.path.dirname(os.path.abspath(self.rfdiff_script)))
             cmd_display = " ".join(shlex.quote(arg) for arg in rfdiff_cmd)
             print(f"[+] Running RFdiffusion: {cmd_display}")
-            subprocess.run(rfdiff_cmd, check=True, shell=False)
+            subprocess.run(rfdiff_cmd, check=True, shell=False, cwd=rfdiff_repo)
             for f in os.listdir(work_rfdiff):
                 if f.endswith(".pdb") and "chimera_design" in f:
                     generated_backbones.append(os.path.join(work_rfdiff, f))
+            if not generated_backbones:
+                raise RuntimeError(f"RFdiffusion execution completed but generated 0 output backbones in {work_rfdiff}")
         else:
             # Create synthetic/mock backbone placeholder in dry_run or fallback
             # RFdiffusion outputs single-chain designs (usually Chain A) with contiguous residues
@@ -1303,6 +1338,7 @@ class ChimeraScaffolder:
             bb_name = os.path.splitext(os.path.basename(bb))[0]
             safe_bb_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', bb_name) or "backbone"
             fixed_map = self.map_fixed_positions_for_mpnn(bb)
+            donor_fixed_matched = getattr(self, "last_donor_fixed", [])
             jsonl_path = safe_join_path(work_mpnn, f"{safe_bb_name}_fixed_positions.jsonl")
             make_fixed_positions_dict(bb_name, fixed_map, out_jsonl=jsonl_path)
 
@@ -1323,12 +1359,14 @@ class ChimeraScaffolder:
                 "backbone": bb,
                 "fixed_positions_jsonl": jsonl_path,
                 "fixed_residues": fixed_map,
+                "donor_fixed": donor_fixed_matched,
                 "mpnn_command": mpnn_cmd
             }
 
             if not self.dry_run and self.mpnn_script and os.path.isfile(self.mpnn_script):
+                mpnn_repo = os.path.dirname(os.path.abspath(self.mpnn_script))
                 print(f"[+] Running ProteinMPNN (batch_size={self.mpnn_batch_size}): {' '.join(mpnn_cmd)}")
-                subprocess.run(mpnn_cmd, check=True, shell=False)
+                subprocess.run(mpnn_cmd, check=True, shell=False, cwd=mpnn_repo)
 
             mpnn_results.append(cand_info)
 
@@ -1346,14 +1384,18 @@ class ChimeraScaffolder:
 
             # Calculate Kabsch RMSD between donor structure and chimera model
             try:
-                # Query motif in seed/bb
+                # Query motif in design: match against identified donor residue indices in backbone
+                query_motif_res = cand.get("donor_fixed", [])
+                if not query_motif_res or len(query_motif_res) != len(ref_motif_res):
+                    query_motif_res = ref_motif_res
+
                 rmsd_res = calculate_motif_rmsd(
                     ref_pdb=self.working_donor_pdb,
                     query_pdb=bb_path,
                     ref_chain=self.donor_chain_id,
                     ref_residues=ref_motif_res,
                     query_chain=None,  # auto
-                    query_residues=ref_motif_res,
+                    query_residues=query_motif_res,
                     atom_type="CA"
                 )
                 motif_rmsd = rmsd_res["rmsd"]
@@ -1577,6 +1619,8 @@ def main() -> None:
         "--plddt_threshold", type=float, default=75.0,
         help="pLDDT quality cutoff [Default: 75.0]"
     )
+    parser.add_argument("--rfdiff_script", help="Path to RFdiffusion run_inference.py")
+    parser.add_argument("--mpnn_script", help="Path to ProteinMPNN protein_mpnn_run.py")
     parser.add_argument("--out_dir", "-o", default="outputs/chimera_scaffold", help="Output directory")
     parser.add_argument(
         "--dry_run", action="store_true",
@@ -1605,6 +1649,8 @@ def main() -> None:
         mpnn_batch_size=args.mpnn_batch_size,
         rmsd_threshold=args.rmsd_threshold,
         plddt_threshold=args.plddt_threshold,
+        rfdiff_script=args.rfdiff_script,
+        mpnn_script=args.mpnn_script,
         out_dir=args.out_dir,
         dry_run=args.dry_run
     )
