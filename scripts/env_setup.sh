@@ -10,7 +10,9 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # Resolve root script directory
-if [ -z "$SCRIPT_DIR" ]; then
+if [ -n "$AUTOSCAFFOLD_HOME" ] && [ -f "$AUTOSCAFFOLD_HOME/scripts/env_setup.sh" ]; then
+    SCRIPT_DIR="$AUTOSCAFFOLD_HOME"
+elif [ -z "$SCRIPT_DIR" ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
 
@@ -64,6 +66,29 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$OMP_NUM_THREADS}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$OMP_NUM_THREADS}"
 
+# Function to detect micromamba binary across system and user paths
+find_micromamba_bin() {
+    if command -v micromamba >/dev/null 2>&1; then
+        command -v micromamba
+        return 0
+    fi
+    for cand in \
+        "$LOCAL_ENVS_DIR/bin/micromamba" \
+        "$LOCAL_ENVS_DIR/micromamba" \
+        "$HOME/.local/bin/micromamba" \
+        "$HOME/bin/micromamba" \
+        "$HOME/.micromamba/bin/micromamba" \
+        "$HOME/micromamba/micromamba" \
+        "/usr/local/bin/micromamba" \
+        "/opt/conda/bin/micromamba"; do
+        if [ -n "$cand" ] && [ -x "$cand" ]; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Function to detect conda / mamba / micromamba binary (cached)
 _CACHED_CONDA_BIN=""
 find_conda_bin() {
@@ -72,18 +97,29 @@ find_conda_bin() {
         return 0
     fi
 
-    if [ -x "$LOCAL_ENVS_DIR/bin/micromamba" ]; then
-        _CACHED_CONDA_BIN="$LOCAL_ENVS_DIR/bin/micromamba"
-    elif [ -x "$LOCAL_ENVS_DIR/micromamba" ]; then
-        _CACHED_CONDA_BIN="$LOCAL_ENVS_DIR/micromamba"
-    elif command -v micromamba >/dev/null 2>&1; then
-        _CACHED_CONDA_BIN="$(command -v micromamba)"
+    local mm_bin
+    mm_bin="$(find_micromamba_bin 2>/dev/null || true)"
+    if [ -n "$mm_bin" ] && [ -x "$mm_bin" ]; then
+        _CACHED_CONDA_BIN="$mm_bin"
     elif command -v mamba >/dev/null 2>&1; then
         _CACHED_CONDA_BIN="$(command -v mamba)"
     elif command -v conda >/dev/null 2>&1; then
         _CACHED_CONDA_BIN="$(command -v conda)"
     else
-        _CACHED_CONDA_BIN=""
+        for cand in \
+            "$CONDA_EXE" \
+            "$CONDA_PREFIX/bin/conda" \
+            "$HOME/miniconda3/bin/conda" \
+            "$HOME/miniforge3/bin/conda" \
+            "$HOME/mambaforge/bin/conda" \
+            "$HOME/anaconda3/bin/conda" \
+            "/opt/conda/bin/conda" \
+            "/usr/local/miniconda3/bin/conda"; do
+            if [ -n "$cand" ] && [ -x "$cand" ]; then
+                _CACHED_CONDA_BIN="$cand"
+                break
+            fi
+        done
     fi
     echo "$_CACHED_CONDA_BIN"
 }
@@ -167,23 +203,28 @@ discover_conda_python() {
 
     [ -z "$target_env" ] && return 1
 
+    _verify_python() {
+        local py="$1"
+        [ -n "$py" ] && [ -x "$py" ] && "$py" -c "import sys" >/dev/null 2>&1
+    }
+
     # 1. Early exit: Check if an environment variable is already exported for this env/tool
     if [ "$target_env" = "SE3nv" ] || [ "$target_env" = "rfdiffusion" ]; then
-        if [ -n "${PYTHON_RFDIFF:-}" ] && [ -x "${PYTHON_RFDIFF:-}" ]; then
+        if [ -n "${PYTHON_RFDIFF:-}" ] && _verify_python "$PYTHON_RFDIFF"; then
             echo "$PYTHON_RFDIFF"
             return 0
         fi
     elif [ "$target_env" = "mlfold" ]; then
-        if [ -n "${PYTHON_MPNN:-}" ] && [ -x "${PYTHON_MPNN:-}" ]; then
+        if [ -n "${PYTHON_MPNN:-}" ] && _verify_python "$PYTHON_MPNN"; then
             echo "$PYTHON_MPNN"
             return 0
         fi
     fi
 
-    local upper_env
-    upper_env="$(echo "$target_env" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_')"
+    local upper_env="${target_env^^}"
+    upper_env="${upper_env//[^A-Z0-9]/_}"
     local env_var="PYTHON_${upper_env}"
-    if [ -n "${!env_var:-}" ] && [ -x "${!env_var:-}" ]; then
+    if [ -n "${!env_var:-}" ] && _verify_python "${!env_var}"; then
         echo "${!env_var}"
         return 0
     fi
@@ -191,27 +232,29 @@ discover_conda_python() {
     # 2. Early exit: Check if active conda environment matches
     if [ -n "$CONDA_PREFIX" ]; then
         if [ "$CONDA_DEFAULT_ENV" = "$target_env" ] || [ "${CONDA_PREFIX##*/}" = "$target_env" ]; then
-            if [ -x "$CONDA_PREFIX/bin/python" ]; then
-                echo "$CONDA_PREFIX/bin/python"
-                return 0
-            elif [ -x "$CONDA_PREFIX/python.exe" ]; then
-                echo "$CONDA_PREFIX/python.exe"
-                return 0
-            fi
+            for cand in "$CONDA_PREFIX/bin/python" "$CONDA_PREFIX/python.exe"; do
+                if _verify_python "$cand"; then
+                    echo "$cand"
+                    return 0
+                fi
+            done
         fi
     fi
 
     # 3. Check local tools/envs directory
-    if [ -x "$LOCAL_ENVS_DIR/$target_env/bin/python" ]; then
-        echo "$LOCAL_ENVS_DIR/$target_env/bin/python"
-        return 0
-    elif [ -x "$LOCAL_ENVS_DIR/$target_env/python.exe" ]; then
-        echo "$LOCAL_ENVS_DIR/$target_env/python.exe"
-        return 0
-    fi
+    for cand in "$LOCAL_ENVS_DIR/$target_env/bin/python" "$LOCAL_ENVS_DIR/$target_env/python.exe"; do
+        if _verify_python "$cand"; then
+            echo "$cand"
+            return 0
+        fi
+    done
 
-    # 4. Check known base conda installations
+    # 4. Check known base conda and micromamba installations
     for base_dir in \
+        "$MAMBA_ROOT_PREFIX" \
+        "$HOME/.micromamba" \
+        "$HOME/micromamba" \
+        "$HOME/.local/share/mamba" \
         "$CONDA_PREFIX/.." \
         "$HOME/miniconda3" \
         "$HOME/miniforge3" \
@@ -221,15 +264,13 @@ discover_conda_python() {
         "/opt/conda" \
         "/usr/local/miniconda3" \
         "/usr/local/anaconda3"; do
-        if [ -d "$base_dir" ]; then
-            candidate="$base_dir/envs/$target_env/bin/python"
-            if [ -x "$candidate" ]; then
-                echo "$candidate"
-                return 0
-            elif [ -x "$base_dir/envs/$target_env/python.exe" ]; then
-                echo "$base_dir/envs/$target_env/python.exe"
-                return 0
-            fi
+        if [ -d "$base_dir/envs/$target_env" ]; then
+            for cand in "$base_dir/envs/$target_env/bin/python" "$base_dir/envs/$target_env/python.exe"; do
+                if _verify_python "$cand"; then
+                    echo "$cand"
+                    return 0
+                fi
+            done
         fi
     done
 
@@ -240,13 +281,12 @@ discover_conda_python() {
         local env_path
         env_path="$("$conda_bin" info --envs 2>/dev/null | awk -v env="$target_env" '$1 == env {print $NF}' | head -n 1)"
         if [ -n "$env_path" ]; then
-            if [ -x "$env_path/bin/python" ]; then
-                echo "$env_path/bin/python"
-                return 0
-            elif [ -x "$env_path/python.exe" ]; then
-                echo "$env_path/python.exe"
-                return 0
-            fi
+            for cand in "$env_path/bin/python" "$env_path/python.exe"; do
+                if _verify_python "$cand"; then
+                    echo "$cand"
+                    return 0
+                fi
+            done
         fi
     fi
 

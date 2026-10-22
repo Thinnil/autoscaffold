@@ -7,7 +7,11 @@ set -e
 trap 'echo -e "\n\n${YELLOW}[!] Operation cancelled by user.${NC}"; exit 130' INT
 
 # Resolve script directory and source shared environment
-SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "$AUTOSCAFFOLD_HOME" ] && [ -f "$AUTOSCAFFOLD_HOME/chimera_scaffold.sh" ]; then
+    SCRIPT_DIR="$AUTOSCAFFOLD_HOME"
+else
+    SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" = "/" ] || [ "$SCRIPT_DIR" = "\\" ] || [[ "$SCRIPT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
     echo -e "\033[0;31m[ERROR] Dangerous or invalid SCRIPT_DIR: '$SCRIPT_DIR'\033[0m"
     exit 1

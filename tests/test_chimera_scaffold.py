@@ -22,7 +22,7 @@ from scripts.pse_pdb_extractor import (  # noqa: E402
     safe_join_path,
     validate_output_dir,
     validate_pse_safety,
-    clear_pdb_parse_cache
+    clear_pdb_parse_cache,
 )
 from scripts.extract_fixed_motif import parse_residue_spec  # noqa: E402
 from scripts.kabsch_rmsd import kabsch_fit  # noqa: E402
@@ -35,14 +35,22 @@ from scripts.chimera_scaffold import (  # noqa: E402
     compute_extension_minimum,
     clear_ca_coords_cache,
     clear_probe_cache,
+    clear_environment_cache,
+    find_environment_managers,
+    get_all_environment_roots,
     _CA_COORDS_CACHE,
     _RESI_COORDS_CACHE,
     _PROBE_CACHE,
+    _CACHED_MANAGERS,
+    _CACHED_ROOTS,
     resolve_python_interpreter,
     resolve_neural_python,
+    resolve_execution_runner,
+    RunnerSpec,
+    build_ephemeral_runner_cmd,
     probe_python_environment,
     display_dependency_alert,
-    display_cuda_warning
+    display_cuda_warning,
 )
 
 
@@ -81,10 +89,13 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
 
         # Build sample multi-chain PDB (Chain A donor, Chain B vessel)
         self.multichain_pdb = os.path.join(self.test_dir, "complex.pdb")
-        create_sample_pdb(self.multichain_pdb, {
-            "A": [(r, "SER", [float(r), 1.0, 0.0]) for r in range(10, 31)],
-            "B": [(r, "LEU", [0.0, float(r), 2.0]) for r in range(1, 81)]
-        })
+        create_sample_pdb(
+            self.multichain_pdb,
+            {
+                "A": [(r, "SER", [float(r), 1.0, 0.0]) for r in range(10, 31)],
+                "B": [(r, "LEU", [0.0, float(r), 2.0]) for r in range(1, 81)],
+            },
+        )
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -129,7 +140,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             linker_c="8-12",
             clamp_linkers=False,
             out_dir=out_scaffold,
-            dry_run=True
+            dry_run=True,
         )
         scaffolder.prepare_input_structures()
         contig, donor_segs, vessel_segs = scaffolder.compute_contigs_and_segments()
@@ -149,7 +160,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             chimera_mode="ligate_nterm",
             linker_c="10-15",
             out_dir=out_scaffold,
-            dry_run=True
+            dry_run=True,
         )
         scaffolder.prepare_input_structures()
         contig, _, _ = scaffolder.compute_contigs_and_segments()
@@ -167,7 +178,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             linker_n="10-15",
             clamp_linkers=False,
             out_dir=out_scaffold,
-            dry_run=True
+            dry_run=True,
         )
         scaffolder.prepare_input_structures()
         contig, _, _ = scaffolder.compute_contigs_and_segments()
@@ -187,7 +198,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             linker_c="6-8",
             clamp_linkers=False,
             out_dir=out_scaffold,
-            dry_run=True
+            dry_run=True,
         )
         scaffolder.prepare_input_structures()
         contig, _, _ = scaffolder.compute_contigs_and_segments()
@@ -204,7 +215,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             chimera_mode="replace",
             vessel_replace_range="40-60",
             out_dir=out_scaffold,
-            dry_run=True
+            dry_run=True,
         )
         scaffolder.prepare_input_structures()
         scaffolder.compute_contigs_and_segments()
@@ -230,11 +241,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
 
         # Translated and rotated set
         theta = np.pi / 4
-        rot_z = np.array([
-            [np.cos(theta), -np.sin(theta), 0],
-            [np.sin(theta), np.cos(theta), 0],
-            [0, 0, 1]
-        ])
+        rot_z = np.array([[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0, 0, 1]])
         translation = np.array([10.0, -5.0, 2.5])
         Q_transformed = np.dot(P, rot_z) + translation
 
@@ -253,7 +260,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             vessel_replace_range="30-50",
             num_designs=2,
             out_dir=out_run,
-            dry_run=True
+            dry_run=True,
         )
         res = scaffolder.run_pipeline()
         self.assertEqual(res["status"], "COMPLETED")
@@ -264,6 +271,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
     def test_buffered_extraction_and_writing(self):
         """Test single-pass extraction and buffered file writing."""
         from scripts.pse_pdb_extractor import write_atoms_to_pdb
+
         out_single_pass = os.path.join(self.test_dir, "single_pass_out")
         extracted = extract_pdb_chains(self.multichain_pdb, out_single_pass, buffer_size=65536)
         self.assertEqual(len(extracted), 2)
@@ -271,9 +279,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             self.assertTrue(os.path.isfile(p))
 
         # Test write_atoms_to_pdb with custom buffer
-        test_atoms = [
-            {"atom_name": "CA", "resn": "ALA", "resi": 1, "chain": "A", "x": 1.0, "y": 2.0, "z": 3.0}
-        ]
+        test_atoms = [{"atom_name": "CA", "resn": "ALA", "resi": 1, "chain": "A", "x": 1.0, "y": 2.0, "z": 3.0}]
         test_pdb = os.path.join(self.test_dir, "test_write.pdb")
         write_atoms_to_pdb(test_atoms, test_pdb, buffer_size=65536)
         self.assertTrue(os.path.isfile(test_pdb))
@@ -300,7 +306,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             num_designs=1,
             mpnn_batch_size=4,
             out_dir=out_batch,
-            dry_run=True
+            dry_run=True,
         )
         res = scaffolder.run_pipeline()
         self.assertEqual(res["status"], "COMPLETED")
@@ -316,6 +322,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         3. denoiser.noise_scale_ca=0.0 and noise_scale_frame=0.0 are strictly present in rfdiffusion_command.
         """
         import json
+
         out_locked = os.path.join(self.test_dir, "out_locked")
         scaffolder = ChimeraScaffolder(
             donor_pdb=self.donor_pdb,
@@ -326,7 +333,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             lock_vessel=True,
             num_designs=1,
             out_dir=out_locked,
-            dry_run=True
+            dry_run=True,
         )
         res = scaffolder.run_pipeline()
 
@@ -361,7 +368,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             lock_vessel=False,
             num_designs=1,
             out_dir=out_unlocked,
-            dry_run=True
+            dry_run=True,
         )
         res_unlocked = scaffolder_unlocked.run_pipeline()
         self.assertEqual(res_unlocked["status"], "COMPLETED")
@@ -386,7 +393,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             chimera_mode="replace",
             vessel_replace_range="40-60",
             out_dir=out_rep,
-            dry_run=True
+            dry_run=True,
         )
         scaffolder.run_pipeline()
 
@@ -424,9 +431,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         # Test buffered generation & symlink/copy
         out_buf = os.path.join(self.test_dir, "out_buffered_report")
         mr.generate_methodology_report(
-            run_name="Cache_Buffer_Test",
-            pipeline_mode="Chimera Scaffolding",
-            output_dir=out_buf
+            run_name="Cache_Buffer_Test", pipeline_mode="Chimera Scaffolding", output_dir=out_buf
         )
         f1 = os.path.join(out_buf, "run_methodology.txt")
         f2 = os.path.join(out_buf, "methodology.txt")
@@ -516,7 +521,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             linker_c="4-6",
             clamp_linkers=True,
             out_dir=out_clamp,
-            dry_run=True
+            dry_run=True,
         )
         contig, _, _ = scaffolder.compute_contigs_and_segments()
         # Should have auto-clamped both linkers
@@ -535,7 +540,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             linker_c="auto",
             clamp_linkers=True,
             out_dir=os.path.join(self.test_dir, "out_auto"),
-            dry_run=True
+            dry_run=True,
         )
         contig_auto, _, _ = scaffolder_auto.compute_contigs_and_segments()
         self.assertEqual(scaffolder_auto.linker_n, "17-23")
@@ -567,7 +572,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             linker_c="8-12",
             clamp_linkers=False,
             out_dir=out_gap,
-            dry_run=True
+            dry_run=True,
         )
         contig, donor_segs, vessel_segs = scaffolder.compute_contigs_and_segments()
 
@@ -589,7 +594,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             vessel_replace_range="40-60",
             clamp_linkers=False,
             out_dir=os.path.join(self.test_dir, "out_meas"),
-            dry_run=True
+            dry_run=True,
         )
         data = scaffolder.measure_junctions()
         self.assertEqual(data["mode"], "replace")
@@ -605,11 +610,16 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             sys.executable,
             script_path,
             "measure_junctions",
-            "--donor_pdb", self.donor_pdb,
-            "--vessel_pdb", self.vessel_pdb,
-            "--motif_residues", "30-40",
-            "--chimera_mode", "replace",
-            "--vessel_replace_range", "40-60"
+            "--donor_pdb",
+            self.donor_pdb,
+            "--vessel_pdb",
+            self.vessel_pdb,
+            "--motif_residues",
+            "30-40",
+            "--chimera_mode",
+            "replace",
+            "--vessel_replace_range",
+            "40-60",
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
         cli_data = json.loads(res.stdout)
@@ -662,7 +672,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             vessel_replace_range="40-60",
             clamp_linkers=False,
             out_dir=os.path.join(self.test_dir, "out_alias"),
-            dry_run=True
+            dry_run=True,
         )
         data1 = scaffolder.measure_junctions()
         data2 = scaffolder.measure_junction_distances()
@@ -680,7 +690,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             chimera_mode="replace",
             vessel_replace_range="40-60",
             out_dir=out_plan,
-            dry_run=True
+            dry_run=True,
         )
         res = scaffolder.run_pipeline()
         self.assertIn("contig_plan", res)
@@ -772,7 +782,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             chimera_mode="replace",
             vessel_replace_range="40-60",
             out_dir=os.path.join(self.test_dir, "out_disc_seg"),
-            dry_run=True
+            dry_run=True,
         )
         scaffolder.prepare_input_structures()
         segments = scaffolder.parse_motif_ranges()
@@ -805,7 +815,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             linker_c="8-12",
             clamp_linkers=False,
             out_dir=os.path.join(self.test_dir, "out_gap21"),
-            dry_run=True
+            dry_run=True,
         )
         scaffolder.prepare_input_structures()
         contig, donor_segs, _ = scaffolder.compute_contigs_and_segments()
@@ -879,7 +889,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             vessel_replace_range="11-15",
             lock_vessel=True,
             out_dir=os.path.join(self.test_dir, "out_mask"),
-            dry_run=True
+            dry_run=True,
         )
         scaffolder.prepare_input_structures()
         scaffolder.parse_motif_ranges()
@@ -888,12 +898,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         fixed_dict = scaffolder.map_fixed_positions_for_mpnn(bb_pdb)
         fixed_indices = set(fixed_dict["A"])
 
-        expected_fixed = set(range(1, 11)).union(
-            range(14, 19),
-            range(22, 27),
-            range(30, 36),
-            range(39, 49)
-        )
+        expected_fixed = set(range(1, 11)).union(range(14, 19), range(22, 27), range(30, 36), range(39, 49))
         self.assertEqual(fixed_indices, expected_fixed)
 
         unfixed_indices = set(range(1, 49)) - fixed_indices
@@ -922,7 +927,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
                 linker_c="8-12",
                 clamp_linkers=False,
                 out_dir=os.path.join(self.test_dir, f"out_mode_{mode}"),
-                dry_run=True
+                dry_run=True,
             )
             scaffolder.prepare_input_structures()
             contig, donor_segs, vessel_segs = scaffolder.compute_contigs_and_segments()
@@ -962,17 +967,14 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             explicit_binary=explicit_bin,
             env_var_keys=["NONEXISTENT_KEY_XYZ"],
             conda_env_names=["nonexistent_env"],
-            required_modules=["sys", "os"]
+            required_modules=["sys", "os"],
         )
         self.assertEqual(res_bin, os.path.realpath(explicit_bin))
         self.assertTrue(valid)
 
         # Explicit non-existent path
         bogus_path = os.path.join(self.test_dir, "nonexistent_python_binary")
-        res_bogus, bogus_valid = resolve_python_interpreter(
-            explicit_binary=bogus_path,
-            required_modules=[]
-        )
+        res_bogus, bogus_valid = resolve_python_interpreter(explicit_binary=bogus_path, required_modules=[])
         self.assertEqual(res_bogus, os.path.realpath(bogus_path))
         self.assertFalse(bogus_valid)
 
@@ -981,10 +983,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         os.environ[test_var_name] = sys.executable
         try:
             res_env, valid_env = resolve_python_interpreter(
-                explicit_binary=None,
-                env_var_keys=[test_var_name],
-                conda_env_names=[],
-                required_modules=["sys"]
+                explicit_binary=None, env_var_keys=[test_var_name], conda_env_names=[], required_modules=["sys"]
             )
             self.assertEqual(res_env, os.path.realpath(sys.executable))
             self.assertTrue(valid_env)
@@ -996,7 +995,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             explicit_path=None,
             env_var_names=["NONEXISTENT_KEY_12345"],
             target_env_names=["definitely_nonexistent_conda_env_999"],
-            required_modules=["sys"]
+            required_modules=["sys"],
         )
         self.assertEqual(res_fallback, os.path.realpath(sys.executable))
         self.assertTrue(valid_fallback)
@@ -1005,19 +1004,13 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         """Verify module presence detection and fail-fast exception handling in probe_python_environment."""
         # Standard library modules must succeed
         res = probe_python_environment(
-            sys.executable,
-            required_modules=["sys", "os", "json"],
-            check_cuda=False,
-            raise_on_error=False
+            sys.executable, required_modules=["sys", "os", "json"], check_cuda=False, raise_on_error=False
         )
         self.assertEqual(res["missing_modules"], [])
 
         # Nonexistent module detection
         res_missing = probe_python_environment(
-            sys.executable,
-            required_modules=["nonexistent_module_xyz_123456"],
-            check_cuda=False,
-            raise_on_error=False
+            sys.executable, required_modules=["nonexistent_module_xyz_123456"], check_cuda=False, raise_on_error=False
         )
         self.assertIn("nonexistent_module_xyz_123456", res_missing["missing_modules"])
 
@@ -1029,7 +1022,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
                 check_cuda=False,
                 raise_on_error=True,
                 tool_name="RFdiffusion",
-                suggested_env="SE3nv"
+                suggested_env="SE3nv",
             )
         self.assertIn("nonexistent_module_xyz_123456", str(ctx.exception))
 
@@ -1049,6 +1042,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
 
         # Second run hits cache without spawning a new subprocess
         from unittest.mock import patch
+
         with patch("subprocess.run") as mock_run:
             res2 = probe_python_environment(real_bin, required_modules=req_mods, check_cuda=False)
             mock_run.assert_not_called()
@@ -1081,7 +1075,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             chimera_mode="replace",
             vessel_replace_range="40-60",
             out_dir=os.path.join(self.test_dir, "outputs", "outputs", "scaffold_run"),
-            dry_run=True
+            dry_run=True,
         )
         self.assertNotIn("outputs/outputs", scaffolder.out_dir.replace("\\", "/"))
 
@@ -1091,7 +1085,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             tool_name="RFdiffusion",
             python_bin="/home/user/miniconda3/bin/python",
             missing_modules=["torch", "hydra"],
-            suggested_env="SE3nv"
+            suggested_env="SE3nv",
         )
         self.assertIn("[AUTOSCAFFOLD ERROR]", alert)
         self.assertIn("RFdiffusion", alert)
@@ -1101,8 +1095,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         self.assertIn("PYTHON_RFDIFF", alert)
 
         cuda_warn = display_cuda_warning(
-            python_bin="/home/user/miniconda3/envs/SE3nv/bin/python",
-            tool_name="RFdiffusion"
+            python_bin="/home/user/miniconda3/envs/SE3nv/bin/python", tool_name="RFdiffusion"
         )
         self.assertIn("NO GPU / CUDA ACCELERATION DETECTED", cuda_warn)
         self.assertIn("RFdiffusion", cuda_warn)
@@ -1122,7 +1115,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             python_rfdiff=sys.executable,
             python_mpnn=sys.executable,
             out_dir=out_scaffold,
-            dry_run=True
+            dry_run=True,
         )
         self.assertEqual(scaffolder.python_rfdiff, os.path.realpath(sys.executable))
         self.assertEqual(scaffolder.python_mpnn, os.path.realpath(sys.executable))
@@ -1163,7 +1156,7 @@ class TestSecurityHardening(unittest.TestCase):
             "name": "test_session",
             "values": [1, 2.5, "alpha", True, b"raw_bytes"],
             "coords": np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=float),
-            "nested": {"a": (1, 2, 3)}
+            "nested": {"a": (1, 2, 3)},
         }
         pickled = pickle.dumps(safe_obj)
         unpickled = safe_pickle_loads(pickled)
@@ -1238,36 +1231,34 @@ class TestSecurityHardening(unittest.TestCase):
 
     def test_probe_python_environment_rejects_invalid_binary(self):
         """Verify probe_python_environment safely rejects nonexistent or argument-injected binaries."""
-        res = probe_python_environment("nonexistent_python_binary_arg -c evil", required_modules=["torch"], raise_on_error=False)
+        res = probe_python_environment(
+            "nonexistent_python_binary_arg -c evil", required_modules=["torch"], raise_on_error=False
+        )
         self.assertEqual(res["missing_modules"], ["torch"])
 
         with self.assertRaises(EnvironmentError):
-            probe_python_environment("invalid_python_binary_path --flag", required_modules=["torch"], raise_on_error=True)
+            probe_python_environment(
+                "invalid_python_binary_path --flag", required_modules=["torch"], raise_on_error=True
+            )
 
     def test_chimera_scaffolder_rejects_path_traversal_ids(self):
         """Verify ChimeraScaffolder rejects donor_id and vessel_id with directory traversal characters."""
         with self.assertRaises(ValueError):
             ChimeraScaffolder(
-                donor_pdb=self.donor_pdb if hasattr(self, 'donor_pdb') else "donor.pdb",
-                vessel_pdb=self.vessel_pdb if hasattr(self, 'vessel_pdb') else "vessel.pdb",
+                donor_pdb=self.donor_pdb if hasattr(self, "donor_pdb") else "donor.pdb",
+                vessel_pdb=self.vessel_pdb if hasattr(self, "vessel_pdb") else "vessel.pdb",
                 donor_id="../../etc",
-                motif_residues="30-40"
+                motif_residues="30-40",
             )
 
         with self.assertRaises(ValueError):
             ChimeraScaffolder(
-                donor_pdb="donor.pdb",
-                vessel_pdb="vessel.pdb",
-                vessel_id="../bad_vessel",
-                motif_residues="30-40"
+                donor_pdb="donor.pdb", vessel_pdb="vessel.pdb", vessel_id="../bad_vessel", motif_residues="30-40"
             )
 
         with self.assertRaises(ValueError):
             ChimeraScaffolder(
-                donor_pdb="donor.pdb",
-                vessel_pdb="vessel.pdb",
-                donor_id=["A", "../../evil"],
-                motif_residues="30-40"
+                donor_pdb="donor.pdb", vessel_pdb="vessel.pdb", donor_id=["A", "../../evil"], motif_residues="30-40"
             )
 
     def test_extract_and_merge_objects_rejects_traversal_target_ids(self):
@@ -1281,6 +1272,63 @@ class TestSecurityHardening(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             extract_and_merge_objects(sample_pdb, ["A", "../evil"], out_sub)
+
+    def test_runner_spec_build_command_rejects_shell_operators(self):
+        """Verify RunnerSpec.build_command rejects shell operators, pipes, and semicolons."""
+        runner = RunnerSpec(runner_type="direct", command_prefix=["python; rm -rf /"])
+        with self.assertRaises(ValueError):
+            runner.build_command("script.py")
+
+        runner_pipe = RunnerSpec(runner_type="custom", command_prefix=["python", "|", "cat"])
+        with self.assertRaises(ValueError):
+            runner_pipe.build_command("script.py")
+
+        runner_safe = RunnerSpec(runner_type="direct", command_prefix=[sys.executable])
+        with self.assertRaises(ValueError):
+            runner_safe.build_command("script.py; rm -rf /")
+
+        with self.assertRaises(ValueError):
+            runner_safe.build_command("script.py", "--flag", "val; evil")
+
+    def test_probe_python_environment_rejects_shell_operators(self):
+        """Verify probe_python_environment rejects shell operators, pipes, and semicolons."""
+        with self.assertRaises(EnvironmentError):
+            probe_python_environment("python; rm -rf /", raise_on_error=True)
+
+        with self.assertRaises(EnvironmentError):
+            probe_python_environment(["python", "|", "sh"], raise_on_error=True)
+
+        res = probe_python_environment("python; echo pwned", raise_on_error=False)
+        self.assertIn("torch", probe_python_environment("python; evil", required_modules=["torch"], raise_on_error=False)["missing_modules"])
+
+    def test_get_all_environment_roots_excludes_root_directories(self):
+        """Verify get_all_environment_roots canonicalizes paths and excludes root directory escapes."""
+        from scripts.chimera_scaffold import get_all_environment_roots
+        roots = get_all_environment_roots()
+        for r in roots:
+            self.assertNotIn(r, ["/", "\\", "C:\\", "C:/", "\\\\"])
+            p_drive, p_rest = os.path.splitdrive(r)
+            is_root = (
+                (not p_drive and r.rstrip("/\\") == "")
+                or (p_drive and p_rest in ("/", "\\", ""))
+                or r in ("/", "\\", "//", "\\\\")
+            )
+            self.assertFalse(is_root, f"Root directory found in environment roots: {r}")
+
+    def test_resolve_execution_runner_rejects_traversal_and_shell_injection(self):
+        """Verify resolve_execution_runner rejects path traversal in target_env_names and shell injection in targets."""
+        runner = resolve_execution_runner(
+            explicit_target="python; evil",
+            required_modules=["torch"],
+        )
+        self.assertFalse(runner.is_valid)
+
+        runner_env = resolve_execution_runner(
+            explicit_target=None,
+            target_env_names=["../../etc", "../sensitive"],
+            required_modules=["torch"],
+        )
+        self.assertFalse(runner_env.is_valid)
 
 
 class TestPerformanceOptimizations(unittest.TestCase):
@@ -1296,6 +1344,7 @@ class TestPerformanceOptimizations(unittest.TestCase):
         (1200+ residues) executes in milliseconds without O(N^2) bottlenecks.
         """
         import time
+
         # Generate a large 1200-residue backbone
         bb_pdb = os.path.join(self.test_dir, "large_bb_1200.pdb")
         bb_res = [(r, "ALA", [float(r % 100), float((r // 100) * 3), 0.0]) for r in range(1, 1201)]
@@ -1320,7 +1369,7 @@ class TestPerformanceOptimizations(unittest.TestCase):
             chimera_mode="replace",
             lock_vessel=True,
             out_dir=os.path.join(self.test_dir, "out_perf"),
-            dry_run=True
+            dry_run=True,
         )
         scaffolder.prepare_input_structures()
         scaffolder.parse_motif_ranges()
@@ -1373,9 +1422,7 @@ class TestPerformanceOptimizations(unittest.TestCase):
 
         # Second merge reusing parsed entities_atoms
         out2 = os.path.join(self.test_dir, "out2")
-        res2 = extract_and_merge_objects(
-            multi_pdb, "A", out2, prefix="second", entities_atoms=res1["entities_atoms"]
-        )
+        res2 = extract_and_merge_objects(multi_pdb, "A", out2, prefix="second", entities_atoms=res1["entities_atoms"])
         self.assertEqual(res1["total_amino_acids"], res2["total_amino_acids"])
         self.assertEqual(res1["manifest"]["segments"], res2["manifest"]["segments"])
 
@@ -1390,6 +1437,264 @@ class TestPerformanceOptimizations(unittest.TestCase):
         self.assertEqual(meta1["objects"]["A"]["length"], meta2["objects"]["A"]["length"])
 
         clear_pdb_parse_cache()
+
+    def test_probe_python_environment_runner_list(self):
+        """Verify runner command prefix lists and RunnerSpec instances execute in probe_python_environment."""
+        # 1. Probing with a list command prefix [sys.executable]
+        res_list = probe_python_environment([sys.executable], required_modules=["sys", "os"], check_cuda=False)
+        self.assertEqual(res_list["missing_modules"], [])
+
+        # 2. Probing with RunnerSpec instance
+        spec = RunnerSpec(runner_type="direct", command_prefix=[sys.executable], python_binary=sys.executable)
+        res_spec = probe_python_environment(spec, required_modules=["sys"], check_cuda=False)
+        self.assertEqual(res_spec["missing_modules"], [])
+
+        # 3. Missing module detection via list command prefix
+        res_missing = probe_python_environment(
+            [sys.executable], required_modules=["nonexistent_mod_xyz_8888"], check_cuda=False, raise_on_error=False
+        )
+        self.assertIn("nonexistent_mod_xyz_8888", res_missing["missing_modules"])
+
+    def test_ephemeral_runner_construction_and_building(self):
+        """Verify ephemeral runner command construction for micromamba and conda, and RunnerSpec command building."""
+        # Micromamba named environment
+        cmd_mm_name = build_ephemeral_runner_cmd("micromamba", "/usr/bin/micromamba", env_name="SE3nv")
+        self.assertEqual(cmd_mm_name, ["/usr/bin/micromamba", "run", "-n", "SE3nv", "python"])
+
+        # Micromamba prefix environment
+        cmd_mm_pref = build_ephemeral_runner_cmd("micromamba", "/usr/bin/micromamba", env_prefix="/opt/envs/SE3nv")
+        self.assertEqual(cmd_mm_pref, ["/usr/bin/micromamba", "run", "-p", "/opt/envs/SE3nv", "python"])
+
+        # Conda named environment (includes --no-capture-output)
+        cmd_conda_name = build_ephemeral_runner_cmd("conda", "/usr/bin/conda", env_name="SE3nv")
+        self.assertEqual(cmd_conda_name, ["/usr/bin/conda", "run", "-n", "SE3nv", "--no-capture-output", "python"])
+
+        # Conda prefix environment
+        cmd_conda_pref = build_ephemeral_runner_cmd("conda", "/usr/bin/conda", env_prefix="/opt/envs/SE3nv")
+        expected_pref = ["/usr/bin/conda", "run", "-p", "/opt/envs/SE3nv", "--no-capture-output", "python"]
+        self.assertEqual(cmd_conda_pref, expected_pref)
+
+        # RunnerSpec build_command
+        runner = RunnerSpec(
+            runner_type="micromamba", command_prefix=["micromamba", "run", "-n", "SE3nv", "python"], env_name="SE3nv"
+        )
+        cmd = runner.build_command("run_inference.py", "--flag", "value")
+        self.assertEqual(cmd, ["micromamba", "run", "-n", "SE3nv", "python", "run_inference.py", "--flag", "value"])
+        self.assertIn("SE3nv", runner.display_label())
+
+    def test_multi_candidate_resilient_probing(self):
+        """Verify resolver skips candidate 1 when lacking modules and successfully resolves candidate 2."""
+        from unittest.mock import patch
+
+        cand1_dir = os.path.join(self.test_dir, "root1", "SE3nv", "bin" if sys.platform != "win32" else "Scripts")
+        cand2_dir = os.path.join(self.test_dir, "root2", "SE3nv", "bin" if sys.platform != "win32" else "Scripts")
+        os.makedirs(cand1_dir, exist_ok=True)
+        os.makedirs(cand2_dir, exist_ok=True)
+
+        py_name = "python.exe" if sys.platform == "win32" else "python"
+        cand1_bin = os.path.join(cand1_dir, py_name)
+        cand2_bin = os.path.join(cand2_dir, py_name)
+
+        # Create mock executable files
+        with open(cand1_bin, "w") as f:
+            f.write("#!/bin/sh\n")
+        with open(cand2_bin, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(cand1_bin, 0o755)
+        os.chmod(cand2_bin, 0o755)
+
+        roots = [os.path.join(self.test_dir, "root1"), os.path.join(self.test_dir, "root2")]
+
+        def mock_probe(runner_or_bin, required_modules=None, **kwargs):
+            target = str(runner_or_bin)
+            if hasattr(runner_or_bin, "command_prefix"):
+                target = " ".join(runner_or_bin.command_prefix)
+            elif isinstance(runner_or_bin, (list, tuple)):
+                target = " ".join(str(x) for x in runner_or_bin)
+
+            if "root1" in target:
+                return {"missing_modules": ["torch", "hydra"], "cuda_available": False}
+            elif "root2" in target:
+                return {
+                    "missing_modules": [],
+                    "cuda_available": True,
+                    "torch_version": "2.0.1",
+                    "cuda_device_name": "NVIDIA RTX 4090",
+                }
+            return {"missing_modules": required_modules or [], "cuda_available": False}
+
+        with patch("scripts.chimera_scaffold.get_all_environment_roots", return_value=roots), patch(
+            "scripts.chimera_scaffold.probe_python_environment", side_effect=mock_probe
+        ):
+            clear_probe_cache()
+            runner = resolve_execution_runner(
+                explicit_target=None,
+                env_var_keys=[],
+                target_env_names=["SE3nv"],
+                required_modules=["torch", "hydra"],
+                tool_label="RFdiffusion",
+            )
+            self.assertTrue(runner.is_valid)
+            self.assertTrue(runner.cuda_available)
+            self.assertIn("root2", runner.display_label())
+
+    def test_terminal_scrollback_preservation_configuration(self):
+        """Verify shell scripts preserve terminal scrollback buffer and do not contain unconditional clear."""
+        import re
+
+        scripts_to_check = [
+            os.path.join(REPO_ROOT, "autoscaffold_suite.sh"),
+            os.path.join(REPO_ROOT, "install.sh"),
+            os.path.join(REPO_ROOT, "autoscaffold.sh"),
+            os.path.join(REPO_ROOT, "chimera_scaffold.sh"),
+            os.path.join(REPO_ROOT, "autoscaffold"),
+        ]
+
+        # autoscaffold launcher must export AUTOSCAFFOLD_NO_CLEAR=1 by default
+        with open(os.path.join(REPO_ROOT, "autoscaffold"), "r", encoding="utf-8") as f:
+            launcher_content = f.read()
+        self.assertIn("AUTOSCAFFOLD_NO_CLEAR", launcher_content)
+
+        # Every occurrence of clear in any script must be guarded by AUTOSCAFFOLD_CLEAR or AUTOSCAFFOLD_NO_CLEAR
+        for script_path in scripts_to_check:
+            if not os.path.isfile(script_path):
+                continue
+            with open(script_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            lines = content.splitlines()
+            for idx, line in enumerate(lines):
+                # Ignore comments
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if re.search(r"\bclear\b", line):
+                    # Check that the surrounding context checks AUTOSCAFFOLD_NO_CLEAR or AUTOSCAFFOLD_CLEAR
+                    start_idx = max(0, idx - 3)
+                    end_idx = idx + 1
+                    context = "\n".join(lines[start_idx:end_idx])
+                    self.assertTrue(
+                        "AUTOSCAFFOLD_CLEAR" in context or "AUTOSCAFFOLD_NO_CLEAR" in context,
+                        f"Unshielded clear command at {script_path}:{idx + 1}: {line}",
+                    )
+
+    def test_environment_managers_and_roots_memoization(self):
+        """Verify find_environment_managers and get_all_environment_roots cache results."""
+        from unittest.mock import patch
+        import scripts.chimera_scaffold as cs
+
+        clear_environment_cache()
+        self.assertIsNone(cs._CACHED_MANAGERS)
+        self.assertIsNone(cs._CACHED_ROOTS)
+
+        # First call populates cache
+        mgrs1 = find_environment_managers()
+        roots1 = get_all_environment_roots()
+        self.assertIsNotNone(cs._CACHED_MANAGERS)
+        self.assertIsNotNone(cs._CACHED_ROOTS)
+
+        # Subsequent calls hit cache without scanning
+        with patch("shutil.which", side_effect=RuntimeError("Should not be called when cached")):
+            mgrs2 = find_environment_managers()
+            self.assertEqual(mgrs1, mgrs2)
+
+        with patch("os.path.isdir", side_effect=RuntimeError("Should not be called when cached")):
+            roots2 = get_all_environment_roots()
+            self.assertEqual(roots1, roots2)
+
+        # clear_environment_cache resets cache
+        clear_environment_cache()
+        self.assertIsNone(cs._CACHED_MANAGERS)
+        self.assertIsNone(cs._CACHED_ROOTS)
+
+    def test_probe_python_environment_dual_cache_indexing(self):
+        """Verify probe_python_environment dual-indexes tuple(cmd_prefix) and real_bin in O(1)."""
+        from unittest.mock import patch
+        import scripts.chimera_scaffold as cs
+
+        clear_probe_cache()
+        host_exe = os.path.realpath(sys.executable)
+
+        # Probe with string path
+        res_str = probe_python_environment(host_exe, required_modules=["json"], check_cuda=False)
+        self.assertEqual(res_str["missing_modules"], [])
+
+        # Verify dual keys exist in cache
+        sorted_reqs = ("json",)
+        tuple_key = ((host_exe,), sorted_reqs)
+        bin_key = (host_exe, sorted_reqs)
+        self.assertIn(tuple_key, cs._PROBE_CACHE)
+        self.assertIn(bin_key, cs._PROBE_CACHE)
+
+        # Now probe via RunnerSpec and list - should hit cache without calling subprocess.run
+        with patch("subprocess.run", side_effect=RuntimeError("Subprocess should not be invoked on cached entry")):
+            spec = RunnerSpec(runner_type="direct", command_prefix=[host_exe], python_binary=host_exe)
+            res_spec = probe_python_environment(spec, required_modules=["json"], check_cuda=False)
+            self.assertEqual(res_spec["missing_modules"], [])
+
+            res_list = probe_python_environment([host_exe], required_modules=["json"], check_cuda=False)
+            self.assertEqual(res_list["missing_modules"], [])
+
+    def test_resolve_execution_runner_early_exit_on_cuda(self):
+        """Verify resolve_execution_runner short-circuits immediately when a candidate has CUDA available."""
+        from unittest.mock import patch, MagicMock
+
+        cand1_dir = os.path.join(self.test_dir, "early_root1", "SE3nv", "bin" if sys.platform != "win32" else "Scripts")
+        cand2_dir = os.path.join(self.test_dir, "early_root2", "SE3nv", "bin" if sys.platform != "win32" else "Scripts")
+        os.makedirs(cand1_dir, exist_ok=True)
+        os.makedirs(cand2_dir, exist_ok=True)
+
+        py_name = "python.exe" if sys.platform == "win32" else "python"
+        cand1_bin = os.path.join(cand1_dir, py_name)
+        cand2_bin = os.path.join(cand2_dir, py_name)
+
+        with open(cand1_bin, "w") as f:
+            f.write("#!/bin/sh\n")
+        with open(cand2_bin, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(cand1_bin, 0o755)
+        os.chmod(cand2_bin, 0o755)
+
+        roots = [os.path.join(self.test_dir, "early_root1"), os.path.join(self.test_dir, "early_root2")]
+
+        probed_candidates = []
+
+        def tracking_probe(runner_or_bin, required_modules=None, **kwargs):
+            target = str(runner_or_bin)
+            probed_candidates.append(target)
+            if "early_root1" in target:
+                return {
+                    "missing_modules": [],
+                    "cuda_available": True,
+                    "torch_version": "2.2.0",
+                    "cuda_device_name": "NVIDIA RTX 4090",
+                }
+            elif "early_root2" in target:
+                return {
+                    "missing_modules": [],
+                    "cuda_available": True,
+                    "torch_version": "2.2.0",
+                    "cuda_device_name": "NVIDIA RTX 4090",
+                }
+            return {"missing_modules": required_modules or [], "cuda_available": False}
+
+        with patch("scripts.chimera_scaffold.get_all_environment_roots", return_value=roots), patch(
+            "scripts.chimera_scaffold.probe_python_environment", side_effect=tracking_probe
+        ):
+            clear_probe_cache()
+            runner = resolve_execution_runner(
+                explicit_target=None,
+                env_var_keys=[],
+                target_env_names=["SE3nv"],
+                required_modules=["torch"],
+                tool_label="RFdiffusion",
+            )
+            self.assertTrue(runner.is_valid)
+            self.assertTrue(runner.cuda_available)
+            self.assertIn("early_root1", runner.display_label())
+
+            # Crucial assertion: early_root2 was NEVER probed because early_root1 had cuda_available=True
+            root2_probes = [p for p in probed_candidates if "early_root2" in p]
+            self.assertEqual(len(root2_probes), 0, f"Remaining candidates probed despite CUDA hit: {root2_probes}")
 
 
 if __name__ == "__main__":

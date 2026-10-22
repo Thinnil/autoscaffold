@@ -366,17 +366,16 @@ install_launcher() {
     # If ln -sf did not produce a true symlink (common on Windows Git Bash without native symlink rights),
     # write a canonical launcher wrapper script that explicitly points to LAUNCHER_SRC.
     if [ ! -L "$TARGET_BIN/autoscaffold" ]; then
-        cat << 'EOF' > "$TARGET_BIN/autoscaffold"
+        cat << EOF > "$TARGET_BIN/autoscaffold"
 #!/usr/bin/env bash
-AUTOSCAFFOLD_TARGET="REPLACE_REPO_SRC"
-if [ -f "$AUTOSCAFFOLD_TARGET" ]; then
-    export AUTOSCAFFOLD_DIR="$(dirname "$AUTOSCAFFOLD_TARGET")"
-    exec bash "$AUTOSCAFFOLD_TARGET" "$@"
+AUTOSCAFFOLD_TARGET="$LAUNCHER_SRC"
+if [ -f "\$AUTOSCAFFOLD_TARGET" ]; then
+    export AUTOSCAFFOLD_DIR="\$(dirname "\$AUTOSCAFFOLD_TARGET")"
+    exec bash "\$AUTOSCAFFOLD_TARGET" "\$@"
 fi
-echo -e "\033[0;31m[ERROR] AutoScaffold target not found at: $AUTOSCAFFOLD_TARGET\033[0m"
+echo -e "\\033[0;31m[ERROR] AutoScaffold target not found at: \$AUTOSCAFFOLD_TARGET\\033[0m"
 exit 1
 EOF
-        sed -i "s|REPLACE_REPO_SRC|$LAUNCHER_SRC|g" "$TARGET_BIN/autoscaffold"
     fi
     chmod 755 "$TARGET_BIN/autoscaffold" 2>/dev/null || true
 
@@ -511,7 +510,15 @@ esac
 # Interactive Maintenance Menu
 # ------------------------------------------------------------------------------
 while true; do
-    clear 2>/dev/null || true
+    if [ "${AUTOSCAFFOLD_CLEAR:-0}" = "1" ] && [ "${AUTOSCAFFOLD_NO_CLEAR:-1}" != "1" ]; then
+        clear 2>/dev/null || true
+    else
+        echo ""
+        COLS=$(tput cols 2>/dev/null || echo 80)
+        [ "$COLS" -gt 80 ] && COLS=80
+        printf '%.0s─' $(seq 1 "$COLS") 2>/dev/null || true
+        echo -e "\n"
+    fi
     CONDA_BIN=$(find_conda)
     [ -z "$CONDA_BIN" ] && CONDA_STATUS="${RED}Not Found${NC}" || CONDA_STATUS="${GREEN}Ready ($CONDA_BIN)${NC}"
     [ -d "$LOCAL_TOOLS_DIR/RFdiffusion" ] && RFDIFF_STATUS="${GREEN}Installed${NC}" || RFDIFF_STATUS="${YELLOW}Missing${NC}"

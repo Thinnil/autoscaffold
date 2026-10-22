@@ -12,7 +12,11 @@ set -e
 trap 'echo -e "\n\n${YELLOW}[!] Operation cancelled by user.${NC}"; exit 130' INT
 
 # Resolve script directory and source shared environment
-SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "$AUTOSCAFFOLD_HOME" ] && [ -f "$AUTOSCAFFOLD_HOME/autoscaffold_suite.sh" ]; then
+    SCRIPT_DIR="$AUTOSCAFFOLD_HOME"
+else
+    SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" = "/" ] || [ "$SCRIPT_DIR" = "\\" ] || [[ "$SCRIPT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
     echo -e "\033[0;31m[ERROR] Invalid or dangerous SCRIPT_DIR root: '$SCRIPT_DIR'.\033[0m"
     exit 1
@@ -154,7 +158,15 @@ fi
 # ------------------------------------------------------------------------------
 # Interactive TUI Menu
 # ------------------------------------------------------------------------------
-clear 2>/dev/null || true
+if [ "${AUTOSCAFFOLD_CLEAR:-0}" = "1" ] && [ "${AUTOSCAFFOLD_NO_CLEAR:-1}" != "1" ]; then
+    clear 2>/dev/null || true
+else
+    echo ""
+    COLS=$(tput cols 2>/dev/null || echo 80)
+    [ "$COLS" -gt 80 ] && COLS=80
+    printf '%.0s─' $(seq 1 "$COLS") 2>/dev/null || true
+    echo -e "\n"
+fi
 echo -e "${CYAN}======================================================================${NC}"
 echo -e "${CYAN}        🧬 AUTOSCAFFOLD SUITE: AUTONOMOUS PROTEIN ENGINEERING 🧬        ${NC}"
 echo -e "${CYAN}       RFdiffusion  •  ProteinMPNN  •  ColabFold  •  PyMOL / PSE       ${NC}"
