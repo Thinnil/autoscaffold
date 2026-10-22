@@ -1140,6 +1140,38 @@ class ChimeraScaffolder:
             tool_label="ProteinMPNN",
             strict=strict_python,
         )
+        if not self.mpnn_runner.is_valid and not strict_python:
+            # Fall back to RFdiffusion runner if it is valid and provides torch
+            if self.rfdiff_runner.is_valid:
+                rfdiff_probe = probe_python_environment(
+                    self.rfdiff_runner, required_modules=["torch"], check_cuda=False, raise_on_error=False
+                )
+                if len(rfdiff_probe.get("missing_modules", [])) == 0:
+                    self.mpnn_runner = self.rfdiff_runner
+                    self.python_mpnn = (
+                        self.mpnn_runner.python_binary
+                        if self.mpnn_runner.runner_type == "direct"
+                        else self.mpnn_runner.command_prefix
+                    )
+                    self.mpnn_env_valid = True
+            if not self.mpnn_runner.is_valid:
+                mpnn_fallback = resolve_execution_runner(
+                    explicit_target=None,
+                    env_var_keys=["PYTHON_MPNN", "MPNN_PYTHON"],
+                    target_env_names=["SE3nv", "mpnn", "proteinmpnn", "rfdiffusion"],
+                    required_modules=["torch"],
+                    tool_label="ProteinMPNN (Fallback)",
+                    strict=False,
+                )
+                if mpnn_fallback.is_valid:
+                    self.mpnn_runner = mpnn_fallback
+                    self.python_mpnn = (
+                        self.mpnn_runner.python_binary
+                        if self.mpnn_runner.runner_type == "direct"
+                        else self.mpnn_runner.command_prefix
+                    )
+                    self.mpnn_env_valid = True
+
         self.python_mpnn = (
             self.mpnn_runner.python_binary
             if self.mpnn_runner.runner_type == "direct"

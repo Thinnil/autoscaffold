@@ -624,14 +624,15 @@ PID_FILE="$ABS_OUT_DIR/run.pid"
 LOG_FILE="$ABS_OUT_DIR/run.log"
 
 # Resolve neural model Python binaries if not explicitly configured
-if [ -z "$PYTHON_RFDIFF" ] || [ ! -x "$PYTHON_RFDIFF" ]; then
-    PYTHON_RFDIFF="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" 2>/dev/null || true)"
-    [ -z "$PYTHON_RFDIFF" ] && PYTHON_RFDIFF="$(discover_conda_python "rfdiffusion" 2>/dev/null || true)"
+if [ -z "$PYTHON_RFDIFF" ] || [ ! -x "$PYTHON_RFDIFF" ] || ! "$PYTHON_RFDIFF" -c "import torch" >/dev/null 2>&1; then
+    PYTHON_RFDIFF="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 2>/dev/null || true)"
+    [ -z "$PYTHON_RFDIFF" ] && PYTHON_RFDIFF="$(discover_conda_python "rfdiffusion" "torch" 2>/dev/null || true)"
 fi
 
-if [ -z "$PYTHON_MPNN" ] || [ ! -x "$PYTHON_MPNN" ]; then
-    PYTHON_MPNN="$(discover_conda_python "${CONDA_ENV_MPNN:-mlfold}" 2>/dev/null || true)"
-    [ -z "$PYTHON_MPNN" ] && PYTHON_MPNN="$(discover_conda_python "SE3nv" 2>/dev/null || true)"
+if [ -z "$PYTHON_MPNN" ] || [ ! -x "$PYTHON_MPNN" ] || ! "$PYTHON_MPNN" -c "import torch" >/dev/null 2>&1; then
+    PYTHON_MPNN="$(discover_conda_python "${CONDA_ENV_MPNN:-mlfold}" "torch" 2>/dev/null || true)"
+    [ -z "$PYTHON_MPNN" ] && PYTHON_MPNN="$(discover_conda_python "SE3nv" "torch" 2>/dev/null || true)"
+    [ -z "$PYTHON_MPNN" ] && [ -n "$PYTHON_RFDIFF" ] && PYTHON_MPNN="$PYTHON_RFDIFF"
 fi
 
 # ------------------------------------------------------------------------------

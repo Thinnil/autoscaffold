@@ -199,13 +199,21 @@ run_in_env() {
 # Function to discover python executable for a target conda environment across standard roots
 discover_conda_python() {
     local target_env="$1"
+    local req_module="${2:-}"
     local candidate=""
 
     [ -z "$target_env" ] && return 1
 
     _verify_python() {
         local py="$1"
-        [ -n "$py" ] && [ -x "$py" ] && "$py" -c "import sys" >/dev/null 2>&1
+        if [ -z "$py" ] || [ ! -x "$py" ]; then
+            return 1
+        fi
+        if [ -n "$req_module" ]; then
+            "$py" -c "import sys; import $req_module" >/dev/null 2>&1
+        else
+            "$py" -c "import sys" >/dev/null 2>&1
+        fi
     }
 
     # 1. Early exit: Check if an environment variable is already exported for this env/tool
@@ -296,16 +304,17 @@ discover_conda_python() {
 
 # Resolve and export neural model Python binaries if not explicitly set
 if [ -z "$PYTHON_RFDIFF" ]; then
-    _DISCOVERED_RFDIFF="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" 2>/dev/null || true)"
-    [ -z "$_DISCOVERED_RFDIFF" ] && _DISCOVERED_RFDIFF="$(discover_conda_python "rfdiffusion" 2>/dev/null || true)"
+    _DISCOVERED_RFDIFF="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 2>/dev/null || true)"
+    [ -z "$_DISCOVERED_RFDIFF" ] && _DISCOVERED_RFDIFF="$(discover_conda_python "rfdiffusion" "torch" 2>/dev/null || true)"
     if [ -n "$_DISCOVERED_RFDIFF" ]; then
         export PYTHON_RFDIFF="$_DISCOVERED_RFDIFF"
     fi
 fi
 
 if [ -z "$PYTHON_MPNN" ]; then
-    _DISCOVERED_MPNN="$(discover_conda_python "${CONDA_ENV_MPNN:-mlfold}" 2>/dev/null || true)"
-    [ -z "$_DISCOVERED_MPNN" ] && _DISCOVERED_MPNN="$(discover_conda_python "SE3nv" 2>/dev/null || true)"
+    _DISCOVERED_MPNN="$(discover_conda_python "${CONDA_ENV_MPNN:-mlfold}" "torch" 2>/dev/null || true)"
+    [ -z "$_DISCOVERED_MPNN" ] && _DISCOVERED_MPNN="$(discover_conda_python "SE3nv" "torch" 2>/dev/null || true)"
+    [ -z "$_DISCOVERED_MPNN" ] && [ -n "${PYTHON_RFDIFF:-}" ] && _DISCOVERED_MPNN="$PYTHON_RFDIFF"
     if [ -n "$_DISCOVERED_MPNN" ]; then
         export PYTHON_MPNN="$_DISCOVERED_MPNN"
     fi

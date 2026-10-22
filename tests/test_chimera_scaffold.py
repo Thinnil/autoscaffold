@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import os
 import sys
 import json
@@ -1723,6 +1724,73 @@ class TestPerformanceOptimizations(unittest.TestCase):
             # Crucial assertion: early_root2 was NEVER probed because early_root1 had cuda_available=True
             root2_probes = [p for p in probed_candidates if "early_root2" in p]
             self.assertEqual(len(root2_probes), 0, f"Remaining candidates probed despite CUDA hit: {root2_probes}")
+
+    def test_chimera_scaffolder_mpnn_fallback_to_rfdiff_runner(self):
+        """Verify ChimeraScaffolder automatically falls back to rfdiff_runner if mpnn environment lacks torch."""
+        from scripts.chimera_scaffold import ChimeraScaffolder, RunnerSpec
+
+        valid_rfdiff_runner = RunnerSpec(
+            runner_type="direct",
+            command_prefix=["/path/to/SE3nv/bin/python"],
+            python_binary="/path/to/SE3nv/bin/python",
+            is_valid=True,
+            cuda_available=True,
+            torch_version="2.2.0",
+        )
+        invalid_mpnn_runner = RunnerSpec(
+            runner_type="direct",
+            command_prefix=["/path/to/mlfold/bin/python"],
+            python_binary="/path/to/mlfold/bin/python",
+            is_valid=False,
+            missing_modules=["torch"],
+        )
+
+        def mock_resolve(explicit_target=None, **kwargs):
+            tool = kwargs.get("tool_label", "")
+            if "RFdiffusion" in tool:
+                return valid_rfdiff_runner
+            return invalid_mpnn_runner
+
+        dummy_pdb = os.path.join(self.test_dir, "fallback_test.pdb")
+        with open(dummy_pdb, "w") as f:
+            f.write("ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\n")
+
+        with patch("scripts.chimera_scaffold.resolve_execution_runner", side_effect=mock_resolve), patch(
+            "scripts.chimera_scaffold.probe_python_environment",
+            return_value={"missing_modules": [], "cuda_available": True, "torch_version": "2.2.0"},
+        ):
+            scaffolder = ChimeraScaffolder(
+                input_file=dummy_pdb,
+                donor_id="D",
+                vessel_id="V",
+                motif_residues="30-40",
+                chimera_mode="replace",
+                vessel_replace_range="40-60",
+                python_mpnn="/path/to/mlfold/bin/python",
+                python_rfdiff="/path/to/SE3nv/bin/python",
+                dry_run=True,
+                strict_python=False,
+            )
+            # Automatic fallback should have taken place
+            self.assertTrue(scaffolder.mpnn_env_valid)
+            self.assertEqual(scaffolder.mpnn_runner, valid_rfdiff_runner)
+            self.assertEqual(scaffolder.python_mpnn, "/path/to/SE3nv/bin/python")
+
+            # With strict_python=True, fallback should NOT occur
+            scaffolder_strict = ChimeraScaffolder(
+                input_file=dummy_pdb,
+                donor_id="D",
+                vessel_id="V",
+                motif_residues="30-40",
+                chimera_mode="replace",
+                vessel_replace_range="40-60",
+                python_mpnn="/path/to/mlfold/bin/python",
+                python_rfdiff="/path/to/SE3nv/bin/python",
+                dry_run=True,
+                strict_python=True,
+            )
+            self.assertFalse(scaffolder_strict.mpnn_env_valid)
+            self.assertEqual(scaffolder_strict.mpnn_runner, invalid_mpnn_runner)
 
 
 if __name__ == "__main__":
