@@ -41,8 +41,6 @@ from scripts.chimera_scaffold import (  # noqa: E402
     _CA_COORDS_CACHE,
     _RESI_COORDS_CACHE,
     _PROBE_CACHE,
-    _CACHED_MANAGERS,
-    _CACHED_ROOTS,
     resolve_python_interpreter,
     resolve_neural_python,
     resolve_execution_runner,
@@ -144,8 +142,9 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         )
         scaffolder.prepare_input_structures()
         contig, donor_segs, vessel_segs = scaffolder.compute_contigs_and_segments()
-        # Vessel is 1-100. Excising 40-60 leaves 1-39 and 61-100
-        expected = "V1-39/8-12/D30-40/8-12/V61-100"
+        # Vessel is 1-100. Excising 40-60 leaves 1-39 and 61-100.
+        # Donor residues (30-40) overlap with vessel (1-100), offset to 1030-1040 in unified Chain A.
+        expected = "A1-39/8-12/A1030-1040/8-12/A61-100"
         self.assertEqual(contig, expected)
         self.assertEqual(donor_segs, [(30, 40)])
         self.assertEqual(vessel_segs, [(1, 39), (61, 100)])
@@ -164,7 +163,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         )
         scaffolder.prepare_input_structures()
         contig, _, _ = scaffolder.compute_contigs_and_segments()
-        expected = "D25-35/10-15/V1-100"
+        expected = "A1025-1035/10-15/A1-100"
         self.assertEqual(contig, expected)
 
     def test_contig_generation_ligate_cterm(self):
@@ -182,7 +181,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         )
         scaffolder.prepare_input_structures()
         contig, _, _ = scaffolder.compute_contigs_and_segments()
-        expected = "V1-100/10-15/D25-35"
+        expected = "A1-100/10-15/A1025-1035"
         self.assertEqual(contig, expected)
 
     def test_contig_generation_insert_loop(self):
@@ -202,11 +201,11 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         )
         scaffolder.prepare_input_structures()
         contig, _, _ = scaffolder.compute_contigs_and_segments()
-        expected = "V1-50/6-8/D30-35/6-8/V51-100"
+        expected = "A1-50/6-8/A1030-1035/6-8/A51-100"
         self.assertEqual(contig, expected)
 
     def test_seed_pdb_creation_and_atom_merging(self):
-        """Test creation of merged seed PDB containing donor and vessel atoms."""
+        """Test creation of merged seed PDB containing donor and vessel atoms in unified Chain A."""
         out_scaffold = os.path.join(self.test_dir, "out_seed")
         scaffolder = ChimeraScaffolder(
             donor_pdb=self.donor_pdb,
@@ -223,13 +222,40 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
 
         self.assertTrue(os.path.isfile(seed_path))
         parsed_seed = parse_pdb_file(seed_path)
-        # Should have chains V and D
-        self.assertIn("V", parsed_seed["objects"])
-        self.assertIn("D", parsed_seed["objects"])
-        # Preserved donor residues 30-40 -> 11 residues
-        self.assertEqual(parsed_seed["objects"]["D"]["length"], 11)
-        # Preserved vessel residues (1-39 and 61-100) -> 39 + 40 = 79 residues
-        self.assertEqual(parsed_seed["objects"]["V"]["length"], 79)
+        # In RFdiffusion, all segments in a single designed chain must belong to unified Chain A
+        self.assertIn("A", parsed_seed["objects"])
+        # Total residues in Chain A: 79 vessel residues + 11 donor residues = 90
+        self.assertEqual(parsed_seed["objects"]["A"]["length"], 90)
+
+    def test_non_overlapping_donor_and_vessel_preserves_numbers(self):
+        """Test that non-overlapping donor (e.g. 1-16) and vessel (e.g. 285-427) use 0 offset in unified Chain A."""
+        vessel_ahr = os.path.join(self.test_dir, "vessel_ahr.pdb")
+        donor_hsp = os.path.join(self.test_dir, "donor_hsp.pdb")
+        v_res = [(r, "ALA", [0.0, float(r), 0.0]) for r in range(285, 428)]
+        d_res = [(r, "GLY", [0.0, float(r) + 500.0, 0.0]) for r in range(1, 17)]
+        create_sample_pdb(vessel_ahr, {"A": v_res})
+        create_sample_pdb(donor_hsp, {"D": d_res})
+
+        scaffolder = ChimeraScaffolder(
+            donor_pdb=donor_hsp,
+            vessel_pdb=vessel_ahr,
+            motif_residues="all",
+            chimera_mode="ligate_cterm",
+            linker_n="10",
+            clamp_linkers=False,
+            out_dir=os.path.join(self.test_dir, "out_non_overlap"),
+            dry_run=True,
+        )
+        scaffolder.prepare_input_structures()
+        contig, donor_segs, vessel_segs = scaffolder.compute_contigs_and_segments()
+        # Zero offset because 1-16 and 285-427 do not intersect
+        self.assertEqual(scaffolder.donor_seed_offset, 0)
+        self.assertTrue(contig.startswith("A285-427/10/A1-16"))
+        seed_path = scaffolder.create_merged_seed_pdb()
+        parsed = parse_pdb_file(seed_path)
+        self.assertIn("A", parsed["objects"])
+        # All atoms in unified Chain A
+        self.assertEqual(len(parsed["objects"]), 1)
 
     def test_kabsch_rmsd_alignment(self):
         """Test Kabsch SVD algorithm with identical and translated coordinates."""
@@ -527,7 +553,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         # Should have auto-clamped both linkers
         self.assertEqual(scaffolder.linker_n, "17-23")
         self.assertEqual(scaffolder.linker_c, "25-32")
-        self.assertEqual(contig, "V1-39/17-23/D30-40/25-32/V61-100")
+        self.assertEqual(contig, "A1-39/17-23/A1030-1040/25-32/A61-100")
 
         # Test with 'auto'
         scaffolder_auto = ChimeraScaffolder(
@@ -545,7 +571,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         contig_auto, _, _ = scaffolder_auto.compute_contigs_and_segments()
         self.assertEqual(scaffolder_auto.linker_n, "17-23")
         self.assertEqual(scaffolder_auto.linker_c, "25-32")
-        self.assertEqual(contig_auto, "V1-39/17-23/D30-40/25-32/V61-100")
+        self.assertEqual(contig_auto, "A1-39/17-23/A1030-1040/25-32/A61-100")
 
     def test_crystallographic_loop_gaps_and_multi_segment_vessel(self):
         """
@@ -581,7 +607,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         self.assertEqual(donor_segs, [(30, 40)])
         self.assertEqual(vessel_segs, [(1, 14), (21, 30), (61, 100)])
         # Expected contig preserves the 30aa crystallographic void as 30-30:
-        expected = "V1-14/8-12/D30-40/8-12/V21-30/30-30/V61-100"
+        expected = "A1-14/8-12/A1030-1040/8-12/A21-30/30-30/A61-100"
         self.assertEqual(contig, expected)
 
     def test_measure_junctions_method_and_cli(self):
@@ -821,7 +847,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         contig, donor_segs, _ = scaffolder.compute_contigs_and_segments()
         self.assertEqual(donor_segs, [(1, 5), (10, 15)])
         self.assertIn("/7-13/", contig)
-        self.assertEqual(contig, "V1-39/8-12/D1-5/7-13/D10-15/8-12/V61-100")
+        self.assertEqual(contig, "A1-39/8-12/A1001-1005/7-13/A1010-1015/8-12/A61-100")
 
     def test_fixed_positions_masking_multi_segment(self):
         """Test ProteinMPNN fixed position masking across 3 donor segments,
@@ -937,27 +963,27 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             self.assertFalse(contig.startswith("/"))
             self.assertFalse(contig.endswith("/"))
 
-            # Verify donor segments present
+            # Verify donor segments present (unified Chain A with offset 1000 due to vessel 1-100)
             self.assertEqual(donor_segs, [(1, 5), (10, 15)])
-            self.assertIn("D1-5", contig)
-            self.assertIn("D10-15", contig)
+            self.assertIn("A1001-1005", contig)
+            self.assertIn("A1010-1015", contig)
 
-            # Verify internal linker is embedded between D1-5 and D10-15
+            # Verify internal linker is embedded between A1001-1005 and A1010-1015
             # 15.0 Å void -> L_glob = ceil(15/3) = 5 -> linker is 5-11
-            self.assertIn("D1-5/5-11/D10-15", contig)
+            self.assertIn("A1001-1005/5-11/A1010-1015", contig)
 
             if mode == "replace":
-                self.assertTrue(contig.startswith("V1-39/"))
-                self.assertTrue(contig.endswith("/V61-100"))
+                self.assertTrue(contig.startswith("A1-39/"))
+                self.assertTrue(contig.endswith("/A61-100"))
             elif mode == "ligate_nterm":
-                self.assertTrue(contig.startswith("D1-5/5-11/D10-15/"))
-                self.assertTrue(contig.endswith("/V1-100"))
+                self.assertTrue(contig.startswith("A1001-1005/5-11/A1010-1015/"))
+                self.assertTrue(contig.endswith("/A1-100"))
             elif mode == "ligate_cterm":
-                self.assertTrue(contig.startswith("V1-100/"))
-                self.assertTrue(contig.endswith("/D1-5/5-11/D10-15"))
+                self.assertTrue(contig.startswith("A1-100/"))
+                self.assertTrue(contig.endswith("/A1001-1005/5-11/A1010-1015"))
             elif mode == "insert_loop":
-                self.assertTrue(contig.startswith("V1-50/"))
-                self.assertTrue(contig.endswith("/V51-100"))
+                self.assertTrue(contig.startswith("A1-50/"))
+                self.assertTrue(contig.endswith("/A51-100"))
 
     def test_resolve_python_interpreter_hierarchy(self):
         """Verify 5-tier fallback hierarchy in resolve_python_interpreter and resolve_neural_python."""
@@ -1298,8 +1324,10 @@ class TestSecurityHardening(unittest.TestCase):
         with self.assertRaises(EnvironmentError):
             probe_python_environment(["python", "|", "sh"], raise_on_error=True)
 
-        res = probe_python_environment("python; echo pwned", raise_on_error=False)
-        self.assertIn("torch", probe_python_environment("python; evil", required_modules=["torch"], raise_on_error=False)["missing_modules"])
+        res = probe_python_environment("python; echo pwned", required_modules=["torch"], raise_on_error=False)
+        self.assertIn("torch", res["missing_modules"])
+        probe_evil = probe_python_environment("python; evil", required_modules=["torch"], raise_on_error=False)
+        self.assertIn("torch", probe_evil["missing_modules"])
 
     def test_get_all_environment_roots_excludes_root_directories(self):
         """Verify get_all_environment_roots canonicalizes paths and excludes root directory escapes."""
@@ -1636,7 +1664,7 @@ class TestPerformanceOptimizations(unittest.TestCase):
 
     def test_resolve_execution_runner_early_exit_on_cuda(self):
         """Verify resolve_execution_runner short-circuits immediately when a candidate has CUDA available."""
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
 
         cand1_dir = os.path.join(self.test_dir, "early_root1", "SE3nv", "bin" if sys.platform != "win32" else "Scripts")
         cand2_dir = os.path.join(self.test_dir, "early_root2", "SE3nv", "bin" if sys.platform != "win32" else "Scripts")

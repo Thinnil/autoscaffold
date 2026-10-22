@@ -941,7 +941,13 @@ def resolve_execution_runner(
     all_roots = get_all_environment_roots()
     for env_name in target_env_names or []:
         clean_name = str(env_name).strip()
-        if not clean_name or ".." in clean_name or "/" in clean_name or "\\" in clean_name or _RE_SHELL_INJECTION.search(clean_name):
+        if (
+            not clean_name
+            or ".." in clean_name
+            or "/" in clean_name
+            or "\\" in clean_name
+            or _RE_SHELL_INJECTION.search(clean_name)
+        ):
             continue
         for root in all_roots:
             env_dir = os.path.realpath(os.path.join(root, clean_name))
@@ -1197,6 +1203,8 @@ class ChimeraScaffolder:
         self.contig_string = ""
         self.preserved_donor_segments: List[Tuple[int, int]] = []
         self.preserved_vessel_segments: List[Tuple[int, int]] = []
+        self.seed_chain_id = "A"
+        self.donor_seed_offset = 0
 
     def prepare_input_structures(self):
         """
@@ -1807,9 +1815,22 @@ class ChimeraScaffolder:
                 )
                 self.linker_c = j.get("recommended_range", "6-10")
 
-        # Donor chain label in seed PDB will be 'D', Vessel will be 'V'
-        d_label = "D"
-        v_label = "V"
+        # In RFdiffusion, all segments in a single designed chain must share the same chain ID.
+        # We assign a unified chain ID (default 'A') to all segments in chimera_seed.pdb.
+        unified_chain = getattr(self, "seed_chain_id", "A")
+
+        # Check for residue number collisions between donor and vessel
+        vessel_res_set = set(r for s, e in vessel_intervals for r in range(s, e + 1))
+        donor_res_set = set(r for s, e in motif_segments for r in range(s, e + 1))
+
+        if vessel_res_set.intersection(donor_res_set):
+            max_vessel = max(vessel_res_set) if vessel_res_set else 0
+            self.donor_seed_offset = max(max_vessel + 100, 1000)
+        else:
+            self.donor_seed_offset = 0
+
+        d_label = unified_chain
+        v_label = unified_chain
 
         # Format motif portion in contig, budgeting physical internal linkers across gaps
         motif_contig_parts = []
@@ -1833,7 +1854,9 @@ class ChimeraScaffolder:
                         motif_contig_parts.append(f"{l_glob}-{l_max}")
                     else:
                         motif_contig_parts.append("3-9")
-            motif_contig_parts.append(f"{d_label}{m_start}-{m_end}")
+            seed_m_start = m_start + self.donor_seed_offset
+            seed_m_end = m_end + self.donor_seed_offset
+            motif_contig_parts.append(f"{d_label}{seed_m_start}-{seed_m_end}")
 
         motif_contig_str = "/".join(motif_contig_parts)
 
@@ -1939,6 +1962,8 @@ class ChimeraScaffolder:
 
         atom_lines = []
         atom_idx = 1
+        unified_chain = getattr(self, "seed_chain_id", "A")
+        donor_offset = getattr(self, "donor_seed_offset", 0)
 
         is_same_file = os.path.abspath(self.working_vessel_pdb) == os.path.abspath(self.working_donor_pdb)
 
@@ -1960,12 +1985,17 @@ class ChimeraScaffolder:
                             donor_raw.append(line)
 
             for line in vessel_raw:
-                atom_lines.append(f"{line[:6]}{atom_idx:>5}{line[11:21]}V{line[22:80].rstrip()}\n")
+                atom_lines.append(f"{line[:6]}{atom_idx:>5}{line[11:21]}{unified_chain}{line[22:80].rstrip()}\n")
                 atom_idx += 1
-            if atom_lines:
-                atom_lines.append("TER\n")
             for line in donor_raw:
-                atom_lines.append(f"{line[:6]}{atom_idx:>5}{line[11:21]}D{line[22:80].rstrip()}\n")
+                try:
+                    resi = int(line[22:26])
+                except ValueError:
+                    resi = 1
+                new_resi = resi + donor_offset
+                atom_lines.append(
+                    f"{line[:6]}{atom_idx:>5}{line[11:21]}{unified_chain}{new_resi:>4}{line[26:80].rstrip()}\n"
+                )
                 atom_idx += 1
         else:
             # Extract vessel atoms first with buffered stream
@@ -1978,11 +2008,10 @@ class ChimeraScaffolder:
                             continue
                         ch = line[21].strip() or "A"
                         if (not self.vessel_chain_id or ch == self.vessel_chain_id) and resi in vessel_set:
-                            atom_lines.append(f"{line[:6]}{atom_idx:>5}{line[11:21]}V{line[22:80].rstrip()}\n")
+                            atom_lines.append(
+                                f"{line[:6]}{atom_idx:>5}{line[11:21]}{unified_chain}{line[22:80].rstrip()}\n"
+                            )
                             atom_idx += 1
-
-            if atom_lines:
-                atom_lines.append("TER\n")
 
             # Extract donor motif atoms with buffered stream
             with open(self.working_donor_pdb, "r", encoding="utf-8", errors="ignore", buffering=buffer_size) as f:
@@ -1994,10 +2023,15 @@ class ChimeraScaffolder:
                             continue
                         ch = line[21].strip() or "A"
                         if (not self.donor_chain_id or ch == self.donor_chain_id) and resi in donor_set:
-                            atom_lines.append(f"{line[:6]}{atom_idx:>5}{line[11:21]}D{line[22:80].rstrip()}\n")
+                            new_resi = resi + donor_offset
+                            atom_str = (
+                                f"{line[:6]}{atom_idx:>5}{line[11:21]}{unified_chain}"
+                                f"{new_resi:>4}{line[26:80].rstrip()}\n"
+                            )
+                            atom_lines.append(atom_str)
                             atom_idx += 1
 
-        if atom_lines and not atom_lines[-1].startswith("TER"):
+        if atom_lines:
             atom_lines.append("TER\n")
         atom_lines.append("END\n")
 
@@ -2258,6 +2292,14 @@ class ChimeraScaffolder:
                     f"RFdiffusion script not found. Looked in: '{self.rfdiff_script}'. "
                     "Please configure RFDIFF_DIR in config.env or run: autoscaffold install"
                 )
+            # Clean old generated backbones so RFdiffusion cautious mode does not skip designs
+            if os.path.isdir(work_rfdiff):
+                for f in os.listdir(work_rfdiff):
+                    if f.startswith("chimera_design") and (f.endswith(".pdb") or f.endswith(".trb")):
+                        try:
+                            os.remove(os.path.join(work_rfdiff, f))
+                        except OSError:
+                            pass
             rfdiff_repo = os.path.dirname(os.path.dirname(os.path.abspath(self.rfdiff_script)))
             cmd_display = " ".join(shlex.quote(arg) for arg in rfdiff_cmd)
             print(f"[+] Running RFdiffusion: {cmd_display}")
