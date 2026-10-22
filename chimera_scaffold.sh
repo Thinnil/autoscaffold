@@ -100,8 +100,7 @@ canonicalize_out_dir() {
     local resolved=""
 
     if [ -z "$raw" ]; then
-        echo "$repo_root/outputs/chimera_scaffold"
-        return
+        raw="outputs/chimera_scaffold"
     fi
 
     # If user passed default or relative path while already inside an 'outputs' directory
@@ -110,16 +109,8 @@ canonicalize_out_dir() {
         raw="${raw#outputs\\}"
     fi
 
-    # If relative, anchor default pattern to repo root if matched, else resolve via fast_realpath
-    if [[ ! "$raw" =~ ^/ && ! "$raw" =~ ^[a-zA-Z]:[\\/] ]]; then
-        if [ "$raw" = "outputs/chimera_scaffold" ] || [ "$raw" = "outputs" ]; then
-            resolved="$repo_root/$raw"
-        else
-            resolved="$(fast_realpath "$raw")"
-        fi
-    else
-        resolved="$(fast_realpath "$raw")"
-    fi
+    # Resolve relative path against current working directory ($PWD)
+    resolved="$(fast_realpath "$raw")"
 
     # Collapse any accidental duplicated '/outputs/outputs/'
     while [[ "$resolved" =~ /outputs/outputs/ ]]; do

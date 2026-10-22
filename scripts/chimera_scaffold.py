@@ -2489,6 +2489,18 @@ class ChimeraScaffolder:
                 shutil.copyfile(bb_path, res_dest)
                 passing_models.append(res_dest)
 
+        # If no design passed strict RMSD cutoff, preserve the top-ranking candidates in 3_results
+        if not passing_models and metrics_rows:
+            sorted_by_rmsd = sorted(metrics_rows, key=lambda x: x.get("motif_rmsd", 999.0))
+            top_cand = sorted_by_rmsd[0]
+            top_bb = top_cand["backbone_path"]
+            top_rmsd = top_cand.get("motif_rmsd", 0.0)
+            if os.path.isfile(top_bb):
+                fname = f"{top_cand['model_id']}_top_candidate_rmsd_{top_rmsd:.2f}A.pdb"
+                top_dest = safe_join_path(work_results, fname)
+                shutil.copyfile(top_bb, top_dest)
+                passing_models.append(top_dest)
+
         # Output metrics_summary.csv strictly within out_dir using 64KB buffering
         csv_path = safe_join_path(self.out_dir, "metrics_summary.csv")
         with open(csv_path, "w", newline="", encoding="utf-8", buffering=65536) as csvfile:
