@@ -406,6 +406,19 @@ class ChimeraScaffolder:
         if not v_objs:
             raise ValueError(f"No valid atom/residue records in vessel structure: {self.working_vessel_pdb}")
 
+        if len(d_objs) > 1:
+            # Donor structure is multi-chain (e.g. PyMOL selection containing residues from multiple subunits like HSPA + HSPB).
+            # Merge all donor chains into a unified single chain 'D' to preserve all residues from all subunits.
+            merge_res = extract_and_merge_objects(
+                self.working_donor_pdb,
+                [obj["id"] for obj in d_objs],
+                work_prep,
+                prefix="merged_multichain_donor"
+            )
+            self.working_donor_pdb = merge_res["merged_pdb"]
+            donor_parsed = parse_pdb_file(self.working_donor_pdb)
+            d_objs = list(donor_parsed["objects"].values())
+
         self.donor_metadata = d_objs[0]
         self.vessel_metadata = v_objs[0]
         self.donor_chain_id = self.donor_metadata["id"]
