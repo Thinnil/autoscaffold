@@ -340,7 +340,7 @@ except Exception:
     [ -n "$RESOLVED_DONOR" ] && DONOR_ID="$RESOLVED_DONOR"
 fi
 
-if [[ ! "$DONOR_ID" =~ ^[a-zA-Z0-9_\-,\ ]+$ ]]; then
+if [[ ! "$DONOR_ID" =~ ^[-a-zA-Z0-9_,\ ]+$ ]]; then
     echo -e "${RED}[ERROR] Invalid Donor ID '$DONOR_ID'. Must contain only alphanumeric characters, underscores, hyphens, or commas.${NC}"
     exit 1
 fi
@@ -355,7 +355,7 @@ if [ -z "$MOTIF_RESIDUES" ]; then
     echo -e "${RED}[ERROR] Motif residues cannot be empty.${NC}"
     exit 1
 fi
-if [[ ! "$MOTIF_RESIDUES" =~ ^[a-zA-Z0-9,\-:\ \*%]+$ ]]; then
+if [[ ! "$MOTIF_RESIDUES" =~ ^[-a-zA-Z0-9,:\ \*%]+$ ]]; then
     echo -e "${RED}[ERROR] Invalid motif residues specification '$MOTIF_RESIDUES'.${NC}"
     exit 1
 fi
@@ -382,7 +382,7 @@ except Exception:
     [ -n "$RESOLVED_VESSEL" ] && VESSEL_ID="$RESOLVED_VESSEL"
 fi
 
-if [[ ! "$VESSEL_ID" =~ ^[a-zA-Z0-9_\-]+$ ]]; then
+if [[ ! "$VESSEL_ID" =~ ^[-a-zA-Z0-9_]+$ ]]; then
     echo -e "${RED}[ERROR] Invalid Vessel ID '$VESSEL_ID'. Must contain only alphanumeric characters, underscores, or hyphens.${NC}"
     exit 1
 fi
@@ -416,7 +416,7 @@ if [ -t 0 ] && [ "$CHIMERA_MODE" = "replace" ] && [ -z "$VESSEL_REPLACE_RANGE" ]
 fi
 
 # Validate parameters against unexpected syntax or command injection characters
-if [ -n "$VESSEL_REPLACE_RANGE" ] && [[ ! "$VESSEL_REPLACE_RANGE" =~ ^[a-zA-Z0-9\-]+$ ]]; then
+if [ -n "$VESSEL_REPLACE_RANGE" ] && [[ ! "$VESSEL_REPLACE_RANGE" =~ ^[-a-zA-Z0-9]+$ ]]; then
     echo -e "${RED}[ERROR] Invalid vessel_replace_range '$VESSEL_REPLACE_RANGE'. Expected 'START-END'.${NC}"
     exit 1
 fi
