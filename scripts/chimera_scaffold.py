@@ -61,12 +61,29 @@ _CA_COORDS_CACHE: Dict[Tuple[str, float], Dict[Tuple[str, int], np.ndarray]] = {
 _FALLBACK_COORDS_CACHE: Dict[Tuple[str, float], Dict[Tuple[str, int], np.ndarray]] = {}
 _RESI_COORDS_CACHE: Dict[Tuple[str, float], Dict[int, np.ndarray]] = {}
 
+# In-memory session cache for Python environment probes:
+# Key: (real_bin, tuple(sorted(req_modules))) -> probe_result_dict
+_PROBE_CACHE: Dict[Tuple[str, Tuple[str, ...]], Dict[str, Any]] = {}
+
+# Pre-compiled regular expressions for path validation, residue ranges, and linkers
+_RE_SANITIZE_IDENT = re.compile(r'[^a-zA-Z0-9_\-]')
+_RE_OUTPUTS_DEDUP_MID = re.compile(r'([/\\]outputs)+([/\\]outputs)', re.IGNORECASE)
+_RE_RESIDUE_RANGE = re.compile(r'^[A-Za-z]?(\d+)(?:\s*-\s*[A-Za-z]?(\d+))?$')
+_RE_NUM_OR_SPAN = re.compile(r'^(\d+)(?:-(\d+))?$')
+_RE_HYPHEN_RANGE = re.compile(r'^[A-Za-z]?(\d+)\s*-\s*[A-Za-z]?(\d+)$')
+_RE_LINKER_VAL = re.compile(r'^(auto|\d+(-\d+)?)$', re.IGNORECASE)
+
 
 def clear_ca_coords_cache() -> None:
     """Clears the in-memory parsed coordinate session cache."""
     _CA_COORDS_CACHE.clear()
     _FALLBACK_COORDS_CACHE.clear()
     _RESI_COORDS_CACHE.clear()
+
+
+def clear_probe_cache() -> None:
+    """Clears the in-memory Python environment probe session cache."""
+    _PROBE_CACHE.clear()
 
 
 def get_residue_ca_coords(
@@ -216,6 +233,327 @@ def compute_extension_minimum(distance_angstrom: float) -> int:
     return max(1, int(math.ceil(distance_angstrom / 3.8)))
 
 
+def display_dependency_alert(
+    tool_name: str,
+    python_bin: str,
+    missing_modules: List[str],
+    suggested_env: str = "SE3nv"
+) -> str:
+    """Renders a high-visibility terminal alert box with actionable remediation commands."""
+    missing_str = ", ".join(missing_modules)
+    cli_flag = "--python_rfdiff" if "rfdiff" in tool_name.lower() else "--python_mpnn"
+    env_var = "PYTHON_RFDIFF" if "rfdiff" in tool_name.lower() else "PYTHON_MPNN"
+
+    alert = f"""
+====================================================================================================
+ 🛑 [AUTOSCAFFOLD ERROR]: MISSING NEURAL MODEL DEPENDENCIES IN RESOLVED PYTHON INTERPRETER
+====================================================================================================
+ Target Engine:      {tool_name}
+ Resolved Python:    {python_bin}
+ Missing Module(s):  {missing_str}
+
+ [REASON]
+   {tool_name} requires {missing_str}, which live in a dedicated Conda environment
+   (typically '{suggested_env}'). The resolved interpreter does not provide these modules.
+
+ [ACTIONABLE REMEDIATION - SELECT ONE OPTION]
+
+ Option 1: Activate the dedicated Conda environment before launching:
+   $ conda activate {suggested_env}
+   $ ./chimera_scaffold.sh ...
+
+ Option 2: Provide the explicit Python path via CLI flag:
+   $ ./chimera_scaffold.sh {cli_flag} /path/to/conda/envs/{suggested_env}/bin/python ...
+
+ Option 3: Configure persistent path in 'config.env':
+   Add the following line to config.env:
+   {env_var}=/path/to/conda/envs/{suggested_env}/bin/python
+
+ Option 4: Install the environment automatically if not yet created:
+   $ bash install.sh
+   or
+   $ autoscaffold install
+====================================================================================================
+"""
+    sys.stderr.write(alert + "\n")
+    sys.stderr.flush()
+    return alert
+
+
+def display_cuda_warning(python_bin: str, tool_name: str = "RFdiffusion") -> str:
+    """Renders a warning banner when PyTorch is executing on CPU without CUDA acceleration."""
+    banner = f"""
+╔════════════════════════════════════════════════════════════════════════════╗
+║ ⚠️  WARNING: NO GPU / CUDA ACCELERATION DETECTED FOR {tool_name.upper():<20} ║
+╠════════════════════════════════════════════════════════════════════════════╣
+║ PyTorch reports that CUDA is unavailable in:                              ║
+║   {python_bin:<73}║
+║                                                                            ║
+║ {tool_name} will execute on CPU. This will be 20x-50x slower than GPU.    ║
+║ Expected runtime: ~5-15 minutes per backbone model.                       ║
+╚════════════════════════════════════════════════════════════════════════════╝
+"""
+    sys.stderr.write(banner + "\n")
+    sys.stderr.flush()
+    return banner
+
+
+def probe_python_environment(
+    python_bin: str,
+    required_modules: Optional[List[str]] = None,
+    check_cuda: bool = True,
+    timeout_sec: float = 5.0,
+    raise_on_error: bool = False,
+    tool_name: str = "Neural Tool",
+    suggested_env: str = "SE3nv"
+) -> Dict[str, Any]:
+    """
+    Executes a fast probe subprocess using the target Python interpreter to verify
+    module availability, environment integrity, and hardware acceleration status.
+    Caches probe results in module-level _PROBE_CACHE to avoid redundant subprocess invocations.
+    """
+    req_modules = list(required_modules or [])
+    result: Dict[str, Any] = {
+        "missing_modules": [],
+        "cuda_available": False,
+        "torch_version": None,
+        "cuda_device_name": None
+    }
+
+    if not python_bin or not str(python_bin).strip():
+        result["missing_modules"] = req_modules
+        if raise_on_error and req_modules:
+            display_dependency_alert(tool_name, str(python_bin), req_modules, suggested_env)
+            raise EnvironmentError(f"Interpreter binary not specified for {tool_name}")
+        return result
+
+    real_bin = os.path.realpath(os.path.expanduser(os.path.expandvars(str(python_bin).strip())))
+    if not os.path.isfile(real_bin) or not (os.access(real_bin, os.X_OK) or sys.platform == "win32"):
+        result["missing_modules"] = req_modules
+        if raise_on_error and req_modules:
+            display_dependency_alert(tool_name, real_bin, req_modules, suggested_env)
+            raise EnvironmentError(f"Interpreter binary does not exist or is not an executable file: '{real_bin}'")
+        return result
+
+    # Check session probe cache for identical (real_bin, sorted(req_modules))
+    cache_key = (real_bin, tuple(sorted(req_modules)))
+    if cache_key in _PROBE_CACHE:
+        cached = _PROBE_CACHE[cache_key]
+        if not check_cuda or cached.get("_cuda_checked", False):
+            res_copy = {k: v for k, v in cached.items() if not k.startswith("_")}
+            if raise_on_error and res_copy["missing_modules"]:
+                display_dependency_alert(tool_name, real_bin, res_copy["missing_modules"], suggested_env)
+                raise EnvironmentError(
+                    f"{tool_name} Python interpreter '{real_bin}' lacks required modules: "
+                    f"{', '.join(res_copy['missing_modules'])}"
+                )
+            return res_copy
+
+    probe_code = (
+        "import sys, json\n"
+        "out = {'missing_modules': [], 'cuda_available': False, 'torch_version': None, 'cuda_device_name': None}\n"
+        f"reqs = {json.dumps(req_modules)}\n"
+        "for m in reqs:\n"
+        "    try:\n"
+        "        __import__(m)\n"
+        "    except Exception:\n"
+        "        out['missing_modules'].append(m)\n"
+        "if 'torch' not in out['missing_modules']:\n"
+        "    try:\n"
+        "        import torch\n"
+        "        out['torch_version'] = str(getattr(torch, '__version__', 'unknown'))\n"
+        f"        if {bool(check_cuda)}:\n"
+        "            out['cuda_available'] = bool(torch.cuda.is_available())\n"
+        "            if out['cuda_available'] and torch.cuda.device_count() > 0:\n"
+        "                out['cuda_device_name'] = str(torch.cuda.get_device_name(0))\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "print(json.dumps(out))\n"
+    )
+
+    effective_timeout = min(timeout_sec, 5.0) if timeout_sec > 0 else 5.0
+    try:
+        proc = subprocess.run(
+            [real_bin, "-c", probe_code],
+            capture_output=True,
+            text=True,
+            timeout=effective_timeout,
+            shell=False
+        )
+        if proc.returncode == 0 and proc.stdout:
+            lines = [ln.strip() for ln in proc.stdout.strip().splitlines() if ln.strip()]
+            parsed = None
+            for ln in reversed(lines):
+                if ln.startswith("{") and ln.endswith("}"):
+                    try:
+                        parsed = json.loads(ln)
+                        break
+                    except Exception:
+                        pass
+            if parsed and isinstance(parsed, dict):
+                result.update(parsed)
+            else:
+                result["missing_modules"] = req_modules
+        else:
+            result["missing_modules"] = req_modules
+    except Exception:
+        result["missing_modules"] = req_modules
+
+    # Store in session probe cache
+    cached_entry = dict(result)
+    cached_entry["_cuda_checked"] = bool(check_cuda)
+    _PROBE_CACHE[cache_key] = cached_entry
+
+    if raise_on_error and result["missing_modules"]:
+        display_dependency_alert(tool_name, real_bin, result["missing_modules"], suggested_env)
+        raise EnvironmentError(
+            f"{tool_name} Python interpreter '{real_bin}' lacks required modules: "
+            f"{', '.join(result['missing_modules'])}"
+        )
+
+    return result
+
+
+def resolve_python_interpreter(
+    explicit_binary: Optional[str] = None,
+    env_var_keys: Optional[List[str]] = None,
+    conda_env_names: Optional[List[str]] = None,
+    required_modules: Optional[List[str]] = None,
+    tool_label: str = "Neural Tool"
+) -> Tuple[str, bool]:
+    """
+    Resolves the appropriate Python interpreter binary for a neural modeling tool
+    following the 5-tier resolution hierarchy.
+
+    Precedence:
+    1. Explicit CLI argument (--python_rfdiff, --python_mpnn, etc.)
+    2. Environment variables (PYTHON_RFDIFF, RFDIFF_PYTHON, etc.)
+    3. Active Conda Prefix ($CONDA_PREFIX/bin/python)
+    4. Filesystem scan across common conda root directories
+    5. Host interpreter fallback (sys.executable)
+
+    Returns:
+        Tuple of (resolved_python_path, is_probed_valid)
+    """
+    req_mods = required_modules or []
+
+    def is_executable_binary(path: Optional[str]) -> bool:
+        if not path:
+            return False
+        expanded = os.path.realpath(os.path.expanduser(os.path.expandvars(str(path).strip())))
+        return os.path.isfile(expanded) and (os.access(expanded, os.X_OK) or sys.platform == "win32")
+
+    def probe_candidate(bin_path: str) -> bool:
+        if not req_mods:
+            return True
+        probe = probe_python_environment(bin_path, required_modules=req_mods, check_cuda=False, raise_on_error=False)
+        return len(probe.get("missing_modules", [])) == 0
+
+    seen_cands = set()
+
+    # Tier 1: Explicit CLI argument
+    if explicit_binary and str(explicit_binary).strip():
+        clean_exp = os.path.realpath(os.path.expanduser(os.path.expandvars(str(explicit_binary).strip())))
+        seen_cands.add(clean_exp)
+        if is_executable_binary(clean_exp):
+            is_valid = probe_candidate(clean_exp)
+            return (clean_exp, is_valid)
+        return (clean_exp, False)
+
+    # Tier 2: Environment variables
+    if env_var_keys:
+        for var in env_var_keys:
+            val = os.environ.get(var)
+            if val and str(val).strip():
+                clean_val = os.path.realpath(os.path.expanduser(os.path.expandvars(str(val).strip())))
+                if clean_val in seen_cands:
+                    continue
+                seen_cands.add(clean_val)
+                if is_executable_binary(clean_val):
+                    is_valid = probe_candidate(clean_val)
+                    return (clean_val, is_valid)
+
+    # Tier 3: Active Conda Prefix
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        for candidate in [
+            os.path.join(conda_prefix, "bin", "python"),
+            os.path.join(conda_prefix, "python.exe"),
+            os.path.join(conda_prefix, "Scripts", "python.exe"),
+        ]:
+            cand = os.path.realpath(candidate)
+            if cand in seen_cands:
+                continue
+            seen_cands.add(cand)
+            if is_executable_binary(cand):
+                if probe_candidate(cand):
+                    return (cand, True)
+
+    # Tier 4: Filesystem scan across common conda root directories
+    target_envs = conda_env_names or []
+    home_dir = os.path.expanduser("~")
+    local_envs_dir = os.environ.get("LOCAL_ENVS_DIR", os.path.join(SCRIPT_DIR, "..", "envs"))
+
+    conda_roots = [
+        local_envs_dir,
+        os.path.join(conda_prefix, "envs") if conda_prefix else "",
+        os.path.join(conda_prefix, "..", "envs") if conda_prefix else "",
+        os.path.join(home_dir, "miniconda3", "envs"),
+        os.path.join(home_dir, "miniforge3", "envs"),
+        os.path.join(home_dir, "mambaforge", "envs"),
+        os.path.join(home_dir, "anaconda3", "envs"),
+        os.path.join(home_dir, ".conda", "envs"),
+        "/opt/conda/envs",
+        "/usr/local/miniconda3/envs",
+        "/usr/local/anaconda3/envs",
+        # Windows standard roots
+        r"C:\miniconda3\envs",
+        r"C:\anaconda3\envs",
+        r"C:\ProgramData\miniconda3\envs",
+        r"C:\ProgramData\anaconda3\envs",
+    ]
+
+    for env_name in target_envs:
+        for root in conda_roots:
+            if not root or not os.path.isdir(root):
+                continue
+            for rel_sub in [
+                os.path.join(env_name, "bin", "python"),
+                os.path.join(env_name, "python.exe"),
+                os.path.join(env_name, "Scripts", "python.exe"),
+            ]:
+                cand = os.path.realpath(os.path.join(root, rel_sub))
+                if cand in seen_cands:
+                    continue
+                seen_cands.add(cand)
+                if os.path.isfile(cand) and is_executable_binary(cand):
+                    is_valid = probe_candidate(cand)
+                    if is_valid or not req_mods:
+                        return (cand, is_valid)
+
+    # Tier 5: Host interpreter fallback
+    host_python = os.path.realpath(sys.executable)
+    is_valid = probe_candidate(host_python)
+    return (host_python, is_valid)
+
+
+def resolve_neural_python(
+    explicit_path: Optional[str] = None,
+    env_var_names: Optional[List[str]] = None,
+    target_env_names: Optional[List[str]] = None,
+    required_modules: Optional[List[str]] = None,
+    tool_label: str = "Neural Tool"
+) -> Tuple[str, bool]:
+    """Alias for resolve_python_interpreter conforming to RFDIFF_ENV_SPEC.md."""
+    return resolve_python_interpreter(
+        explicit_binary=explicit_path,
+        env_var_keys=env_var_names,
+        conda_env_names=target_env_names,
+        required_modules=required_modules,
+        tool_label=tool_label
+    )
+
+
 class ChimeraScaffolder:
     """
     Production orchestrator for Chimera Scaffolding.
@@ -245,14 +583,24 @@ class ChimeraScaffolder:
         dry_run: bool = False,
         rfdiff_script: Optional[str] = None,
         mpnn_script: Optional[str] = None,
-        colabfold_cmd: Optional[str] = None
+        colabfold_cmd: Optional[str] = None,
+        python_rfdiff: Optional[str] = None,
+        python_mpnn: Optional[str] = None,
+        python_colabfold: Optional[str] = None
     ):
         self.input_file = os.path.realpath(input_file) if input_file else None
         self.donor_pdb = os.path.realpath(donor_pdb) if donor_pdb else None
         self.vessel_pdb = os.path.realpath(vessel_pdb) if vessel_pdb else None
-        for p_label, p_val in [("input_file", self.input_file), ("donor_pdb", self.donor_pdb), ("vessel_pdb", self.vessel_pdb)]:
-            if p_val and (p_val in ("/", "\\") or (len(p_val) <= 3 and p_val.endswith(":\\"))):
-                raise ValueError(f"Dangerous or root file specified for {p_label}: '{p_val}'")
+        path_checks = [
+            ("input_file", self.input_file),
+            ("donor_pdb", self.donor_pdb),
+            ("vessel_pdb", self.vessel_pdb)
+        ]
+        for p_label, p_val in path_checks:
+            if p_val:
+                p_drive, p_rest = os.path.splitdrive(p_val)
+                if (not p_drive and p_val.rstrip("/\\") == "") or (p_drive and p_rest in ("/", "\\", "")) or p_val in ("/", "\\", "//", "\\\\"):
+                    raise ValueError(f"Dangerous or root file specified for {p_label}: '{p_val}'")
 
         # Validate donor_id and vessel_id against directory traversal
         for id_label, id_val in [("donor_id", donor_id), ("vessel_id", vessel_id)]:
@@ -281,7 +629,34 @@ class ChimeraScaffolder:
         self.lock_vessel = lock_vessel
         self.clamp_linkers = clamp_linkers
         self.out_dir = validate_output_dir(out_dir)
+        if "outputs" in self.out_dir.lower():
+            self.out_dir = _RE_OUTPUTS_DEDUP_MID.sub(r'\1', self.out_dir)
         self.dry_run = dry_run
+
+        # Neural Python Resolvers
+        self.python_rfdiff, self.rfdiff_env_valid = resolve_python_interpreter(
+            explicit_binary=python_rfdiff,
+            env_var_keys=["PYTHON_RFDIFF", "RFDIFF_PYTHON"],
+            conda_env_names=["SE3nv", "rfdiffusion", "rf_diffusion", "se3nv"],
+            required_modules=["torch", "hydra"],
+            tool_label="RFdiffusion"
+        )
+
+        self.python_mpnn, self.mpnn_env_valid = resolve_python_interpreter(
+            explicit_binary=python_mpnn,
+            env_var_keys=["PYTHON_MPNN", "MPNN_PYTHON"],
+            conda_env_names=["mlfold", "SE3nv", "mpnn", "proteinmpnn"],
+            required_modules=["torch"],
+            tool_label="ProteinMPNN"
+        )
+
+        self.python_colabfold, self.colabfold_env_valid = resolve_python_interpreter(
+            explicit_binary=python_colabfold,
+            env_var_keys=["PYTHON_COLABFOLD", "COLABFOLD_PYTHON"],
+            conda_env_names=["colabfold", "colabfold_batch", "af2"],
+            required_modules=[],
+            tool_label="ColabFold"
+        )
 
         self.rfdiff_script = os.path.realpath(rfdiff_script) if rfdiff_script else None
         if not self.rfdiff_script:
@@ -355,7 +730,7 @@ class ChimeraScaffolder:
                     extracted = {}
                     from pse_pdb_extractor import write_atoms_to_pdb
                     for k, atoms in entities_atoms.items():
-                        safe_k = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(k).strip()) or "chain"
+                        safe_k = _RE_SANITIZE_IDENT.sub('_', str(k).strip()) or "chain"
                         out_path = safe_join_path(work_prep, f"{safe_k}.pdb")
                         if not os.path.exists(out_path):
                             write_atoms_to_pdb(atoms, out_path, buffer_size=65536)
@@ -433,7 +808,8 @@ class ChimeraScaffolder:
             raise ValueError(f"No valid atom/residue records in vessel structure: {self.working_vessel_pdb}")
 
         if len(d_objs) > 1:
-            # Donor structure is multi-chain (e.g. PyMOL selection containing residues from multiple subunits like HSPA + HSPB).
+            # Donor structure is multi-chain (e.g. PyMOL selection containing residues
+            # from multiple subunits like HSPA + HSPB).
             # Merge all donor chains into a unified single chain 'D' to preserve all residues from all subunits.
             merge_res = extract_and_merge_objects(
                 self.working_donor_pdb,
@@ -528,7 +904,7 @@ class ChimeraScaffolder:
                 if isinstance(item, (tuple, list)) and len(item) == 2:
                     intervals.append((int(item[0]), int(item[1])))
                 elif isinstance(item, str):
-                    m = re.match(r'^[A-Za-z]?(\d+)(?:\s*-\s*[A-Za-z]?(\d+))?$', item.strip())
+                    m = _RE_RESIDUE_RANGE.match(item.strip())
                     if m:
                         s = int(m.group(1))
                         e = int(m.group(2)) if m.group(2) is not None else s
@@ -541,7 +917,11 @@ class ChimeraScaffolder:
         return intervals
 
     @staticmethod
-    def slice_intervals(intervals: List[Tuple[int, int]], keep_min: Optional[int], keep_max: Optional[int]) -> List[Tuple[int, int]]:
+    def slice_intervals(
+        intervals: List[Tuple[int, int]],
+        keep_min: Optional[int],
+        keep_max: Optional[int]
+    ) -> List[Tuple[int, int]]:
         """
         Clips a list of (start, end) intervals to [keep_min, keep_max] (inclusive).
         Returns only the segments that fall within the bounds.
@@ -593,11 +973,14 @@ class ChimeraScaffolder:
         rec_str = f"{rec_min}-{rec_max}"
 
         if user_clean.lower() == "auto":
-            print(f"[+] Dynamic linker budgeting for {param_name} ({junction_label}): {rec_str} (measured gap: {distance_angstrom:.1f} Å)")
+            print(
+                f"[+] Dynamic linker budgeting for {param_name} ({junction_label}): "
+                f"{rec_str} (measured gap: {distance_angstrom:.1f} Å)"
+            )
             return rec_str
 
         # Parse user min and max
-        m = re.match(r'^(\d+)(?:-(\d+))?$', user_clean)
+        m = _RE_NUM_OR_SPAN.match(user_clean)
         if not m:
             return rec_str
 
@@ -620,6 +1003,14 @@ class ChimeraScaffolder:
             return f"{u_min}-{u_max}"
 
         return user_clean
+
+    @staticmethod
+    def _make_anchor(resi: int, chain: str, coord: np.ndarray) -> Dict[str, Any]:
+        return {
+            "resi": resi,
+            "chain": chain,
+            "coord": coord.tolist() if hasattr(coord, "tolist") else list(coord)
+        }
 
     def measure_junctions(self) -> Dict[str, Any]:
         """
@@ -647,7 +1038,7 @@ class ChimeraScaffolder:
                 rep_start = max(v_min + 5, mid - 10)
                 rep_end = min(v_max - 5, mid + 10)
             else:
-                rep_match = re.match(r'^[A-Za-z]?(\d+)\s*-\s*[A-Za-z]?(\d+)$', str(self.vessel_replace_range).strip())
+                rep_match = _RE_HYPHEN_RANGE.match(str(self.vessel_replace_range).strip())
                 if not rep_match:
                     raise ValueError(
                         f"Invalid vessel_replace_range: '{self.vessel_replace_range}'. "
@@ -676,8 +1067,8 @@ class ChimeraScaffolder:
                         "recommended_range": f"{r_min}-{r_max}",
                         "recommended_min": r_min,
                         "recommended_max": r_max,
-                        "vessel_anchor": {"resi": v_left_res, "chain": self.vessel_chain_id, "coord": v_left_coord.tolist()},
-                        "donor_anchor": {"resi": donor_n_res, "chain": self.donor_chain_id, "coord": donor_n_coord.tolist()}
+                        "vessel_anchor": self._make_anchor(v_left_res, self.vessel_chain_id, v_left_coord),
+                        "donor_anchor": self._make_anchor(donor_n_res, self.donor_chain_id, donor_n_coord)
                     }
 
             if right_segs:
@@ -695,8 +1086,8 @@ class ChimeraScaffolder:
                         "recommended_range": f"{r_min}-{r_max}",
                         "recommended_min": r_min,
                         "recommended_max": r_max,
-                        "donor_anchor": {"resi": donor_c_res, "chain": self.donor_chain_id, "coord": donor_c_coord.tolist()},
-                        "vessel_anchor": {"resi": v_right_res, "chain": self.vessel_chain_id, "coord": v_right_coord.tolist()}
+                        "donor_anchor": self._make_anchor(donor_c_res, self.donor_chain_id, donor_c_coord),
+                        "vessel_anchor": self._make_anchor(v_right_res, self.vessel_chain_id, v_right_coord)
                     }
 
         elif self.chimera_mode in ["insert_loop", "loop", "insert"]:
@@ -715,15 +1106,17 @@ class ChimeraScaffolder:
                     r_min, r_max = compute_recommended_linker(d_n)
                     junctions["n_term"] = {
                         "param": "linker_n",
-                        "description": f"N-terminal Junction (Vessel split res {v_left_res} -> Donor res {donor_n_res})",
+                        "description": (
+                            f"N-terminal Junction (Vessel split res {v_left_res} -> Donor res {donor_n_res})"
+                        ),
                         "distance_angstrom": round(d_n, 2),
                         "ext_min": compute_extension_minimum(d_n),
                         "glob_min": max(3, int(math.ceil(d_n / 3.0))),
                         "recommended_range": f"{r_min}-{r_max}",
                         "recommended_min": r_min,
                         "recommended_max": r_max,
-                        "vessel_anchor": {"resi": v_left_res, "chain": self.vessel_chain_id, "coord": v_left_coord.tolist()},
-                        "donor_anchor": {"resi": donor_n_res, "chain": self.donor_chain_id, "coord": donor_n_coord.tolist()}
+                        "vessel_anchor": self._make_anchor(v_left_res, self.vessel_chain_id, v_left_coord),
+                        "donor_anchor": self._make_anchor(donor_n_res, self.donor_chain_id, donor_n_coord)
                     }
 
             if right_segs:
@@ -741,8 +1134,8 @@ class ChimeraScaffolder:
                         "recommended_range": f"{r_min}-{r_max}",
                         "recommended_min": r_min,
                         "recommended_max": r_max,
-                        "donor_anchor": {"resi": donor_c_res, "chain": self.donor_chain_id, "coord": donor_c_coord.tolist()},
-                        "vessel_anchor": {"resi": v_right_res, "chain": self.vessel_chain_id, "coord": v_right_coord.tolist()}
+                        "donor_anchor": self._make_anchor(donor_c_res, self.donor_chain_id, donor_c_coord),
+                        "vessel_anchor": self._make_anchor(v_right_res, self.vessel_chain_id, v_right_coord)
                     }
 
         elif self.chimera_mode in ["ligate_nterm", "nterm"]:
@@ -753,15 +1146,17 @@ class ChimeraScaffolder:
                 r_min, r_max = compute_recommended_linker(d)
                 junctions["c_term"] = {
                     "param": "linker_c",
-                    "description": f"N-terminal Ligation (Donor C-term res {donor_c_res} -> Vessel N-term res {v_n_res})",
+                    "description": (
+                        f"N-terminal Ligation (Donor C-term res {donor_c_res} -> Vessel N-term res {v_n_res})"
+                    ),
                     "distance_angstrom": round(d, 2),
                     "ext_min": compute_extension_minimum(d),
                     "glob_min": max(3, int(math.ceil(d / 3.0))),
                     "recommended_range": f"{r_min}-{r_max}",
                     "recommended_min": r_min,
                     "recommended_max": r_max,
-                    "donor_anchor": {"resi": donor_c_res, "chain": self.donor_chain_id, "coord": donor_c_coord.tolist()},
-                    "vessel_anchor": {"resi": v_n_res, "chain": self.vessel_chain_id, "coord": v_n_coord.tolist()}
+                    "donor_anchor": self._make_anchor(donor_c_res, self.donor_chain_id, donor_c_coord),
+                    "vessel_anchor": self._make_anchor(v_n_res, self.vessel_chain_id, v_n_coord)
                 }
 
         elif self.chimera_mode in ["ligate_cterm", "cterm"]:
@@ -772,15 +1167,17 @@ class ChimeraScaffolder:
                 r_min, r_max = compute_recommended_linker(d)
                 junctions["n_term"] = {
                     "param": "linker_n",
-                    "description": f"C-terminal Ligation (Vessel C-term res {v_c_res} -> Donor N-term res {donor_n_res})",
+                    "description": (
+                        f"C-terminal Ligation (Vessel C-term res {v_c_res} -> Donor N-term res {donor_n_res})"
+                    ),
                     "distance_angstrom": round(d, 2),
                     "ext_min": compute_extension_minimum(d),
                     "glob_min": max(3, int(math.ceil(d / 3.0))),
                     "recommended_range": f"{r_min}-{r_max}",
                     "recommended_min": r_min,
                     "recommended_max": r_max,
-                    "vessel_anchor": {"resi": v_c_res, "chain": self.vessel_chain_id, "coord": v_c_coord.tolist()},
-                    "donor_anchor": {"resi": donor_n_res, "chain": self.donor_chain_id, "coord": donor_n_coord.tolist()}
+                    "vessel_anchor": self._make_anchor(v_c_res, self.vessel_chain_id, v_c_coord),
+                    "donor_anchor": self._make_anchor(donor_n_res, self.donor_chain_id, donor_n_coord)
                 }
 
         # Measure internal gaps between consecutive donor segments
@@ -817,7 +1214,10 @@ class ChimeraScaffolder:
                     "ext_min": l_ext,
                     "glob_min": l_glob,
                     "recommended_range": rec_range,
-                    "description": f"Internal Bridge {k + 1} (Segment S{k + 1} res {seg_k_end} -> Segment S{k + 2} res {seg_next_start})"
+                    "description": (
+                        f"Internal Bridge {k + 1} (Segment S{k + 1} res {seg_k_end} "
+                        f"-> Segment S{k + 2} res {seg_next_start})"
+                    )
                 })
 
         donor_segments_breakdown: List[Dict[str, Any]] = []
@@ -864,8 +1264,11 @@ class ChimeraScaffolder:
 
         # Validate linker specifications initially
         for lname, lval in [("linker_n", self.linker_n), ("linker_c", self.linker_c)]:
-            if not re.match(r'^(auto|\d+(-\d+)?)$', str(lval).strip(), re.IGNORECASE):
-                raise ValueError(f"Invalid format for {lname}: '{lval}'. Expected format: 'auto', 'LEN', or 'MIN-MAX' (e.g. '6-10').")
+            if not _RE_LINKER_VAL.match(str(lval).strip()):
+                raise ValueError(
+                    f"Invalid format for {lname}: '{lval}'. "
+                    "Expected format: 'auto', 'LEN', or 'MIN-MAX' (e.g. '6-10')."
+                )
 
         # Measure junctions for distances and clamping
         measure_info = self.measure_junctions()
@@ -874,27 +1277,43 @@ class ChimeraScaffolder:
         if self.clamp_linkers:
             if "n_term" in junctions and junctions["n_term"].get("param") == "linker_n":
                 j = junctions["n_term"]
-                self.linker_n = self.check_and_clamp_linker(self.linker_n, "linker_n", j["distance_angstrom"], j["description"])
+                self.linker_n = self.check_and_clamp_linker(
+                    self.linker_n, "linker_n", j["distance_angstrom"], j["description"]
+                )
             elif "c_term" in junctions and junctions["c_term"].get("param") == "linker_n":
                 j = junctions["c_term"]
-                self.linker_n = self.check_and_clamp_linker(self.linker_n, "linker_n", j["distance_angstrom"], j["description"])
+                self.linker_n = self.check_and_clamp_linker(
+                    self.linker_n, "linker_n", j["distance_angstrom"], j["description"]
+                )
             elif str(self.linker_n).strip().lower() == "auto":
                 self.linker_n = "6-10"
 
             if "c_term" in junctions and junctions["c_term"].get("param") == "linker_c":
                 j = junctions["c_term"]
-                self.linker_c = self.check_and_clamp_linker(self.linker_c, "linker_c", j["distance_angstrom"], j["description"])
+                self.linker_c = self.check_and_clamp_linker(
+                    self.linker_c, "linker_c", j["distance_angstrom"], j["description"]
+                )
             elif "n_term" in junctions and junctions["n_term"].get("param") == "linker_c":
                 j = junctions["n_term"]
-                self.linker_c = self.check_and_clamp_linker(self.linker_c, "linker_c", j["distance_angstrom"], j["description"])
+                self.linker_c = self.check_and_clamp_linker(
+                    self.linker_c, "linker_c", j["distance_angstrom"], j["description"]
+                )
             elif str(self.linker_c).strip().lower() == "auto":
                 self.linker_c = "6-10"
         else:
             if str(self.linker_n).strip().lower() == "auto":
-                j = junctions.get("n_term", {}) if junctions.get("n_term", {}).get("param") == "linker_n" else junctions.get("c_term", {})
+                j = (
+                    junctions.get("n_term", {})
+                    if junctions.get("n_term", {}).get("param") == "linker_n"
+                    else junctions.get("c_term", {})
+                )
                 self.linker_n = j.get("recommended_range", "6-10")
             if str(self.linker_c).strip().lower() == "auto":
-                j = junctions.get("c_term", {}) if junctions.get("c_term", {}).get("param") == "linker_c" else junctions.get("n_term", {})
+                j = (
+                    junctions.get("c_term", {})
+                    if junctions.get("c_term", {}).get("param") == "linker_c"
+                    else junctions.get("n_term", {})
+                )
                 self.linker_c = j.get("recommended_range", "6-10")
 
         # Donor chain label in seed PDB will be 'D', Vessel will be 'V'
@@ -937,7 +1356,7 @@ class ChimeraScaffolder:
                 rep_start = max(v_min + 5, mid - 10)
                 rep_end = min(v_max - 5, mid + 10)
             else:
-                rep_match = re.match(r'^[A-Za-z]?(\d+)\s*-\s*[A-Za-z]?(\d+)$', str(self.vessel_replace_range).strip())
+                rep_match = _RE_HYPHEN_RANGE.match(str(self.vessel_replace_range).strip())
                 if not rep_match:
                     raise ValueError(
                         f"Invalid vessel_replace_range: '{self.vessel_replace_range}'. "
@@ -998,7 +1417,10 @@ class ChimeraScaffolder:
             self.contig_string = "/".join(contig_pieces)
 
         else:
-            raise ValueError(f"Unknown chimera_mode: '{self.chimera_mode}'. Must be replace, ligate_nterm, ligate_cterm, or insert_loop.")
+            raise ValueError(
+                f"Unknown chimera_mode: '{self.chimera_mode}'. "
+                "Must be replace, ligate_nterm, ligate_cterm, or insert_loop."
+            )
 
         self.preserved_vessel_segments = vessel_segments
         return self.contig_string, self.preserved_donor_segments, self.preserved_vessel_segments
@@ -1128,10 +1550,18 @@ class ChimeraScaffolder:
                 main_chain = chain_keys[0]
 
             donor_ca_coords, _ = extract_coordinates(
-                self.working_donor_pdb, chain_id=self.donor_chain_id, residue_list=ref_donor_res, atom_names=["CA"], extract_meta=False
+                self.working_donor_pdb,
+                chain_id=self.donor_chain_id,
+                residue_list=ref_donor_res,
+                atom_names=["CA"],
+                extract_meta=False
             )
             vessel_ca_coords, _ = extract_coordinates(
-                self.working_vessel_pdb, chain_id=self.vessel_chain_id, residue_list=ref_vessel_res, atom_names=["CA"], extract_meta=False
+                self.working_vessel_pdb,
+                chain_id=self.vessel_chain_id,
+                residue_list=ref_vessel_res,
+                atom_names=["CA"],
+                extract_meta=False
             )
 
             # Map donor residues by fast KDTree (< 0.20 Å for pinned coordinates) or vectorized search
@@ -1184,8 +1614,14 @@ class ChimeraScaffolder:
         if not donor_fixed:
             donor_fixed = []
             vessel_fixed = []
-            v_left_len = sum(e - s + 1 for s, e in self.preserved_vessel_segments[:1]) if self.preserved_vessel_segments else 0
-            v_right_len = sum(e - s + 1 for s, e in self.preserved_vessel_segments[1:]) if len(self.preserved_vessel_segments) > 1 else 0
+            v_left_len = (
+                sum(e - s + 1 for s, e in self.preserved_vessel_segments[:1])
+                if self.preserved_vessel_segments else 0
+            )
+            v_right_len = (
+                sum(e - s + 1 for s, e in self.preserved_vessel_segments[1:])
+                if len(self.preserved_vessel_segments) > 1 else 0
+            )
             num_donor_res = sum(e - s + 1 for s, e in self.preserved_donor_segments)
             num_int_linkers = max(0, len(self.preserved_donor_segments) - 1)
             est_int_len = 6
@@ -1279,8 +1715,21 @@ class ChimeraScaffolder:
             cpf.write(f"Preserved Vessel Segments: {self.preserved_vessel_segments}\n")
         summary_data["contig_plan"] = contig_plan_path
 
+        # Pre-flight environment probe for RFdiffusion
+        if not self.dry_run:
+            probe_res = probe_python_environment(
+                self.python_rfdiff,
+                required_modules=["torch", "hydra"],
+                check_cuda=True,
+                raise_on_error=True,
+                tool_name="RFdiffusion",
+                suggested_env="SE3nv"
+            )
+            if not probe_res.get("cuda_available", False):
+                display_cuda_warning(self.python_rfdiff, tool_name="RFdiffusion")
+
         rfdiff_cmd = [
-            sys.executable,
+            self.python_rfdiff,
             self.rfdiff_script or "scripts/run_inference.py",
             f"inference.output_prefix={os.path.join(work_rfdiff, 'chimera_design')}",
             f"inference.input_pdb={self.seed_pdb_path}",
@@ -1312,7 +1761,8 @@ class ChimeraScaffolder:
             # Create synthetic/mock backbone placeholder in dry_run or fallback
             # RFdiffusion outputs single-chain designs (usually Chain A) with contiguous residues
             mock_bb = safe_join_path(work_rfdiff, "chimera_design_0.pdb")
-            with open(self.seed_pdb_path, "r", encoding="utf-8", buffering=65536) as sf, open(mock_bb, "w", encoding="utf-8", buffering=65536) as mf:
+            with open(self.seed_pdb_path, "r", encoding="utf-8", buffering=65536) as sf, \
+                 open(mock_bb, "w", encoding="utf-8", buffering=65536) as mf:
                 curr_resi = 0
                 prev_orig_resi = None
                 prev_orig_ch = None
@@ -1333,17 +1783,27 @@ class ChimeraScaffolder:
             generated_backbones.append(mock_bb)
 
         # Step 3: ProteinMPNN sequence design & masking
+        if not self.dry_run and self.mpnn_script and os.path.isfile(self.mpnn_script):
+            probe_python_environment(
+                self.python_mpnn,
+                required_modules=["torch"],
+                check_cuda=False,
+                raise_on_error=True,
+                tool_name="ProteinMPNN",
+                suggested_env="mlfold"
+            )
+
         mpnn_results = []
         for bb in generated_backbones:
             bb_name = os.path.splitext(os.path.basename(bb))[0]
-            safe_bb_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', bb_name) or "backbone"
+            safe_bb_name = _RE_SANITIZE_IDENT.sub('_', bb_name) or "backbone"
             fixed_map = self.map_fixed_positions_for_mpnn(bb)
             donor_fixed_matched = getattr(self, "last_donor_fixed", [])
             jsonl_path = safe_join_path(work_mpnn, f"{safe_bb_name}_fixed_positions.jsonl")
             make_fixed_positions_dict(bb_name, fixed_map, out_jsonl=jsonl_path)
 
             mpnn_cmd = [
-                sys.executable,
+                self.python_mpnn,
                 self.mpnn_script or "protein_mpnn_run.py",
                 "--pdb_path", bb,
                 "--fixed_positions_jsonl", jsonl_path,
@@ -1370,6 +1830,8 @@ class ChimeraScaffolder:
 
             mpnn_results.append(cand_info)
 
+        summary_data["candidates"] = mpnn_results
+
         # Step 4: Verification & RMSD calculation
         # Compare donor motif in seed against native donor structure
         metrics_rows = []
@@ -1380,7 +1842,7 @@ class ChimeraScaffolder:
         for cand in mpnn_results:
             bb_path = cand["backbone"]
             bb_base = os.path.splitext(os.path.basename(bb_path))[0]
-            safe_bb_base = re.sub(r'[^a-zA-Z0-9_\-]', '_', bb_base) or "model"
+            safe_bb_base = _RE_SANITIZE_IDENT.sub('_', bb_base) or "model"
 
             # Calculate Kabsch RMSD between donor structure and chimera model
             try:
@@ -1621,6 +2083,18 @@ def main() -> None:
     )
     parser.add_argument("--rfdiff_script", help="Path to RFdiffusion run_inference.py")
     parser.add_argument("--mpnn_script", help="Path to ProteinMPNN protein_mpnn_run.py")
+    parser.add_argument(
+        "--python_rfdiff",
+        help="Path to Python interpreter binary for RFdiffusion (e.g. ~/miniconda3/envs/SE3nv/bin/python)"
+    )
+    parser.add_argument(
+        "--python_mpnn",
+        help="Path to Python interpreter binary for ProteinMPNN (e.g. ~/miniconda3/envs/mlfold/bin/python)"
+    )
+    parser.add_argument(
+        "--python_colabfold",
+        help="Path to Python interpreter binary or CLI for ColabFold"
+    )
     parser.add_argument("--out_dir", "-o", default="outputs/chimera_scaffold", help="Output directory")
     parser.add_argument(
         "--dry_run", action="store_true",
@@ -1651,6 +2125,9 @@ def main() -> None:
         plddt_threshold=args.plddt_threshold,
         rfdiff_script=args.rfdiff_script,
         mpnn_script=args.mpnn_script,
+        python_rfdiff=args.python_rfdiff,
+        python_mpnn=args.python_mpnn,
+        python_colabfold=args.python_colabfold,
         out_dir=args.out_dir,
         dry_run=args.dry_run
     )

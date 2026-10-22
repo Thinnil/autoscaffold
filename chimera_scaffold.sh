@@ -89,6 +89,51 @@ fast_realpath() {
     fi
 }
 
+# De-duplicate accidental nested 'outputs/outputs' in paths and anchor default relative output
+canonicalize_out_dir() {
+    local raw="$1"
+    local repo_root="$2"
+    local resolved=""
+
+    if [ -z "$raw" ]; then
+        echo "$repo_root/outputs/chimera_scaffold"
+        return
+    fi
+
+    # If user passed default or relative path while already inside an 'outputs' directory
+    if [[ "$PWD" =~ [/\\]outputs$ ]] && [[ "$raw" =~ ^outputs[/\\] ]]; then
+        raw="${raw#outputs/}"
+        raw="${raw#outputs\\}"
+    fi
+
+    # If relative, anchor default pattern to repo root if matched, else resolve via fast_realpath
+    if [[ ! "$raw" =~ ^/ && ! "$raw" =~ ^[a-zA-Z]:[\\/] ]]; then
+        if [ "$raw" = "outputs/chimera_scaffold" ] || [ "$raw" = "outputs" ]; then
+            resolved="$repo_root/$raw"
+        else
+            resolved="$(fast_realpath "$raw")"
+        fi
+    else
+        resolved="$(fast_realpath "$raw")"
+    fi
+
+    # Collapse any accidental duplicated '/outputs/outputs/'
+    while [[ "$resolved" =~ /outputs/outputs/ ]]; do
+        resolved="${resolved//\/outputs\/outputs\//\/outputs\/}"
+    done
+    while [[ "$resolved" =~ \\outputs\\outputs\\ ]]; do
+        resolved="${resolved//\\outputs\\outputs\\/\\outputs\\}"
+    done
+    while [[ "$resolved" =~ /outputs/outputs$ ]]; do
+        resolved="${resolved%/outputs}"
+    done
+    while [[ "$resolved" =~ \\outputs\\outputs$ ]]; do
+        resolved="${resolved%\\outputs}"
+    done
+
+    echo "$resolved"
+}
+
 echo -e "${CYAN}======================================================================${NC}"
 echo -e "${CYAN} 🧬 AUTOSCAFFOLD: CHIMERA SCAFFOLDING WIZARD 🧬                         ${NC}"
 echo -e "${CYAN} Graft & Ligate Active Motifs into Host Proteins (PDB or PyMOL .pse)  ${NC}"
@@ -116,6 +161,8 @@ MPNN_BATCH_SIZE="1"
 RMSD_THRESHOLD="1.0"
 PLDDT_THRESHOLD="75.0"
 OUT_DIR="outputs/chimera_scaffold"
+PYTHON_RFDIFF="${PYTHON_RFDIFF:-}"
+PYTHON_MPNN="${PYTHON_MPNN:-}"
 DRY_RUN=""
 LOCK_VESSEL_FLAG=""
 BACKGROUND_MODE=false
@@ -148,6 +195,8 @@ while [[ $# -gt 0 ]]; do
             echo -e "  --mpnn_batch_size N     ProteinMPNN parallel GPU batch size [Default: 1]"
             echo -e "  --rmsd_threshold VAL    Kabsch RMSD cutoff in Å [Default: 1.0]"
             echo -e "  --plddt_threshold VAL   pLDDT quality cutoff [Default: 75.0]"
+            echo -e "  --python_rfdiff PATH    Python interpreter for RFdiffusion"
+            echo -e "  --python_mpnn PATH      Python interpreter for ProteinMPNN"
             echo -e "  --out_dir DIR           Output directory [Default: outputs/chimera_scaffold]"
             echo -e "  --dry_run               Execute pipeline without GPU inference"
             echo -e "  --background, -b        Run pipeline detached in background via nohup"
@@ -227,6 +276,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --out_dir|-o)
             OUT_DIR="$2"
+            shift 2
+            ;;
+        --python_rfdiff)
+            PYTHON_RFDIFF="$2"
+            shift 2
+            ;;
+        --python_mpnn)
+            PYTHON_MPNN="$2"
             shift 2
             ;;
         --lock_vessel)
@@ -545,7 +602,7 @@ except Exception:
     OUT_DIR=${INP_OD:-$OUT_DIR}
 fi
 
-ABS_OUT_DIR="$(fast_realpath "$OUT_DIR")"
+ABS_OUT_DIR="$(canonicalize_out_dir "$OUT_DIR" "$SCRIPT_DIR")"
 if [ -z "$ABS_OUT_DIR" ] || [ "$ABS_OUT_DIR" = "/" ] || [ "$ABS_OUT_DIR" = "\\" ] || [[ "$ABS_OUT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
     echo -e "${RED}[ERROR] Invalid or dangerous output directory specified: '$OUT_DIR'.${NC}"
     exit 1
@@ -561,6 +618,17 @@ mkdir -p "$ABS_OUT_DIR"
 
 PID_FILE="$ABS_OUT_DIR/run.pid"
 LOG_FILE="$ABS_OUT_DIR/run.log"
+
+# Resolve neural model Python binaries if not explicitly configured
+if [ -z "$PYTHON_RFDIFF" ] || [ ! -x "$PYTHON_RFDIFF" ]; then
+    PYTHON_RFDIFF="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" 2>/dev/null || true)"
+    [ -z "$PYTHON_RFDIFF" ] && PYTHON_RFDIFF="$(discover_conda_python "rfdiffusion" 2>/dev/null || true)"
+fi
+
+if [ -z "$PYTHON_MPNN" ] || [ ! -x "$PYTHON_MPNN" ]; then
+    PYTHON_MPNN="$(discover_conda_python "${CONDA_ENV_MPNN:-mlfold}" 2>/dev/null || true)"
+    [ -z "$PYTHON_MPNN" ] && PYTHON_MPNN="$(discover_conda_python "SE3nv" 2>/dev/null || true)"
+fi
 
 # ------------------------------------------------------------------------------
 # 3.5 Background Execution Option
@@ -592,8 +660,16 @@ if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ]; then
             [ -n "$VESSEL_SPLIT_AFTER" ] && BG_ARGS+=("--split_after" "$VESSEL_SPLIT_AFTER")
             [ -n "$DRY_RUN" ] && BG_ARGS+=("$DRY_RUN")
             [ -n "$LOCK_VESSEL_FLAG" ] && BG_ARGS+=("$LOCK_VESSEL_FLAG")
+            [ -n "$PYTHON_RFDIFF" ] && BG_ARGS+=("--python_rfdiff" "$PYTHON_RFDIFF")
+            [ -n "$PYTHON_MPNN" ] && BG_ARGS+=("--python_mpnn" "$PYTHON_MPNN")
         else
             BG_ARGS=("${ORIG_ARGS[@]}")
+            if [[ ! " ${ORIG_ARGS[*]} " =~ " --python_rfdiff " ]] && [ -n "$PYTHON_RFDIFF" ]; then
+                BG_ARGS+=("--python_rfdiff" "$PYTHON_RFDIFF")
+            fi
+            if [[ ! " ${ORIG_ARGS[*]} " =~ " --python_mpnn " ]] && [ -n "$PYTHON_MPNN" ]; then
+                BG_ARGS+=("--python_mpnn" "$PYTHON_MPNN")
+            fi
         fi
         nohup bash "$SCRIPT_DIR/chimera_scaffold.sh" "${BG_ARGS[@]}" --background < /dev/null > "$LOG_FILE" 2>&1 &
         BG_PID=$!
@@ -630,6 +706,14 @@ CMD_ARGS=(
     "--plddt_threshold" "$PLDDT_THRESHOLD"
     "--out_dir" "$ABS_OUT_DIR"
 )
+
+if [ -n "$PYTHON_RFDIFF" ]; then
+    CMD_ARGS+=("--python_rfdiff" "$PYTHON_RFDIFF")
+fi
+
+if [ -n "$PYTHON_MPNN" ]; then
+    CMD_ARGS+=("--python_mpnn" "$PYTHON_MPNN")
+fi
 
 if [ -n "$ABS_INPUT_FILE" ]; then
     CMD_ARGS+=("--input_file" "$ABS_INPUT_FILE")

@@ -18,7 +18,6 @@ from scripts.pse_pdb_extractor import (  # noqa: E402
     extract_pdb_chains,
     extract_and_merge_objects,
     extract_and_merge_donors,
-    SafeSessionUnpickler,
     safe_pickle_loads,
     safe_join_path,
     validate_output_dir,
@@ -35,8 +34,15 @@ from scripts.chimera_scaffold import (  # noqa: E402
     compute_recommended_linker,
     compute_extension_minimum,
     clear_ca_coords_cache,
+    clear_probe_cache,
     _CA_COORDS_CACHE,
-    _RESI_COORDS_CACHE
+    _RESI_COORDS_CACHE,
+    _PROBE_CACHE,
+    resolve_python_interpreter,
+    resolve_neural_python,
+    probe_python_environment,
+    display_dependency_alert,
+    display_cuda_warning
 )
 
 
@@ -808,7 +814,8 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         self.assertEqual(contig, "V1-39/8-12/D1-5/7-13/D10-15/8-12/V61-100")
 
     def test_fixed_positions_masking_multi_segment(self):
-        """Test ProteinMPNN fixed position masking across 3 donor segments, 2 internal linkers, and 2 external linkers."""
+        """Test ProteinMPNN fixed position masking across 3 donor segments,
+        2 internal linkers, and 2 external linkers."""
         donor_pdb = os.path.join(self.test_dir, "mask_donor.pdb")
         s1 = [(r, "ALA", [float(r), 0.0, 0.0]) for r in range(1, 6)]
         s2 = [(r, "ALA", [float(r) + 20.0, 0.0, 0.0]) for r in range(10, 15)]
@@ -947,6 +954,187 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
                 self.assertTrue(contig.startswith("V1-50/"))
                 self.assertTrue(contig.endswith("/V51-100"))
 
+    def test_resolve_python_interpreter_hierarchy(self):
+        """Verify 5-tier fallback hierarchy in resolve_python_interpreter and resolve_neural_python."""
+        # Tier 1: Explicit CLI binary takes precedence
+        explicit_bin = sys.executable
+        res_bin, valid = resolve_python_interpreter(
+            explicit_binary=explicit_bin,
+            env_var_keys=["NONEXISTENT_KEY_XYZ"],
+            conda_env_names=["nonexistent_env"],
+            required_modules=["sys", "os"]
+        )
+        self.assertEqual(res_bin, os.path.realpath(explicit_bin))
+        self.assertTrue(valid)
+
+        # Explicit non-existent path
+        bogus_path = os.path.join(self.test_dir, "nonexistent_python_binary")
+        res_bogus, bogus_valid = resolve_python_interpreter(
+            explicit_binary=bogus_path,
+            required_modules=[]
+        )
+        self.assertEqual(res_bogus, os.path.realpath(bogus_path))
+        self.assertFalse(bogus_valid)
+
+        # Tier 2: Environment variable override
+        test_var_name = "TEST_RFDIFF_PYTHON_VAR"
+        os.environ[test_var_name] = sys.executable
+        try:
+            res_env, valid_env = resolve_python_interpreter(
+                explicit_binary=None,
+                env_var_keys=[test_var_name],
+                conda_env_names=[],
+                required_modules=["sys"]
+            )
+            self.assertEqual(res_env, os.path.realpath(sys.executable))
+            self.assertTrue(valid_env)
+        finally:
+            os.environ.pop(test_var_name, None)
+
+        # Tier 5: Host interpreter fallback when no CLI or env vars provided
+        res_fallback, valid_fallback = resolve_neural_python(
+            explicit_path=None,
+            env_var_names=["NONEXISTENT_KEY_12345"],
+            target_env_names=["definitely_nonexistent_conda_env_999"],
+            required_modules=["sys"]
+        )
+        self.assertEqual(res_fallback, os.path.realpath(sys.executable))
+        self.assertTrue(valid_fallback)
+
+    def test_probe_python_environment(self):
+        """Verify module presence detection and fail-fast exception handling in probe_python_environment."""
+        # Standard library modules must succeed
+        res = probe_python_environment(
+            sys.executable,
+            required_modules=["sys", "os", "json"],
+            check_cuda=False,
+            raise_on_error=False
+        )
+        self.assertEqual(res["missing_modules"], [])
+
+        # Nonexistent module detection
+        res_missing = probe_python_environment(
+            sys.executable,
+            required_modules=["nonexistent_module_xyz_123456"],
+            check_cuda=False,
+            raise_on_error=False
+        )
+        self.assertIn("nonexistent_module_xyz_123456", res_missing["missing_modules"])
+
+        # raise_on_error=True must raise EnvironmentError with formatted alert
+        with self.assertRaises(EnvironmentError) as ctx:
+            probe_python_environment(
+                sys.executable,
+                required_modules=["nonexistent_module_xyz_123456"],
+                check_cuda=False,
+                raise_on_error=True,
+                tool_name="RFdiffusion",
+                suggested_env="SE3nv"
+            )
+        self.assertIn("nonexistent_module_xyz_123456", str(ctx.exception))
+
+    def test_probe_python_environment_caching(self):
+        """Verify probe_python_environment caches probe results in _PROBE_CACHE and avoids subprocess calls."""
+        clear_probe_cache()
+        real_bin = os.path.realpath(sys.executable)
+        req_mods = ["os", "sys"]
+        cache_key = (real_bin, tuple(sorted(req_mods)))
+
+        self.assertNotIn(cache_key, _PROBE_CACHE)
+
+        # First run populates cache
+        res1 = probe_python_environment(real_bin, required_modules=req_mods, check_cuda=False)
+        self.assertEqual(res1["missing_modules"], [])
+        self.assertIn(cache_key, _PROBE_CACHE)
+
+        # Second run hits cache without spawning a new subprocess
+        from unittest.mock import patch
+        with patch("subprocess.run") as mock_run:
+            res2 = probe_python_environment(real_bin, required_modules=req_mods, check_cuda=False)
+            mock_run.assert_not_called()
+            self.assertEqual(res2["missing_modules"], [])
+
+        # clear_probe_cache() empties _PROBE_CACHE
+        clear_probe_cache()
+        self.assertNotIn(cache_key, _PROBE_CACHE)
+
+    def test_path_deduplication_validate_output_dir(self):
+        """Verify lexical de-duplication of nested /outputs/outputs/ path segments."""
+        # Relative repeated outputs
+        p1 = validate_output_dir("outputs/outputs/chimera_scaffold")
+        self.assertNotIn("outputs/outputs", p1.replace("\\", "/"))
+
+        # Deep repeated outputs
+        p2 = validate_output_dir("outputs/outputs/outputs/run1")
+        self.assertNotIn("outputs/outputs", p2.replace("\\", "/"))
+
+        # Explicit absolute path with duplicate outputs
+        abs_repeated = os.path.join(self.test_dir, "outputs", "outputs", "design_1")
+        p3 = validate_output_dir(abs_repeated)
+        self.assertNotIn("outputs/outputs", p3.replace("\\", "/"))
+
+        # ChimeraScaffolder constructor normalization
+        scaffolder = ChimeraScaffolder(
+            donor_pdb=self.donor_pdb,
+            vessel_pdb=self.vessel_pdb,
+            motif_residues="30-40",
+            chimera_mode="replace",
+            vessel_replace_range="40-60",
+            out_dir=os.path.join(self.test_dir, "outputs", "outputs", "scaffold_run"),
+            dry_run=True
+        )
+        self.assertNotIn("outputs/outputs", scaffolder.out_dir.replace("\\", "/"))
+
+    def test_preflight_alert_formatting(self):
+        """Verify alert box rendering contains structured diagnostic and remediation text."""
+        alert = display_dependency_alert(
+            tool_name="RFdiffusion",
+            python_bin="/home/user/miniconda3/bin/python",
+            missing_modules=["torch", "hydra"],
+            suggested_env="SE3nv"
+        )
+        self.assertIn("[AUTOSCAFFOLD ERROR]", alert)
+        self.assertIn("RFdiffusion", alert)
+        self.assertIn("torch, hydra", alert)
+        self.assertIn("conda activate SE3nv", alert)
+        self.assertIn("--python_rfdiff", alert)
+        self.assertIn("PYTHON_RFDIFF", alert)
+
+        cuda_warn = display_cuda_warning(
+            python_bin="/home/user/miniconda3/envs/SE3nv/bin/python",
+            tool_name="RFdiffusion"
+        )
+        self.assertIn("NO GPU / CUDA ACCELERATION DETECTED", cuda_warn)
+        self.assertIn("RFdiffusion", cuda_warn)
+
+    def test_dry_run_with_custom_interpreters(self):
+        """Verify full dry run pipeline succeeds when passing custom neural python interpreters."""
+        out_scaffold = os.path.join(self.test_dir, "custom_interp_out")
+        scaffolder = ChimeraScaffolder(
+            donor_pdb=self.donor_pdb,
+            vessel_pdb=self.vessel_pdb,
+            motif_residues="30-40",
+            chimera_mode="replace",
+            vessel_replace_range="40-60",
+            linker_n="8-12",
+            linker_c="8-12",
+            clamp_linkers=False,
+            python_rfdiff=sys.executable,
+            python_mpnn=sys.executable,
+            out_dir=out_scaffold,
+            dry_run=True
+        )
+        self.assertEqual(scaffolder.python_rfdiff, os.path.realpath(sys.executable))
+        self.assertEqual(scaffolder.python_mpnn, os.path.realpath(sys.executable))
+
+        res = scaffolder.run_pipeline()
+        self.assertIn("rfdiffusion_command", res)
+        # Verify rfdiffusion_command starts with resolved python_rfdiff
+        self.assertEqual(res["rfdiffusion_command"][0], os.path.realpath(sys.executable))
+        self.assertTrue(len(res["candidates"]) > 0)
+        # Verify mpnn_command starts with resolved python_mpnn
+        self.assertEqual(res["candidates"][0]["mpnn_command"][0], os.path.realpath(sys.executable))
+
 
 class TestSecurityHardening(unittest.TestCase):
     def setUp(self):
@@ -1032,6 +1220,12 @@ class TestSecurityHardening(unittest.TestCase):
             validate_output_dir("C:\\")
 
         with self.assertRaises(ValueError):
+            validate_output_dir("C:")
+
+        with self.assertRaises(ValueError):
+            validate_output_dir("C:/")
+
+        with self.assertRaises(ValueError):
             validate_output_dir("/etc")
 
         with self.assertRaises(ValueError):
@@ -1041,6 +1235,14 @@ class TestSecurityHardening(unittest.TestCase):
         valid_dir = os.path.join(self.test_dir, "valid_output")
         res = validate_output_dir(valid_dir)
         self.assertEqual(res, os.path.realpath(os.path.abspath(valid_dir)))
+
+    def test_probe_python_environment_rejects_invalid_binary(self):
+        """Verify probe_python_environment safely rejects nonexistent or argument-injected binaries."""
+        res = probe_python_environment("nonexistent_python_binary_arg -c evil", required_modules=["torch"], raise_on_error=False)
+        self.assertEqual(res["missing_modules"], ["torch"])
+
+        with self.assertRaises(EnvironmentError):
+            probe_python_environment("invalid_python_binary_path --flag", required_modules=["torch"], raise_on_error=True)
 
     def test_chimera_scaffolder_rejects_path_traversal_ids(self):
         """Verify ChimeraScaffolder rejects donor_id and vessel_id with directory traversal characters."""

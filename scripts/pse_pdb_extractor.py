@@ -20,7 +20,6 @@ import gzip
 import zlib
 import pickle
 import json
-import math
 import argparse
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -84,6 +83,22 @@ def safe_pickle_loads(data: bytes, encoding: str = "latin1") -> Any:
     return SafeSessionUnpickler(io.BytesIO(data), encoding=encoding).load()
 
 
+# Pre-compiled regular expressions for path validation, deduplication, and identifier sanitization
+_RE_SANITIZE_FILENAME = re.compile(r'[^a-zA-Z0-9_\-\.]')
+_RE_SANITIZE_IDENT = re.compile(r'[^a-zA-Z0-9_\-]')
+_RE_COMMA_SPLIT = re.compile(r'[,]+')
+_RE_DRIVE_ROOT = re.compile(r'^[a-zA-Z]:[\\/]?$')
+_RE_DRIVE_PREFIX = re.compile(r'^[a-zA-Z]:')
+_RE_OUTPUTS_DEDUP_START = re.compile(r'(^|[/\\])outputs([/\\]outputs)+', re.IGNORECASE)
+_RE_OUTPUTS_DEDUP_MID = re.compile(r'([/\\]outputs)+([/\\]outputs)', re.IGNORECASE)
+
+_SYS_EXACT: Tuple[str, ...] = (
+    "/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/sys", "/proc",
+    "/windows", "/program files", "/program files (x86)", "/system32"
+)
+_SYS_PREFIXES: Tuple[str, ...] = tuple(s + "/" for s in _SYS_EXACT)
+
+
 def safe_join_path(base_dir: str, *paths: str) -> str:
     """
     Safely joins base_dir and relative paths, preventing directory traversal.
@@ -94,7 +109,7 @@ def safe_join_path(base_dir: str, *paths: str) -> str:
     clean_parts = []
     for p in paths:
         sanitized = os.path.basename(str(p).strip())
-        sanitized = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', sanitized)
+        sanitized = _RE_SANITIZE_FILENAME.sub('_', sanitized)
         if not sanitized or sanitized in ('.', '..'):
             sanitized = "unnamed"
         clean_parts.append(sanitized)
@@ -111,24 +126,44 @@ def safe_join_path(base_dir: str, *paths: str) -> str:
 def validate_output_dir(out_dir: str) -> str:
     """
     Validates that out_dir is non-empty, not root, and not a dangerous system directory.
+    De-duplicates accidental nested 'outputs/outputs' path segments using pre-compiled regexes.
     Returns canonical real path.
     """
     if not out_dir or not str(out_dir).strip():
         raise ValueError("Output directory cannot be empty.")
     raw_str = str(out_dir).strip()
-    real_out = os.path.realpath(os.path.abspath(raw_str))
-    if real_out in ("/", "\\") or (len(real_out) <= 3 and real_out.endswith(":\\")):
+
+    if _RE_DRIVE_ROOT.match(raw_str) or raw_str in ("/", "\\", "//", "\\\\"):
+        raise ValueError(f"Dangerous or root output directory specified: '{out_dir}'")
+
+    # Fast check: only execute regex deduplication if 'outputs' substring is present
+    if "outputs" in raw_str.lower():
+        dedup_str = _RE_OUTPUTS_DEDUP_START.sub(r'\1outputs', raw_str)
+        dedup_str = _RE_OUTPUTS_DEDUP_MID.sub(r'\1', dedup_str)
+    else:
+        dedup_str = raw_str
+
+    real_out = os.path.realpath(os.path.abspath(dedup_str))
+
+    # Also collapse any duplicate outputs segments resulting from abspath joining with PWD
+    if "outputs" in real_out.lower():
+        real_out = _RE_OUTPUTS_DEDUP_MID.sub(r'\1', real_out)
+        real_out = os.path.realpath(os.path.abspath(real_out))
+
+    # Bulletproof root check for POSIX (/), Windows drive roots (C:\, C:/, C:), UNC roots (\\, //)
+    drive, rest = os.path.splitdrive(real_out)
+    if (not drive and real_out.rstrip("/\\") == "") or (drive and rest in ("/", "\\", "")):
+        raise ValueError(f"Dangerous or root output directory specified: '{out_dir}'")
+    if real_out in ("/", "\\", "//", "\\\\") or (len(real_out) <= 3 and (real_out.endswith(":\\") or real_out.endswith(":/"))):
         raise ValueError(f"Dangerous or root output directory specified: '{out_dir}'")
 
     # Check normalized paths with forward slashes across POSIX and Windows drives
     norm_posix = real_out.replace("\\", "/").lower()
     raw_posix = raw_str.replace("\\", "/").lower()
-    drive_stripped = re.sub(r'^[a-zA-Z]:', '', norm_posix)
+    drive_stripped = _RE_DRIVE_PREFIX.sub('', norm_posix)
 
-    for sys_dir in ("/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/windows", "/program files"):
-        if (norm_posix == sys_dir or norm_posix.startswith(sys_dir + "/") or
-            drive_stripped == sys_dir or drive_stripped.startswith(sys_dir + "/") or
-            raw_posix == sys_dir or raw_posix.startswith(sys_dir + "/")):
+    for check_path in (norm_posix, drive_stripped, raw_posix):
+        if check_path in _SYS_EXACT or check_path.startswith(_SYS_PREFIXES):
             raise ValueError(f"Output directory cannot be in system directory: '{out_dir}'")
     return real_out
 
@@ -276,7 +311,7 @@ def extract_pdb_chains(pdb_path: str, out_dir: str, buffer_size: int = 65536) ->
     os.makedirs(out_dir, exist_ok=True)
 
     base_name = os.path.splitext(os.path.basename(pdb_path))[0]
-    base_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', base_name)
+    base_name = _RE_SANITIZE_IDENT.sub('_', base_name)
 
     chain_handles: Dict[str, Any] = {}
     extracted_files: Dict[str, str] = {}
@@ -287,7 +322,7 @@ def extract_pdb_chains(pdb_path: str, out_dir: str, buffer_size: int = 65536) ->
                 if line.startswith("ATOM  ") or line.startswith("HETATM"):
                     ch = line[21].strip() or "A"
                     if ch not in chain_handles:
-                        safe_ch = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(ch).strip()) or "A"
+                        safe_ch = _RE_SANITIZE_IDENT.sub('_', str(ch).strip()) or "A"
                         out_file = safe_join_path(out_dir, f"{base_name}_chain_{safe_ch}.pdb")
                         chain_handles[ch] = open(out_file, "w", encoding="utf-8", buffering=buffer_size)
                         extracted_files[ch] = out_file
@@ -342,7 +377,7 @@ def try_extract_pse_with_pymol(pse_path: str, out_dir: Optional[str] = None) -> 
             objects_data[obj] = mem_parsed
 
             if out_dir:
-                safe_obj = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(obj).strip()) or "obj"
+                safe_obj = _RE_SANITIZE_IDENT.sub('_', str(obj).strip()) or "obj"
                 out_path = safe_join_path(out_dir, f"{safe_obj}.pdb")
                 cmd.save(out_path, obj)
                 extracted_files[obj] = out_path
@@ -561,7 +596,11 @@ def parse_pse_standalone(pse_path: str) -> Dict[str, Any]:
                     resn = str(at[5]).strip()
                     atom_name = str(at[6]).strip()
                     resi_str = str(at[3]).strip()
-                    elem = str(at[7]).strip() if len(at) > 7 and isinstance(at[7], str) else (atom_name[0] if atom_name else "C")
+                    elem = (
+                        str(at[7]).strip()
+                        if len(at) > 7 and isinstance(at[7], str)
+                        else (atom_name[0] if atom_name else "C")
+                    )
                 else:
                     atom_name = str(at[1]).strip() if len(at) > 1 else "CA"
                     resn = str(at[2]).strip() if len(at) > 2 else "UNK"
@@ -683,7 +722,10 @@ def write_atoms_to_pdb(atoms: List[Dict[str, Any]], out_path: str, buffer_size: 
             x, y, z = a["x"], a["y"], a["z"]
             b_factor = a.get("b_factor", 20.0)
             elem = a.get("element", "C")[:2]
-            out.write(f"ATOM  {idx:>5} {atom_fmt} {resn:>3} {chain}{resi:>4}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00{b_factor:6.2f}          {elem:>2}\n")
+            out.write(
+                f"ATOM  {idx:>5} {atom_fmt} {resn:>3} {chain}{resi:>4}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00{b_factor:6.2f}          {elem:>2}\n"
+            )
         out.write("TER\nEND\n")
 
 
@@ -707,7 +749,7 @@ def extract_pse_objects(pse_path: str, out_dir: str) -> Dict[str, str]:
         atoms = obj_meta.get("_atoms", [])
         if not atoms:
             continue
-        safe_obj = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(obj_name).strip()) or "obj"
+        safe_obj = _RE_SANITIZE_IDENT.sub('_', str(obj_name).strip()) or "obj"
         out_file = safe_join_path(out_dir, f"{safe_obj}.pdb")
         write_atoms_to_pdb(atoms, out_file)
         extracted_files[obj_name] = out_file
@@ -738,7 +780,7 @@ def extract_and_merge_objects(
     # Parse target_ids into clean token list with path traversal validation
     tokens: List[str] = []
     if isinstance(target_ids, str):
-        for part in re.split(r'[,]+', target_ids.strip()):
+        for part in _RE_COMMA_SPLIT.split(target_ids.strip()):
             p = part.strip()
             if p:
                 if ".." in p or "/" in p or "\\" in p:
@@ -746,7 +788,7 @@ def extract_and_merge_objects(
                 tokens.append(p)
     elif isinstance(target_ids, (list, tuple)):
         for item in target_ids:
-            for part in re.split(r'[,]+', str(item).strip()):
+            for part in _RE_COMMA_SPLIT.split(str(item).strip()):
                 p = part.strip()
                 if p:
                     if ".." in p or "/" in p or "\\" in p:
@@ -788,7 +830,11 @@ def extract_and_merge_objects(
                         except ValueError:
                             continue
                         b_factor = float(line[60:66]) if len(line) >= 66 and line[60:66].strip() else 20.0
-                        elem = line[76:78].strip() if len(line) >= 78 and line[76:78].strip() else (atom_name[0] if atom_name else "C")
+                        elem = (
+                            line[76:78].strip()
+                            if len(line) >= 78 and line[76:78].strip()
+                            else (atom_name[0] if atom_name else "C")
+                        )
 
                         atom_dict = {
                             "atom_name": atom_name,
@@ -936,7 +982,7 @@ def extract_and_merge_objects(
             })
 
     # Write merged PDB with 64KB buffering
-    safe_prefix = re.sub(r'[^a-zA-Z0-9_\-]', '_', str(prefix).strip()) or "merged_donor"
+    safe_prefix = _RE_SANITIZE_IDENT.sub('_', str(prefix).strip()) or "merged_donor"
     out_merged_pdb = safe_join_path(out_dir, f"{safe_prefix}.pdb")
     write_atoms_to_pdb(all_merged_atoms, out_merged_pdb, buffer_size=buffer_size)
 
@@ -1025,7 +1071,9 @@ def extract_file(input_path: str, out_dir: str) -> Dict[str, str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Inspect and extract chains/objects from PDB or PyMOL session (.pse) files.")
+    parser = argparse.ArgumentParser(
+        description="Inspect and extract chains/objects from PDB or PyMOL session (.pse) files."
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Subcommand: inspect
@@ -1037,8 +1085,14 @@ def main() -> None:
     extract_parser = subparsers.add_parser("extract", help="Extract individual chains/objects to PDBs")
     extract_parser.add_argument("--input", "-i", required=True, help="Input PDB or PSE file")
     extract_parser.add_argument("--out_dir", "-d", required=True, help="Directory to save extracted PDB files")
-    extract_parser.add_argument("--target_ids", "-t", help="Comma-separated IDs/names/indices to extract and merge into a single donor PDB")
-    extract_parser.add_argument("--prefix", default="merged_donor", help="Prefix for merged output PDB [Default: merged_donor]")
+    extract_parser.add_argument(
+        "--target_ids", "-t",
+        help="Comma-separated IDs/names/indices to extract and merge into a single donor PDB"
+    )
+    extract_parser.add_argument(
+        "--prefix", default="merged_donor",
+        help="Prefix for merged output PDB [Default: merged_donor]"
+    )
 
     args = parser.parse_args()
 
@@ -1047,7 +1101,8 @@ def main() -> None:
         json_output = json.dumps(info, indent=2)
         if args.out_json:
             out_json_path = os.path.realpath(os.path.abspath(args.out_json))
-            if out_json_path in ("/", "\\") or (len(out_json_path) <= 3 and out_json_path.endswith(":\\")):
+            drive, rest = os.path.splitdrive(out_json_path)
+            if (not drive and out_json_path.rstrip("/\\") == "") or (drive and rest in ("/", "\\", "")) or out_json_path in ("/", "\\", "//", "\\\\"):
                 raise ValueError(f"Dangerous output JSON path: {out_json_path}")
             out_json_dir = os.path.dirname(out_json_path)
             if out_json_dir:
@@ -1057,9 +1112,7 @@ def main() -> None:
         print(json_output)
 
     elif args.command == "extract":
-        out_dir = os.path.realpath(os.path.abspath(args.out_dir))
-        if out_dir in ("/", "\\") or (len(out_dir) <= 3 and out_dir.endswith(":\\")):
-            raise ValueError(f"Dangerous output directory: {out_dir}")
+        out_dir = validate_output_dir(args.out_dir)
         os.makedirs(out_dir, exist_ok=True)
         if args.target_ids:
             merge_res = extract_and_merge_objects(args.input, args.target_ids, out_dir, prefix=args.prefix)

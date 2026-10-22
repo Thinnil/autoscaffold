@@ -159,3 +159,114 @@ run_in_env() {
     activate_env "$env_name"
     python "$@"
 }
+
+# Function to discover python executable for a target conda environment across standard roots
+discover_conda_python() {
+    local target_env="$1"
+    local candidate=""
+
+    [ -z "$target_env" ] && return 1
+
+    # 1. Early exit: Check if an environment variable is already exported for this env/tool
+    if [ "$target_env" = "SE3nv" ] || [ "$target_env" = "rfdiffusion" ]; then
+        if [ -n "${PYTHON_RFDIFF:-}" ] && [ -x "${PYTHON_RFDIFF:-}" ]; then
+            echo "$PYTHON_RFDIFF"
+            return 0
+        fi
+    elif [ "$target_env" = "mlfold" ]; then
+        if [ -n "${PYTHON_MPNN:-}" ] && [ -x "${PYTHON_MPNN:-}" ]; then
+            echo "$PYTHON_MPNN"
+            return 0
+        fi
+    fi
+
+    local upper_env
+    upper_env="$(echo "$target_env" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_')"
+    local env_var="PYTHON_${upper_env}"
+    if [ -n "${!env_var:-}" ] && [ -x "${!env_var:-}" ]; then
+        echo "${!env_var}"
+        return 0
+    fi
+
+    # 2. Early exit: Check if active conda environment matches
+    if [ -n "$CONDA_PREFIX" ]; then
+        if [ "$CONDA_DEFAULT_ENV" = "$target_env" ] || [ "${CONDA_PREFIX##*/}" = "$target_env" ]; then
+            if [ -x "$CONDA_PREFIX/bin/python" ]; then
+                echo "$CONDA_PREFIX/bin/python"
+                return 0
+            elif [ -x "$CONDA_PREFIX/python.exe" ]; then
+                echo "$CONDA_PREFIX/python.exe"
+                return 0
+            fi
+        fi
+    fi
+
+    # 3. Check local tools/envs directory
+    if [ -x "$LOCAL_ENVS_DIR/$target_env/bin/python" ]; then
+        echo "$LOCAL_ENVS_DIR/$target_env/bin/python"
+        return 0
+    elif [ -x "$LOCAL_ENVS_DIR/$target_env/python.exe" ]; then
+        echo "$LOCAL_ENVS_DIR/$target_env/python.exe"
+        return 0
+    fi
+
+    # 4. Check known base conda installations
+    for base_dir in \
+        "$CONDA_PREFIX/.." \
+        "$HOME/miniconda3" \
+        "$HOME/miniforge3" \
+        "$HOME/mambaforge" \
+        "$HOME/anaconda3" \
+        "$HOME/.conda" \
+        "/opt/conda" \
+        "/usr/local/miniconda3" \
+        "/usr/local/anaconda3"; do
+        if [ -d "$base_dir" ]; then
+            candidate="$base_dir/envs/$target_env/bin/python"
+            if [ -x "$candidate" ]; then
+                echo "$candidate"
+                return 0
+            elif [ -x "$base_dir/envs/$target_env/python.exe" ]; then
+                echo "$base_dir/envs/$target_env/python.exe"
+                return 0
+            fi
+        fi
+    done
+
+    # 5. Fallback: Query conda info directly only if conda binary exists
+    local conda_bin
+    conda_bin="$(find_conda_bin 2>/dev/null || true)"
+    if [ -n "$conda_bin" ] && [ -x "$conda_bin" ]; then
+        local env_path
+        env_path="$("$conda_bin" info --envs 2>/dev/null | awk -v env="$target_env" '$1 == env {print $NF}' | head -n 1)"
+        if [ -n "$env_path" ]; then
+            if [ -x "$env_path/bin/python" ]; then
+                echo "$env_path/bin/python"
+                return 0
+            elif [ -x "$env_path/python.exe" ]; then
+                echo "$env_path/python.exe"
+                return 0
+            fi
+        fi
+    fi
+
+    echo ""
+    return 0
+}
+
+# Resolve and export neural model Python binaries if not explicitly set
+if [ -z "$PYTHON_RFDIFF" ]; then
+    _DISCOVERED_RFDIFF="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" 2>/dev/null || true)"
+    [ -z "$_DISCOVERED_RFDIFF" ] && _DISCOVERED_RFDIFF="$(discover_conda_python "rfdiffusion" 2>/dev/null || true)"
+    if [ -n "$_DISCOVERED_RFDIFF" ]; then
+        export PYTHON_RFDIFF="$_DISCOVERED_RFDIFF"
+    fi
+fi
+
+if [ -z "$PYTHON_MPNN" ]; then
+    _DISCOVERED_MPNN="$(discover_conda_python "${CONDA_ENV_MPNN:-mlfold}" 2>/dev/null || true)"
+    [ -z "$_DISCOVERED_MPNN" ] && _DISCOVERED_MPNN="$(discover_conda_python "SE3nv" 2>/dev/null || true)"
+    if [ -n "$_DISCOVERED_MPNN" ]; then
+        export PYTHON_MPNN="$_DISCOVERED_MPNN"
+    fi
+fi
