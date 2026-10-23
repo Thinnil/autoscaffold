@@ -1825,6 +1825,43 @@ class TestPerformanceOptimizations(unittest.TestCase):
             self.assertIn("GLU", lines[2])
             self.assertIn("ARG", lines[3])
 
+        # Test sidechain reconstruction: CB addition and seed_pdb sidechain preservation
+        mock_bb_backbone = os.path.join(self.test_dir, "test_bb_full.pdb")
+        with open(mock_bb_backbone, "w", encoding="utf-8") as f:
+            # Res 1: linker (N, CA, C)
+            f.write("ATOM      1  N   ALA A   1       0.000   1.450   0.000  1.00 20.00           N\n")
+            f.write("ATOM      2  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\n")
+            f.write("ATOM      3  C   ALA A   1       1.500   0.000   0.000  1.00 20.00           C\n")
+            f.write("ATOM      4  O   ALA A   1       2.100   1.000   0.000  1.00 20.00           O\n")
+            # Res 2: preserved motif residue from seed
+            f.write("ATOM      5  N   TRP A   2       2.000  -1.200   0.000  1.00 20.00           N\n")
+            f.write("ATOM      6  CA  TRP A   2       3.400  -1.500   0.000  1.00 20.00           C\n")
+            f.write("ATOM      7  C   TRP A   2       4.200  -0.500   0.000  1.00 20.00           C\n")
+            f.write("ATOM      8  O   TRP A   2       3.800   0.600   0.000  1.00 20.00           O\n")
+
+        mock_seed = os.path.join(self.test_dir, "mock_seed.pdb")
+        with open(mock_seed, "w", encoding="utf-8") as f:
+            # Native sidechains for Res 2
+            f.write("ATOM      5  N   TRP A   2       2.000  -1.200   0.000  1.00 20.00           N\n")
+            f.write("ATOM      6  CA  TRP A   2       3.400  -1.500   0.000  1.00 20.00           C\n")
+            f.write("ATOM      7  CB  TRP A   2       3.600  -2.500   1.000  1.00 20.00           C\n")
+            f.write("ATOM      8  CG  TRP A   2       3.800  -2.200   2.400  1.00 20.00           C\n")
+            f.write("ATOM      9  CD1 TRP A   2       4.900  -1.600   2.900  1.00 20.00           C\n")
+            f.write("ATOM     10  NE1 TRP A   2       4.700  -1.500   4.200  1.00 20.00           N\n")
+
+        threaded_sc_pdb = os.path.join(self.test_dir, "threaded_sc.pdb")
+        res_sc = thread_sequence_onto_pdb(mock_bb_backbone, "KW", threaded_sc_pdb, seed_pdb=mock_seed)
+        self.assertTrue(res_sc)
+        with open(threaded_sc_pdb, "r", encoding="utf-8") as f:
+            sc_content = f.read()
+            # Res 1 (LYS) should have generated CB
+            self.assertIn("CB  LYS A   1", sc_content)
+            # Res 2 (TRP) should have transferred native sidechain atoms
+            self.assertIn("CB  TRP A   2", sc_content)
+            self.assertIn("CG  TRP A   2", sc_content)
+            self.assertIn("CD1 TRP A   2", sc_content)
+            self.assertIn("NE1 TRP A   2", sc_content)
+
     def test_methodology_reporter_prevents_circular_symlinks(self):
         """Verify methodology_reporter produces valid regular files and never circular symlinks."""
         from scripts.methodology_reporter import generate_methodology_report

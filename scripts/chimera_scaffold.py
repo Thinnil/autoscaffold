@@ -136,35 +136,132 @@ def extract_mpnn_sequences(fasta_path: str) -> List[Tuple[str, str]]:
     return records
 
 
-def thread_sequence_onto_pdb(backbone_pdb: str, sequence: str, out_pdb: str) -> bool:
+def compute_cb_coords(n_coord: np.ndarray, ca_coord: np.ndarray, c_coord: np.ndarray) -> np.ndarray:
+    """Computes exact C-beta coordinates using standard tetrahedral geometry (sp3)."""
+    b = n_coord - ca_coord
+    c = c_coord - ca_coord
+    norm_b = np.linalg.norm(b)
+    norm_c = np.linalg.norm(c)
+    if norm_b < 1e-6 or norm_c < 1e-6:
+        return ca_coord + np.array([1.53, 0.0, 0.0])
+    u = np.cross(b, c)
+    norm_u = np.linalg.norm(u)
+    if norm_u < 1e-6:
+        u = np.array([0.0, 0.0, 1.0])
+    else:
+        u = u / norm_u
+    v = (b / norm_b) + (c / norm_c)
+    norm_v = np.linalg.norm(v)
+    if norm_v < 1e-6:
+        v = np.array([1.0, 0.0, 0.0])
+    else:
+        v = v / norm_v
+    d = -0.577 * v + 0.816 * u
+    norm_d = np.linalg.norm(d)
+    if norm_d > 1e-6:
+        d = d / norm_d
+    return ca_coord + 1.53 * d
+
+
+def thread_sequence_onto_pdb(
+    backbone_pdb: str, sequence: str, out_pdb: str, seed_pdb: Optional[str] = None
+) -> bool:
     """
     Threads an amino acid sequence onto a 3D backbone PDB file by updating residue names
-    in ATOM lines while preserving exact tertiary coordinates (N, CA, C, O, CB).
+    in ATOM lines and reconstructing sidechain atoms (CB for linkers, full native sidechains
+    for preserved residues from seed_pdb).
     """
     if not os.path.isfile(backbone_pdb) or not sequence:
         return False
     clean_seq = sequence.strip().upper()
-    lines_out = []
+
+    seed_sidechains: Dict[Tuple[str, int], List[str]] = {}
+    if seed_pdb and os.path.isfile(seed_pdb):
+        with open(seed_pdb, "r", encoding="utf-8", errors="ignore") as sf:
+            for s_line in sf:
+                if s_line.startswith("ATOM  ") or s_line.startswith("HETATM"):
+                    atom_name = s_line[12:16].strip().upper()
+                    if atom_name not in ("N", "CA", "C", "O", "OXT"):
+                        try:
+                            s_resi = int(s_line[22:26])
+                        except ValueError:
+                            continue
+                        s_ch = s_line[21].strip() or "A"
+                        seed_sidechains.setdefault((s_ch, s_resi), []).append(s_line)
+
+    residue_blocks: List[List[str]] = []
     current_resi = None
-    seq_idx = -1
+    current_block: List[str] = []
+
     with open(backbone_pdb, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             if line.startswith("ATOM  ") or line.startswith("HETATM"):
                 try:
                     resi = int(line[22:26])
                 except ValueError:
-                    lines_out.append(line)
-                    continue
+                    resi = None
                 if resi != current_resi:
+                    if current_block:
+                        residue_blocks.append(current_block)
+                    current_block = [line]
                     current_resi = resi
-                    seq_idx += 1
-                if 0 <= seq_idx < len(clean_seq):
-                    aa_1 = clean_seq[seq_idx]
-                    aa_3 = ONE_TO_THREE.get(aa_1, "ALA")
-                    line = f"{line[:17]}{aa_3:>3}{line[20:]}"
-                lines_out.append(line)
-            else:
-                lines_out.append(line)
+                else:
+                    current_block.append(line)
+        if current_block:
+            residue_blocks.append(current_block)
+
+    lines_out: List[str] = []
+    atom_serial = 1
+
+    for seq_idx, block in enumerate(residue_blocks):
+        aa_1 = clean_seq[seq_idx] if seq_idx < len(clean_seq) else "A"
+        aa_3 = ONE_TO_THREE.get(aa_1, "ALA")
+
+        atom_coords: Dict[str, np.ndarray] = {}
+        block_ch = "A"
+        block_resi = seq_idx + 1
+
+        for line in block:
+            aname = line[12:16].strip().upper()
+            block_ch = line[21].strip() or "A"
+            try:
+                block_resi = int(line[22:26])
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+                atom_coords[aname] = np.array([x, y, z])
+            except (ValueError, IndexError):
+                pass
+
+        has_cb = False
+        for line in block:
+            aname = line[12:16].strip().upper()
+            if aname == "CB":
+                has_cb = True
+            mod_line = f"{line[:6]}{atom_serial:>5}{line[11:17]}{aa_3:>3}{line[20:]}"
+            lines_out.append(mod_line)
+            atom_serial += 1
+
+        native_sc = seed_sidechains.get((block_ch, block_resi), [])
+        if native_sc:
+            for sc_line in native_sc:
+                aname = sc_line[12:16].strip().upper()
+                if aname == "CB":
+                    has_cb = True
+                sc_mod = f"{sc_line[:6]}{atom_serial:>5}{sc_line[11:17]}{aa_3:>3}{sc_line[20:]}"
+                lines_out.append(sc_mod)
+                atom_serial += 1
+        elif not has_cb and aa_1 != "G" and "N" in atom_coords and "CA" in atom_coords and "C" in atom_coords:
+            cb_pos = compute_cb_coords(atom_coords["N"], atom_coords["CA"], atom_coords["C"])
+            cb_line = (
+                f"ATOM  {atom_serial:>5}  CB  {aa_3:>3} {block_ch}{block_resi:>4}    "
+                f"{cb_pos[0]:8.3f}{cb_pos[1]:8.3f}{cb_pos[2]:8.3f}  1.00 20.00           C\n"
+            )
+            lines_out.append(cb_line)
+            atom_serial += 1
+
+    lines_out.append("TER\nEND\n")
+
     with open(out_pdb, "w", encoding="utf-8", buffering=65536) as f:
         f.writelines(lines_out)
     return True
@@ -2520,7 +2617,7 @@ class ChimeraScaffolder:
             if des_seqs:
                 for s_idx, (hdr, seq) in enumerate(des_seqs, start=1):
                     th_pdb = safe_join_path(work_mpnn, f"{bb_name}_seq{s_idx}.pdb")
-                    if thread_sequence_onto_pdb(bb, seq, th_pdb):
+                    if thread_sequence_onto_pdb(bb, seq, th_pdb, seed_pdb=self.seed_pdb):
                         cand["threaded_pdbs"].append(th_pdb)
 
         summary_data["candidates"] = mpnn_results
