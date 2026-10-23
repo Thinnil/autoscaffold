@@ -136,31 +136,161 @@ def extract_mpnn_sequences(fasta_path: str) -> List[Tuple[str, str]]:
     return records
 
 
+def place_atom_nerf(
+    a: np.ndarray, b: np.ndarray, c: np.ndarray, bond_len: float, bond_angle_deg: float, torsion_deg: float
+) -> np.ndarray:
+    """
+    Places 4th atom D given 3 prior atoms A, B, C using the Natural Extension Reference Frame (NeRF).
+    """
+    theta = np.radians(bond_angle_deg)
+    phi = np.radians(torsion_deg)
+    d_local = np.array([
+        bond_len * np.cos(theta),
+        bond_len * np.sin(theta) * np.cos(phi),
+        bond_len * np.sin(theta) * np.sin(phi),
+    ])
+    bc = c - b
+    bc_norm = np.linalg.norm(bc)
+    bc_u = bc / bc_norm if bc_norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+    ab = b - a
+    n = np.cross(ab, bc_u)
+    n_norm = np.linalg.norm(n)
+    n_u = n / n_norm if n_norm > 1e-6 else np.array([0.0, 0.0, 1.0])
+    nbc = np.cross(n_u, bc_u)
+    m = np.column_stack([-bc_u, nbc, n_u])
+    return c + m.dot(d_local)
+
+
+def build_sidechain_atoms(
+    aa_1: str, n: np.ndarray, ca: np.ndarray, c: np.ndarray
+) -> List[Tuple[str, str, np.ndarray]]:
+    """
+    Generates complete 3D Cartesian coordinates for all sidechain heavy atoms
+    of any standard amino acid using idealized internal coordinates (NeRF).
+    Returns list of (atom_name, element, coord_array).
+    """
+    aa = aa_1.upper()
+    if aa == "G":
+        return []
+    cb = place_atom_nerf(n, c, ca, 1.53, 110.5, 122.5)
+    atoms = [("CB", "C", cb)]
+    if aa == "A":
+        return atoms
+    if aa == "V":
+        cg1 = place_atom_nerf(n, ca, cb, 1.53, 111.0, -60.0)
+        cg2 = place_atom_nerf(n, ca, cb, 1.53, 111.0, 60.0)
+        return atoms + [("CG1", "C", cg1), ("CG2", "C", cg2)]
+    if aa == "L":
+        cg = place_atom_nerf(n, ca, cb, 1.53, 111.0, -60.0)
+        cd1 = place_atom_nerf(ca, cb, cg, 1.53, 111.0, 180.0)
+        cd2 = place_atom_nerf(ca, cb, cg, 1.53, 111.0, 65.0)
+        return atoms + [("CG", "C", cg), ("CD1", "C", cd1), ("CD2", "C", cd2)]
+    if aa == "I":
+        cg1 = place_atom_nerf(n, ca, cb, 1.53, 111.0, -60.0)
+        cg2 = place_atom_nerf(n, ca, cb, 1.53, 111.0, 60.0)
+        cd1 = place_atom_nerf(ca, cb, cg1, 1.53, 111.0, 180.0)
+        return atoms + [("CG1", "C", cg1), ("CG2", "C", cg2), ("CD1", "C", cd1)]
+    if aa == "S":
+        og = place_atom_nerf(n, ca, cb, 1.43, 110.0, -60.0)
+        return atoms + [("OG", "O", og)]
+    if aa == "T":
+        og1 = place_atom_nerf(n, ca, cb, 1.43, 110.0, -60.0)
+        cg2 = place_atom_nerf(n, ca, cb, 1.53, 111.0, 60.0)
+        return atoms + [("OG1", "O", og1), ("CG2", "C", cg2)]
+    if aa == "C":
+        sg = place_atom_nerf(n, ca, cb, 1.81, 113.0, -60.0)
+        return atoms + [("SG", "S", sg)]
+    if aa == "M":
+        cg = place_atom_nerf(n, ca, cb, 1.53, 111.0, -60.0)
+        sd = place_atom_nerf(ca, cb, cg, 1.81, 113.0, 180.0)
+        ce = place_atom_nerf(cb, cg, sd, 1.79, 100.0, 180.0)
+        return atoms + [("CG", "C", cg), ("SD", "S", sd), ("CE", "C", ce)]
+    if aa == "D":
+        cg = place_atom_nerf(n, ca, cb, 1.52, 111.0, -60.0)
+        od1 = place_atom_nerf(ca, cb, cg, 1.25, 120.0, 0.0)
+        od2 = place_atom_nerf(ca, cb, cg, 1.25, 120.0, 180.0)
+        return atoms + [("CG", "C", cg), ("OD1", "O", od1), ("OD2", "O", od2)]
+    if aa == "E":
+        cg = place_atom_nerf(n, ca, cb, 1.53, 111.0, -60.0)
+        cd = place_atom_nerf(ca, cb, cg, 1.52, 111.0, 180.0)
+        oe1 = place_atom_nerf(cb, cg, cd, 1.25, 120.0, 0.0)
+        oe2 = place_atom_nerf(cb, cg, cd, 1.25, 120.0, 180.0)
+        return atoms + [("CG", "C", cg), ("CD", "C", cd), ("OE1", "O", oe1), ("OE2", "O", oe2)]
+    if aa == "N":
+        cg = place_atom_nerf(n, ca, cb, 1.52, 111.0, -60.0)
+        od1 = place_atom_nerf(ca, cb, cg, 1.24, 120.0, 0.0)
+        nd2 = place_atom_nerf(ca, cb, cg, 1.33, 116.0, 180.0)
+        return atoms + [("CG", "C", cg), ("OD1", "O", od1), ("ND2", "N", nd2)]
+    if aa == "Q":
+        cg = place_atom_nerf(n, ca, cb, 1.53, 111.0, -60.0)
+        cd = place_atom_nerf(ca, cb, cg, 1.52, 111.0, 180.0)
+        oe1 = place_atom_nerf(cb, cg, cd, 1.24, 120.0, 0.0)
+        ne2 = place_atom_nerf(cb, cg, cd, 1.33, 116.0, 180.0)
+        return atoms + [("CG", "C", cg), ("CD", "C", cd), ("OE1", "O", oe1), ("NE2", "N", ne2)]
+    if aa == "K":
+        cg = place_atom_nerf(n, ca, cb, 1.53, 111.0, -60.0)
+        cd = place_atom_nerf(ca, cb, cg, 1.53, 111.0, 180.0)
+        ce = place_atom_nerf(cb, cg, cd, 1.53, 111.0, 180.0)
+        nz = place_atom_nerf(cg, cd, ce, 1.49, 111.0, 180.0)
+        return atoms + [("CG", "C", cg), ("CD", "C", cd), ("CE", "C", ce), ("NZ", "N", nz)]
+    if aa == "R":
+        cg = place_atom_nerf(n, ca, cb, 1.53, 111.0, -60.0)
+        cd = place_atom_nerf(ca, cb, cg, 1.53, 111.0, 180.0)
+        ne = place_atom_nerf(cb, cg, cd, 1.46, 111.0, 180.0)
+        cz = place_atom_nerf(cg, cd, ne, 1.33, 124.0, 180.0)
+        nh1 = place_atom_nerf(cd, ne, cz, 1.33, 120.0, 0.0)
+        nh2 = place_atom_nerf(cd, ne, cz, 1.33, 120.0, 180.0)
+        return atoms + [
+            ("CG", "C", cg), ("CD", "C", cd), ("NE", "N", ne),
+            ("CZ", "C", cz), ("NH1", "N", nh1), ("NH2", "N", nh2),
+        ]
+    if aa == "H":
+        cg = place_atom_nerf(n, ca, cb, 1.50, 111.0, -60.0)
+        nd1 = place_atom_nerf(ca, cb, cg, 1.38, 126.0, 90.0)
+        cd2 = place_atom_nerf(ca, cb, cg, 1.37, 130.0, -90.0)
+        ce1 = place_atom_nerf(cb, cg, nd1, 1.33, 108.0, 180.0)
+        ne2 = place_atom_nerf(cg, nd1, ce1, 1.32, 108.0, 0.0)
+        return atoms + [("CG", "C", cg), ("ND1", "N", nd1), ("CD2", "C", cd2), ("CE1", "C", ce1), ("NE2", "N", ne2)]
+    if aa in ("F", "Y"):
+        cg = place_atom_nerf(n, ca, cb, 1.50, 111.0, -60.0)
+        cd1 = place_atom_nerf(ca, cb, cg, 1.39, 120.0, 90.0)
+        cd2 = place_atom_nerf(ca, cb, cg, 1.39, 120.0, -90.0)
+        ce1 = place_atom_nerf(cb, cg, cd1, 1.39, 120.0, 180.0)
+        ce2 = place_atom_nerf(cb, cg, cd2, 1.39, 120.0, 180.0)
+        cz = place_atom_nerf(cg, cd1, ce1, 1.39, 120.0, 0.0)
+        res = atoms + [
+            ("CG", "C", cg), ("CD1", "C", cd1), ("CD2", "C", cd2),
+            ("CE1", "C", ce1), ("CE2", "C", ce2), ("CZ", "C", cz),
+        ]
+        if aa == "Y":
+            oh = place_atom_nerf(cd1, ce1, cz, 1.36, 120.0, 180.0)
+            res.append(("OH", "O", oh))
+        return res
+    if aa == "W":
+        cg = place_atom_nerf(n, ca, cb, 1.50, 111.0, -60.0)
+        cd1 = place_atom_nerf(ca, cb, cg, 1.37, 127.0, 90.0)
+        cd2 = place_atom_nerf(ca, cb, cg, 1.43, 126.0, -90.0)
+        ne1 = place_atom_nerf(cb, cg, cd1, 1.38, 109.0, 180.0)
+        ce2 = place_atom_nerf(cg, cd1, ne1, 1.37, 110.0, 0.0)
+        ce3 = place_atom_nerf(cg, cd2, ce2, 1.40, 134.0, 180.0)
+        cz2 = place_atom_nerf(cd2, ce2, ne1, 1.40, 130.0, 180.0)
+        cz3 = place_atom_nerf(cd2, ce3, ce2, 1.40, 120.0, 180.0)
+        ch2 = place_atom_nerf(ce3, cz3, cz2, 1.40, 120.0, 0.0)
+        return atoms + [
+            ("CG", "C", cg), ("CD1", "C", cd1), ("CD2", "C", cd2),
+            ("NE1", "N", ne1), ("CE2", "C", ce2), ("CE3", "C", ce3),
+            ("CZ2", "C", cz2), ("CZ3", "C", cz3), ("CH2", "C", ch2),
+        ]
+    if aa == "P":
+        cg = place_atom_nerf(n, ca, cb, 1.53, 104.0, 30.0)
+        cd = place_atom_nerf(ca, cb, cg, 1.53, 104.0, -35.0)
+        return atoms + [("CG", "C", cg), ("CD", "C", cd)]
+    return atoms
+
+
 def compute_cb_coords(n_coord: np.ndarray, ca_coord: np.ndarray, c_coord: np.ndarray) -> np.ndarray:
     """Computes exact C-beta coordinates using standard tetrahedral geometry (sp3)."""
-    b = n_coord - ca_coord
-    c = c_coord - ca_coord
-    norm_b = np.linalg.norm(b)
-    norm_c = np.linalg.norm(c)
-    if norm_b < 1e-6 or norm_c < 1e-6:
-        return ca_coord + np.array([1.53, 0.0, 0.0])
-    u = np.cross(b, c)
-    norm_u = np.linalg.norm(u)
-    if norm_u < 1e-6:
-        u = np.array([0.0, 0.0, 1.0])
-    else:
-        u = u / norm_u
-    v = (b / norm_b) + (c / norm_c)
-    norm_v = np.linalg.norm(v)
-    if norm_v < 1e-6:
-        v = np.array([1.0, 0.0, 0.0])
-    else:
-        v = v / norm_v
-    d = -0.577 * v + 0.816 * u
-    norm_d = np.linalg.norm(d)
-    if norm_d > 1e-6:
-        d = d / norm_d
-    return ca_coord + 1.53 * d
+    return place_atom_nerf(n_coord, c_coord, ca_coord, 1.53, 110.5, 122.5)
 
 
 def thread_sequence_onto_pdb(
@@ -168,26 +298,68 @@ def thread_sequence_onto_pdb(
 ) -> bool:
     """
     Threads an amino acid sequence onto a 3D backbone PDB file by updating residue names
-    in ATOM lines and reconstructing sidechain atoms (CB for linkers, full native sidechains
-    for preserved residues from seed_pdb).
+    in ATOM lines and reconstructing sidechain atoms (full native sidechains from seed_pdb
+    matched by 3D CA coordinates, and idealized all-atom sidechains for designed linkers).
     """
     if not os.path.isfile(backbone_pdb) or not sequence:
         return False
     clean_seq = sequence.strip().upper()
 
-    seed_sidechains: Dict[Tuple[str, int], List[str]] = {}
+    # Parse seed PDB by 3D CA coordinates to transfer authentic native sidechains
+    seed_residues: List[Dict[str, Any]] = []
     if seed_pdb and os.path.isfile(seed_pdb):
+        curr_seed_key = None
+        curr_seed_atoms: List[Tuple[str, str, np.ndarray, str]] = []
+        curr_ca_coord: Optional[np.ndarray] = None
+        curr_resn = "ALA"
+
         with open(seed_pdb, "r", encoding="utf-8", errors="ignore") as sf:
             for s_line in sf:
                 if s_line.startswith("ATOM  ") or s_line.startswith("HETATM"):
-                    atom_name = s_line[12:16].strip().upper()
-                    if atom_name not in ("N", "CA", "C", "O", "OXT"):
-                        try:
-                            s_resi = int(s_line[22:26])
-                        except ValueError:
-                            continue
-                        s_ch = s_line[21].strip() or "A"
-                        seed_sidechains.setdefault((s_ch, s_resi), []).append(s_line)
+                    s_aname = s_line[12:16].strip().upper()
+                    try:
+                        s_resi = int(s_line[22:26])
+                        sx = float(s_line[30:38])
+                        sy = float(s_line[38:46])
+                        sz = float(s_line[46:54])
+                    except (ValueError, IndexError):
+                        continue
+                    s_ch = s_line[21].strip() or "A"
+                    s_resn = s_line[17:20].strip().upper()
+                    s_elem = s_line[76:78].strip() or s_aname[0]
+                    key = (s_ch, s_resi)
+
+                    if key != curr_seed_key:
+                        if curr_ca_coord is not None:
+                            seed_residues.append({
+                                "ca": curr_ca_coord,
+                                "resn": curr_resn,
+                                "sidechains": [
+                                    (a[0], a[1], a[2] - curr_ca_coord)
+                                    for a in curr_seed_atoms if a[0] not in ("N", "CA", "C", "O", "OXT")
+                                ],
+                            })
+                        curr_seed_key = key
+                        curr_seed_atoms = []
+                        curr_ca_coord = None
+                        curr_resn = s_resn
+
+                    coord = np.array([sx, sy, sz])
+                    if s_aname == "CA":
+                        curr_ca_coord = coord
+                    curr_seed_atoms.append((s_aname, s_elem, coord, s_resn))
+
+            if curr_ca_coord is not None:
+                seed_residues.append({
+                    "ca": curr_ca_coord,
+                    "resn": curr_resn,
+                    "sidechains": [
+                        (a[0], a[1], a[2] - curr_ca_coord)
+                        for a in curr_seed_atoms if a[0] not in ("N", "CA", "C", "O", "OXT")
+                    ],
+                })
+
+    seed_ca_arr = np.array([r["ca"] for r in seed_residues]) if seed_residues else np.empty((0, 3))
 
     residue_blocks: List[List[str]] = []
     current_resi = None
@@ -211,6 +383,8 @@ def thread_sequence_onto_pdb(
             residue_blocks.append(current_block)
 
     lines_out: List[str] = []
+    lines_out.append("REMARK 250 AUTOSCAFFOLD ALL-ATOM THREADED STRUCTURE\n")
+    lines_out.append("REMARK 250 PYMOL DISPLAY COMMAND: show cartoon; show sticks, not (name c,n,o)\n")
     atom_serial = 1
 
     for seq_idx, block in enumerate(residue_blocks):
@@ -233,32 +407,45 @@ def thread_sequence_onto_pdb(
             except (ValueError, IndexError):
                 pass
 
-        has_cb = False
+        # Write backbone atoms
         for line in block:
             aname = line[12:16].strip().upper()
-            if aname == "CB":
-                has_cb = True
-            mod_line = f"{line[:6]}{atom_serial:>5}{line[11:17]}{aa_3:>3}{line[20:]}"
-            lines_out.append(mod_line)
-            atom_serial += 1
-
-        native_sc = seed_sidechains.get((block_ch, block_resi), [])
-        if native_sc:
-            for sc_line in native_sc:
-                aname = sc_line[12:16].strip().upper()
-                if aname == "CB":
-                    has_cb = True
-                sc_mod = f"{sc_line[:6]}{atom_serial:>5}{sc_line[11:17]}{aa_3:>3}{sc_line[20:]}"
-                lines_out.append(sc_mod)
+            if aname in ("N", "CA", "C", "O", "OXT"):
+                mod_line = f"{line[:6]}{atom_serial:>5}{line[11:17]}{aa_3:>3}{line[20:]}"
+                lines_out.append(mod_line)
                 atom_serial += 1
-        elif not has_cb and aa_1 != "G" and "N" in atom_coords and "CA" in atom_coords and "C" in atom_coords:
-            cb_pos = compute_cb_coords(atom_coords["N"], atom_coords["CA"], atom_coords["C"])
-            cb_line = (
-                f"ATOM  {atom_serial:>5}  CB  {aa_3:>3} {block_ch}{block_resi:>4}    "
-                f"{cb_pos[0]:8.3f}{cb_pos[1]:8.3f}{cb_pos[2]:8.3f}  1.00 20.00           C\n"
-            )
-            lines_out.append(cb_line)
-            atom_serial += 1
+
+        # Check for matching native residue in seed structure by 3D CA coordinate
+        matched_seed: Optional[Dict[str, Any]] = None
+        if "CA" in atom_coords and len(seed_ca_arr) > 0:
+            dists = np.linalg.norm(seed_ca_arr - atom_coords["CA"], axis=1)
+            min_idx = int(np.argmin(dists))
+            if dists[min_idx] < 0.40:
+                matched_seed = seed_residues[min_idx]
+
+        if matched_seed and matched_seed["sidechains"]:
+            # Transfer authentic native sidechains from experimental structure
+            ca_bb = atom_coords["CA"]
+            for s_aname, s_elem, delta in matched_seed["sidechains"]:
+                pos = ca_bb + delta
+                pad_aname = f" {s_aname:<3}" if len(s_aname) < 4 else f"{s_aname:<4}"
+                sc_line = (
+                    f"ATOM  {atom_serial:>5} {pad_aname} {aa_3:>3} {block_ch}{block_resi:>4}    "
+                    f"{pos[0]:8.3f}{pos[1]:8.3f}{pos[2]:8.3f}  1.00 20.00          {s_elem:>2}\n"
+                )
+                lines_out.append(sc_line)
+                atom_serial += 1
+        elif "N" in atom_coords and "CA" in atom_coords and "C" in atom_coords:
+            # Build complete all-atom sidechain for de novo linker residue
+            sc_atoms = build_sidechain_atoms(aa_1, atom_coords["N"], atom_coords["CA"], atom_coords["C"])
+            for sc_aname, sc_elem, sc_pos in sc_atoms:
+                pad_aname = f" {sc_aname:<3}" if len(sc_aname) < 4 else f"{sc_aname:<4}"
+                sc_line = (
+                    f"ATOM  {atom_serial:>5} {pad_aname} {aa_3:>3} {block_ch}{block_resi:>4}    "
+                    f"{sc_pos[0]:8.3f}{sc_pos[1]:8.3f}{sc_pos[2]:8.3f}  1.00 20.00          {sc_elem:>2}\n"
+                )
+                lines_out.append(sc_line)
+                atom_serial += 1
 
     lines_out.append("TER\nEND\n")
 
@@ -2701,6 +2888,30 @@ class ChimeraScaffolder:
                 top_fa = safe_join_path(work_mpnn, "seqs", f"{top_base}.fa")
                 if os.path.isfile(top_fa):
                     shutil.copyfile(top_fa, safe_join_path(work_results, f"{top_base}_top_candidate.fa"))
+
+        # Generate automated PyMOL visualization script in results/
+        if passing_models:
+            top_model_path = passing_models[0]
+            top_model_name = os.path.basename(top_model_path)
+            pml_path = safe_join_path(work_results, "view_in_pymol.pml")
+            pml_content = (
+                "# AutoScaffold Automated PyMOL Visualization Script\n"
+                "# Usage in terminal: pymol view_in_pymol.pml\n"
+                "# Usage in PyMOL CLI: @view_in_pymol.pml\n"
+                "reinitialize\n"
+                f"load {top_model_name}, chimera\n"
+                "hide everything, chimera\n"
+                "show cartoon, chimera\n"
+                "color cyan, chimera\n\n"
+                "# Show all sidechain sticks while keeping backbone ribbon clean\n"
+                "show sticks, chimera and not (name c,n,o)\n"
+                "color atomic, (not elem C)\n"
+                "set stick_radius, 0.18\n"
+                "zoom chimera\n"
+            )
+            with open(pml_path, "w", encoding="utf-8") as pf:
+                pf.write(pml_content)
+            summary_data["pymol_script"] = pml_path
 
         # Output metrics_summary.csv strictly within out_dir using 64KB buffering
         csv_path = safe_join_path(self.out_dir, "metrics_summary.csv")

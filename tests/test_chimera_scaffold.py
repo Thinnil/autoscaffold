@@ -1854,8 +1854,9 @@ class TestPerformanceOptimizations(unittest.TestCase):
         self.assertTrue(res_sc)
         with open(threaded_sc_pdb, "r", encoding="utf-8") as f:
             sc_content = f.read()
-            # Res 1 (LYS) should have generated CB
+            # Res 1 (LYS) should have generated all-atom sidechain including CB and NZ
             self.assertIn("CB  LYS A   1", sc_content)
+            self.assertIn("NZ  LYS A   1", sc_content)
             # Res 2 (TRP) should have transferred native sidechain atoms
             self.assertIn("CB  TRP A   2", sc_content)
             self.assertIn("CG  TRP A   2", sc_content)
