@@ -16,9 +16,12 @@ def find_default_input_pdb() -> str:
         "*/results/*.pdb",
         "*/*/results/*.pdb",
         "c_term/results/*.pdb",
+        "c_term/**/*.pdb",
         "n_terminal/results/*.pdb",
+        "n_terminal/**/*.pdb",
         "*/2_mpnn/*_seq*.pdb",
         "*/1_rfdiffusion/*.pdb",
+        "results/*.pdb",
         "**/*.pdb",
     ]
     for pat in patterns:

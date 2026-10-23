@@ -429,14 +429,6 @@ def thread_sequence_onto_pdb(
             except (ValueError, IndexError):
                 pass
 
-        # Write backbone atoms
-        for line in block:
-            aname = line[12:16].strip().upper()
-            if aname in ("N", "CA", "C", "O", "OXT"):
-                mod_line = f"{line[:6]}{atom_serial:>5}{line[11:17]}{aa_3:>3}{line[20:]}"
-                lines_out.append(mod_line)
-                atom_serial += 1
-
         # Check for matching native residue in seed structure by 3D CA coordinate
         matched_seed: Optional[Dict[str, Any]] = None
         if "CA" in atom_coords and len(seed_ca_arr) > 0:
@@ -445,6 +437,17 @@ def thread_sequence_onto_pdb(
             if dists[min_idx] < 0.40:
                 matched_seed = seed_residues[min_idx]
 
+        # If this residue matches the native seed, preserve its exact native identity (e.g. TRP, GLU)
+        resn_3 = matched_seed["resn"] if (matched_seed and matched_seed.get("resn")) else aa_3
+
+        # Write backbone atoms
+        for line in block:
+            aname = line[12:16].strip().upper()
+            if aname in ("N", "CA", "C", "O", "OXT"):
+                mod_line = f"{line[:6]}{atom_serial:>5}{line[11:17]}{resn_3:>3}{line[20:]}"
+                lines_out.append(mod_line)
+                atom_serial += 1
+
         if matched_seed and matched_seed["sidechains"]:
             # Transfer authentic native sidechains from experimental structure
             ca_bb = atom_coords["CA"]
@@ -452,7 +455,7 @@ def thread_sequence_onto_pdb(
                 pos = ca_bb + delta
                 pad_aname = f" {s_aname:<3}" if len(s_aname) < 4 else f"{s_aname:<4}"
                 sc_line = (
-                    f"ATOM  {atom_serial:>5} {pad_aname} {aa_3:>3} {block_ch}{block_resi:>4}    "
+                    f"ATOM  {atom_serial:>5} {pad_aname} {resn_3:>3} {block_ch}{block_resi:>4}    "
                     f"{pos[0]:8.3f}{pos[1]:8.3f}{pos[2]:8.3f}  1.00 20.00          {s_elem:>2}\n"
                 )
                 lines_out.append(sc_line)
@@ -463,7 +466,7 @@ def thread_sequence_onto_pdb(
             for sc_aname, sc_elem, sc_pos in sc_atoms:
                 pad_aname = f" {sc_aname:<3}" if len(sc_aname) < 4 else f"{sc_aname:<4}"
                 sc_line = (
-                    f"ATOM  {atom_serial:>5} {pad_aname} {aa_3:>3} {block_ch}{block_resi:>4}    "
+                    f"ATOM  {atom_serial:>5} {pad_aname} {resn_3:>3} {block_ch}{block_resi:>4}    "
                     f"{sc_pos[0]:8.3f}{sc_pos[1]:8.3f}{sc_pos[2]:8.3f}  1.00 20.00          {sc_elem:>2}\n"
                 )
                 lines_out.append(sc_line)
@@ -2521,13 +2524,13 @@ class ChimeraScaffolder:
 
                 if bb_tree is not None:
                     if len(donor_ca_coords) > 0:
-                        dists, idxs = bb_tree.query(donor_ca_coords, distance_upper_bound=0.20)
+                        dists, idxs = bb_tree.query(donor_ca_coords, distance_upper_bound=0.35)
                         valid = idxs < len(bb_ca_coords)
                         if np.any(valid):
                             donor_fixed = (idxs[valid] + 1).tolist()
 
                     if self.lock_vessel and len(vessel_ca_coords) > 0:
-                        v_dists, v_idxs = bb_tree.query(vessel_ca_coords, distance_upper_bound=0.20)
+                        v_dists, v_idxs = bb_tree.query(vessel_ca_coords, distance_upper_bound=0.35)
                         v_valid = v_idxs < len(bb_ca_coords)
                         if np.any(v_valid):
                             vessel_fixed = (v_idxs[v_valid] + 1).tolist()
@@ -2539,7 +2542,7 @@ class ChimeraScaffolder:
                             diffs = bb_ca_coords - d_coord
                             sq_dists = np.sum(diffs * diffs, axis=1)
                             min_idx = int(np.argmin(sq_dists))
-                            if sq_dists[min_idx] < 0.04:  # (0.20 Å)^2 avoids square root calculations
+                            if sq_dists[min_idx] < 0.1225:  # (0.35 Å)^2 avoids square root calculations
                                 d_found.append(min_idx + 1)
                         if len(d_found) > 0:
                             donor_fixed = d_found
@@ -2550,7 +2553,7 @@ class ChimeraScaffolder:
                             diffs = bb_ca_coords - v_coord
                             sq_dists = np.sum(diffs * diffs, axis=1)
                             min_idx = int(np.argmin(sq_dists))
-                            if sq_dists[min_idx] < 0.04:  # (0.20 Å)^2 avoids square root calculations
+                            if sq_dists[min_idx] < 0.1225:  # (0.35 Å)^2 avoids square root calculations
                                 v_found.append(min_idx + 1)
                         if len(v_found) > 0:
                             vessel_fixed = v_found
