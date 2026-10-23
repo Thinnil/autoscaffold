@@ -316,16 +316,23 @@ def extract_native_motif_sequence(donor_pdb: str, chain_id: Optional[str], motif
 
 
 def thread_sequence_onto_pdb(
-    backbone_pdb: str, sequence: str, out_pdb: str, seed_pdb: Optional[str] = None
+    backbone_pdb: str,
+    sequence: str,
+    out_pdb: str,
+    seed_pdb: Optional[str] = None,
+    fixed_donor_positions: Optional[List[int]] = None,
 ) -> bool:
     """
     Threads an amino acid sequence onto a 3D backbone PDB file by updating residue names
     in ATOM lines and reconstructing sidechain atoms (full native sidechains from seed_pdb
     matched by 3D CA coordinates, and idealized all-atom sidechains for designed linkers).
+    Uses Sequence-Anchored Contig Tracking (SACT) via fixed_donor_positions to permanently
+    preserve authentic donor residue identity (e.g. EW / W312, E313).
     """
     if not os.path.isfile(backbone_pdb) or not sequence:
         return False
     clean_seq = sequence.strip().upper()
+    donor_pos_set = set(fixed_donor_positions or [])
 
     # Parse seed PDB by 3D CA coordinates to transfer authentic native sidechains
     seed_residues: List[Dict[str, Any]] = []
@@ -429,12 +436,15 @@ def thread_sequence_onto_pdb(
             except (ValueError, IndexError):
                 pass
 
-        # Check for matching native residue in seed structure by 3D CA coordinate
+        # Check for matching native residue in seed structure by 3D CA coordinate or SACT fixed donor position
         matched_seed: Optional[Dict[str, Any]] = None
         if "CA" in atom_coords and len(seed_ca_arr) > 0:
             dists = np.linalg.norm(seed_ca_arr - atom_coords["CA"], axis=1)
             min_idx = int(np.argmin(dists))
-            if dists[min_idx] < 0.40:
+            is_sact_donor = (block_resi in donor_pos_set) or ((seq_idx + 1) in donor_pos_set)
+            # Standard tolerance: 0.75 Å. For SACT locked donor positions: allow up to 1.50 Å drift
+            max_tol = 1.50 if is_sact_donor else 0.75
+            if dists[min_idx] < max_tol:
                 matched_seed = seed_residues[min_idx]
 
         # If this residue matches the native seed, preserve its exact native identity (e.g. TRP, GLU)
@@ -2489,6 +2499,30 @@ class ChimeraScaffolder:
         ref_donor_res = [r for s, e in self.preserved_donor_segments for r in range(s, e + 1)]
         ref_vessel_res = [r for s, e in self.preserved_vessel_segments for r in range(s, e + 1)]
 
+        # SACT Step 1: Check for RFdiffusion .trb metadata for 100% deterministic contig mapping
+        trb_path = os.path.splitext(backbone_pdb)[0] + ".trb"
+        if os.path.isfile(trb_path):
+            try:
+                from scripts.pse_pdb_extractor import SafeSessionUnpickler
+                with open(trb_path, "rb") as pf:
+                    trb_data = SafeSessionUnpickler(pf).load()
+                if isinstance(trb_data, dict) and "con_ref_pdb_idx" in trb_data:
+                    d_trb = []
+                    v_trb = []
+                    for h_idx, r_item in enumerate(trb_data["con_ref_pdb_idx"]):
+                        if r_item is not None:
+                            ch = str(r_item[0]).strip().upper()
+                            if ch in (getattr(self, "donor_chain_id", "D"), "D", "A"):
+                                d_trb.append(h_idx + 1)
+                            elif ch in (getattr(self, "vessel_chain_id", "V"), "V"):
+                                v_trb.append(h_idx + 1)
+                    if d_trb:
+                        donor_fixed = d_trb
+                    if v_trb and self.lock_vessel:
+                        vessel_fixed = v_trb
+            except Exception:
+                pass
+
         try:
             # Extract CA across backbone
             bb_ca_coords, bb_meta = extract_coordinates(
@@ -2513,8 +2547,8 @@ class ChimeraScaffolder:
                 extract_meta=False,
             )
 
-            # Map donor residues by fast KDTree (< 0.20 Å for pinned coordinates) or vectorized search
-            if len(bb_ca_coords) > 0:
+            # Map donor residues by fast KDTree (< 0.65 Å for pinned coordinates) or vectorized search
+            if len(bb_ca_coords) > 0 and not donor_fixed:
                 try:
                     from scipy.spatial import cKDTree
 
@@ -2524,13 +2558,13 @@ class ChimeraScaffolder:
 
                 if bb_tree is not None:
                     if len(donor_ca_coords) > 0:
-                        dists, idxs = bb_tree.query(donor_ca_coords, distance_upper_bound=0.35)
+                        dists, idxs = bb_tree.query(donor_ca_coords, distance_upper_bound=0.65)
                         valid = idxs < len(bb_ca_coords)
                         if np.any(valid):
                             donor_fixed = (idxs[valid] + 1).tolist()
 
                     if self.lock_vessel and len(vessel_ca_coords) > 0:
-                        v_dists, v_idxs = bb_tree.query(vessel_ca_coords, distance_upper_bound=0.35)
+                        v_dists, v_idxs = bb_tree.query(vessel_ca_coords, distance_upper_bound=0.65)
                         v_valid = v_idxs < len(bb_ca_coords)
                         if np.any(v_valid):
                             vessel_fixed = (v_idxs[v_valid] + 1).tolist()
@@ -2542,7 +2576,7 @@ class ChimeraScaffolder:
                             diffs = bb_ca_coords - d_coord
                             sq_dists = np.sum(diffs * diffs, axis=1)
                             min_idx = int(np.argmin(sq_dists))
-                            if sq_dists[min_idx] < 0.1225:  # (0.35 Å)^2 avoids square root calculations
+                            if sq_dists[min_idx] < 0.4225:  # (0.65 Å)^2 avoids square root calculations
                                 d_found.append(min_idx + 1)
                         if len(d_found) > 0:
                             donor_fixed = d_found
@@ -2553,7 +2587,7 @@ class ChimeraScaffolder:
                             diffs = bb_ca_coords - v_coord
                             sq_dists = np.sum(diffs * diffs, axis=1)
                             min_idx = int(np.argmin(sq_dists))
-                            if sq_dists[min_idx] < 0.1225:  # (0.35 Å)^2 avoids square root calculations
+                            if sq_dists[min_idx] < 0.4225:  # (0.65 Å)^2 avoids square root calculations
                                 v_found.append(min_idx + 1)
                         if len(v_found) > 0:
                             vessel_fixed = v_found
@@ -2856,7 +2890,10 @@ class ChimeraScaffolder:
                 for s_idx, (hdr, seq) in enumerate(des_seqs, start=1):
                     th_pdb = safe_join_path(work_mpnn, f"{bb_name}_seq{s_idx}.pdb")
                     seed_source = getattr(self, "seed_pdb_path", None) or getattr(self, "seed_pdb", None)
-                    if thread_sequence_onto_pdb(bb, seq, th_pdb, seed_pdb=seed_source):
+                    d_fixed_list = cand.get("donor_fixed", [])
+                    if thread_sequence_onto_pdb(
+                        bb, seq, th_pdb, seed_pdb=seed_source, fixed_donor_positions=d_fixed_list
+                    ):
                         cand["threaded_pdbs"].append(th_pdb)
 
         summary_data["candidates"] = mpnn_results
@@ -2964,6 +3001,22 @@ class ChimeraScaffolder:
         if passing_models:
             top_model_path = passing_models[0]
             top_model_name = os.path.basename(top_model_path)
+            canonical_res = safe_join_path(work_results, "chimera_full_atoms.pdb")
+            try:
+                shutil.copyfile(top_model_path, canonical_res)
+            except Exception:
+                pass
+
+            # Automatic 2-Stage Soft-Core Minimization & PyMOL Clash Relief
+            try:
+                from scripts.relax_chimera import relax_structure
+                relaxed_dest = safe_join_path(work_results, "chimera_minimized.pdb")
+                print("[+] Launching automatic 2-Stage Soft-Core Relaxation to eliminate PyMOL steric clashes...")
+                if relax_structure(canonical_res, relaxed_dest, max_iterations=150):
+                    print(f"✅ Polished clash-free structure ready at: {relaxed_dest}")
+            except Exception as e:
+                print(f"[*] Note on automated relaxation: {e}")
+
             pml_path = safe_join_path(work_results, "view_in_pymol.pml")
             pml_content = (
                 "# AutoScaffold Automated PyMOL Visualization Script\n"
