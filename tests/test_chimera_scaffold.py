@@ -1899,6 +1899,46 @@ class TestPerformanceOptimizations(unittest.TestCase):
         self.assertTrue(os.path.isfile(f2))
         self.assertFalse(os.path.islink(f1))
 
+    def test_vessel_redesign_modes_and_sequence_fidelity(self):
+        """Verify vessel redesign modes and native motif sequence extraction/fidelity."""
+        from scripts.chimera_scaffold import ChimeraScaffolder, extract_native_motif_sequence
+
+        mock_bb = os.path.join(self.test_dir, "test_scaff.pdb")
+        with open(mock_bb, "w", encoding="utf-8") as f:
+            f.write("ATOM      1  CA  TRP A   1       0.000   0.000   0.000  1.00 20.00           C\n")
+            f.write("ATOM      2  CA  GLU A   2       3.800   0.000   0.000  1.00 20.00           C\n")
+
+        # Test mode initialization
+        scaff_linkers = ChimeraScaffolder(
+            donor_pdb=mock_bb,
+            vessel_pdb=mock_bb,
+            vessel_redesign_mode="linkers_only",
+            dry_run=True,
+        )
+        self.assertEqual(scaff_linkers.vessel_redesign_mode, "linkers_only")
+        self.assertTrue(scaff_linkers.lock_vessel)
+
+        scaff_full = ChimeraScaffolder(
+            donor_pdb=mock_bb,
+            vessel_pdb=mock_bb,
+            vessel_redesign_mode="vessel_full",
+            dry_run=True,
+        )
+        self.assertEqual(scaff_full.vessel_redesign_mode, "vessel_full")
+        self.assertFalse(scaff_full.lock_vessel)
+
+        scaff_iface = ChimeraScaffolder(
+            donor_pdb=mock_bb,
+            vessel_pdb=mock_bb,
+            vessel_redesign_mode="vessel_interface",
+            dry_run=True,
+        )
+        self.assertEqual(scaff_iface.vessel_redesign_mode, "vessel_interface")
+
+        # Test extract_native_motif_sequence
+        native_seq = extract_native_motif_sequence(mock_bb, "A", [1, 2])
+        self.assertEqual(native_seq, "WE")
+
 
 if __name__ == "__main__":
     unittest.main()

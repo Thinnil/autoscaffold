@@ -293,6 +293,28 @@ def compute_cb_coords(n_coord: np.ndarray, ca_coord: np.ndarray, c_coord: np.nda
     return place_atom_nerf(n_coord, c_coord, ca_coord, 1.53, 110.5, 122.5)
 
 
+def extract_native_motif_sequence(donor_pdb: str, chain_id: Optional[str], motif_residues: List[int]) -> str:
+    """Extracts the 1-letter amino acid sequence for the specified motif residues from a PDB file."""
+    if not os.path.isfile(donor_pdb):
+        return ""
+    try:
+        parsed = parse_pdb_file(donor_pdb)
+        objs = parsed.get("objects", {})
+        target_obj = None
+        if chain_id and chain_id in objs:
+            target_obj = objs[chain_id]
+        elif objs:
+            target_obj = list(objs.values())[0]
+        if not target_obj:
+            return ""
+        r_seqs = target_obj.get("residue_seqs", [])
+        seq_str = target_obj.get("sequence", "")
+        r_map = {r: seq_str[i] for i, r in enumerate(r_seqs) if i < len(seq_str)}
+        return "".join(r_map.get(r, "") for r in motif_residues)
+    except Exception:
+        return ""
+
+
 def thread_sequence_onto_pdb(
     backbone_pdb: str, sequence: str, out_pdb: str, seed_pdb: Optional[str] = None
 ) -> bool:
@@ -1413,6 +1435,7 @@ class ChimeraScaffolder:
         rmsd_threshold: float = 1.0,
         plddt_threshold: float = 75.0,
         lock_vessel: bool = True,
+        vessel_redesign_mode: str = "linkers_only",
         clamp_linkers: bool = True,
         out_dir: str = "outputs/chimera_scaffold",
         dry_run: bool = False,
@@ -1463,7 +1486,16 @@ class ChimeraScaffolder:
         self.mpnn_batch_size = mpnn_batch_size
         self.rmsd_threshold = rmsd_threshold
         self.plddt_threshold = plddt_threshold
-        self.lock_vessel = lock_vessel
+        v_mode = str(vessel_redesign_mode).lower().strip()
+        if v_mode in ("vessel_full", "full", "false") or not lock_vessel:
+            self.vessel_redesign_mode = "vessel_full"
+            self.lock_vessel = False
+        elif v_mode in ("vessel_interface", "interface"):
+            self.vessel_redesign_mode = "vessel_interface"
+            self.lock_vessel = True
+        else:
+            self.vessel_redesign_mode = "linkers_only"
+            self.lock_vessel = True
         self.clamp_linkers = clamp_linkers
         self.out_dir = validate_output_dir(out_dir)
         if "outputs" in self.out_dir.lower():
@@ -2576,9 +2608,23 @@ class ChimeraScaffolder:
                     donor_fixed.extend(range(cursor, cursor + seg_len))
                     cursor += seg_len + est_int_len
 
-        # Combine fixed positions
+        # Combine fixed positions based on vessel redesign mode
         all_fixed = set(donor_fixed)
-        if self.lock_vessel:
+        if self.vessel_redesign_mode == "vessel_interface" and len(donor_fixed) > 0 and len(vessel_fixed) > 0:
+            # Only lock vessel residues that are far (>= 8.0 A) from the donor motif.
+            # Vessel interface residues (< 8.0 A) are left flexible for redesign to pack against donor.
+            d_coords = [bb_ca_coords[d - 1] for d in donor_fixed if 1 <= d <= len(bb_ca_coords)]
+            if d_coords:
+                d_arr = np.array(d_coords)
+                for v_idx in vessel_fixed:
+                    if 1 <= v_idx <= len(bb_ca_coords):
+                        v_ca = bb_ca_coords[v_idx - 1]
+                        min_dist = float(np.min(np.linalg.norm(d_arr - v_ca, axis=1)))
+                        if min_dist >= 8.0:
+                            all_fixed.add(v_idx)
+            else:
+                all_fixed.update(vessel_fixed)
+        elif self.lock_vessel:
             all_fixed.update(vessel_fixed)
 
         # Ensure indices are within [1, total_len] and sorted
@@ -2849,12 +2895,34 @@ class ChimeraScaffolder:
             plddt = 88.5  # Standard confident metric baseline
             passed = (motif_rmsd <= self.rmsd_threshold) and (plddt >= self.plddt_threshold)
 
+            # Sequence fidelity verification: Verify 100% identity of donor motif
+            expected_motif_str = extract_native_motif_sequence(
+                self.working_donor_pdb, self.donor_chain_id, ref_motif_res
+            )
+            motif_fidelity = True
+            des_seqs = cand.get("designed_sequences", [])
+            top_des_seq = des_seqs[0][1] if des_seqs else ""
+            actual_motif_str = ""
+            if top_des_seq and query_motif_res:
+                actual_motif_str = "".join(
+                    top_des_seq[idx - 1] for idx in query_motif_res if 1 <= idx <= len(top_des_seq)
+                )
+                if expected_motif_str and actual_motif_str and (expected_motif_str != actual_motif_str):
+                    motif_fidelity = False
+
+            if not motif_fidelity:
+                passed = False
+                verdict = "FAIL (MOTIF_MUTATED)"
+            else:
+                verdict = "PASS" if passed else "FAIL"
+
             row = {
                 "model_id": safe_bb_base,
                 "backbone_path": bb_path,
                 "motif_rmsd": motif_rmsd,
                 "plddt": plddt,
-                "verdict": "PASS" if passed else "FAIL",
+                "motif_fidelity": "100%" if motif_fidelity else "MUTATED",
+                "verdict": verdict,
             }
             metrics_rows.append(row)
 
@@ -2916,7 +2984,9 @@ class ChimeraScaffolder:
         # Output metrics_summary.csv strictly within out_dir using 64KB buffering
         csv_path = safe_join_path(self.out_dir, "metrics_summary.csv")
         with open(csv_path, "w", newline="", encoding="utf-8", buffering=65536) as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=["model_id", "backbone_path", "motif_rmsd", "plddt", "verdict"])
+            writer = csv.DictWriter(
+                csvfile, fieldnames=["model_id", "backbone_path", "motif_rmsd", "plddt", "motif_fidelity", "verdict"]
+            )
             writer.writeheader()
             for r in metrics_rows:
                 writer.writerow(r)
@@ -3114,6 +3184,12 @@ def main() -> None:
         help="Allow ProteinMPNN to redesign vessel framework residues",
     )
     parser.add_argument(
+        "--vessel_redesign_mode",
+        choices=["linkers_only", "vessel_full", "vessel_interface"],
+        default="linkers_only",
+        help="Vessel redesign flexibility mode for ProteinMPNN [Default: linkers_only]",
+    )
+    parser.add_argument(
         "--clamp_linkers",
         dest="clamp_linkers",
         action="store_true",
@@ -3168,6 +3244,7 @@ def main() -> None:
         linker_n=args.linker_n,
         linker_c=args.linker_c,
         lock_vessel=args.lock_vessel,
+        vessel_redesign_mode=args.vessel_redesign_mode,
         clamp_linkers=args.clamp_linkers,
         num_designs=args.num_designs,
         mpnn_seqs_per_bb=args.mpnn_seqs_per_bb,

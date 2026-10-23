@@ -165,6 +165,7 @@ PYTHON_RFDIFF="${PYTHON_RFDIFF:-}"
 PYTHON_MPNN="${PYTHON_MPNN:-}"
 DRY_RUN=""
 LOCK_VESSEL_FLAG=""
+VESSEL_REDESIGN_MODE="${VESSEL_REDESIGN_MODE:-linkers_only}"
 BACKGROUND_MODE=false
 ORIG_ARGS=("$@")
 
@@ -293,6 +294,10 @@ while [[ $# -gt 0 ]]; do
         --no_lock_vessel)
             LOCK_VESSEL_FLAG="--no_lock_vessel"
             shift
+            ;;
+        --vessel_redesign_mode)
+            VESSEL_REDESIGN_MODE="$2"
+            shift 2
             ;;
         --dry_run)
             DRY_RUN="--dry_run"
@@ -600,7 +605,17 @@ except Exception:
     NUM_SEQS=${INP_NS:-$NUM_SEQS}
     read -r -p "▶ 10. ProteinMPNN parallel GPU batch size [Default: $MPNN_BATCH_SIZE]: " INP_BS
     MPNN_BATCH_SIZE=${INP_BS:-$MPNN_BATCH_SIZE}
-    read -r -e -p "▶ 11. Output directory [Default: $OUT_DIR]: " INP_OD
+    echo -e "\n▶ 10b. Vessel Redesign Flexibility Mode:"
+    echo -e "       [1] linkers_only: Keep Donor & Vessel Fixed (Redesign Linkers Only) [Default]"
+    echo -e "       [2] vessel_full: Keep Donor 100% Fixed, Redesign Entire Vessel & Linkers"
+    echo -e "       [3] vessel_interface: Keep Donor 100% Fixed, Redesign Vessel Interface (<8Å) & Linkers"
+    read -r -p "       Select mode [1/2/3, Default: 1]: " INP_VRM
+    case "$INP_VRM" in
+        2|vessel_full) VESSEL_REDESIGN_MODE="vessel_full" ;;
+        3|vessel_interface) VESSEL_REDESIGN_MODE="vessel_interface" ;;
+        *) VESSEL_REDESIGN_MODE="${VESSEL_REDESIGN_MODE:-linkers_only}" ;;
+    esac
+    read -r -e -p "\n▶ 11. Output directory [Default: $OUT_DIR]: " INP_OD
     OUT_DIR=${INP_OD:-$OUT_DIR}
 fi
 
@@ -672,6 +687,7 @@ if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ]; then
             [ -n "$VESSEL_SPLIT_AFTER" ] && BG_ARGS+=("--split_after" "$VESSEL_SPLIT_AFTER")
             [ -n "$DRY_RUN" ] && BG_ARGS+=("$DRY_RUN")
             [ -n "$LOCK_VESSEL_FLAG" ] && BG_ARGS+=("$LOCK_VESSEL_FLAG")
+            [ -n "$VESSEL_REDESIGN_MODE" ] && BG_ARGS+=("--vessel_redesign_mode" "$VESSEL_REDESIGN_MODE")
             [ -n "$PYTHON_RFDIFF" ] && BG_ARGS+=("--python_rfdiff" "$PYTHON_RFDIFF")
             [ -n "$PYTHON_MPNN" ] && BG_ARGS+=("--python_mpnn" "$PYTHON_MPNN")
         else
@@ -717,6 +733,7 @@ CMD_ARGS=(
     "--rmsd_threshold" "$RMSD_THRESHOLD"
     "--plddt_threshold" "$PLDDT_THRESHOLD"
     "--out_dir" "$ABS_OUT_DIR"
+    "--vessel_redesign_mode" "$VESSEL_REDESIGN_MODE"
 )
 
 if [ -n "$PYTHON_RFDIFF" ]; then
