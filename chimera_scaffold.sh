@@ -618,6 +618,15 @@ for SYS_DIR in "/etc" "/usr" "/bin" "/sbin" "/boot" "/dev" "c:\\windows" "c:\\pr
 done
 mkdir -p "$ABS_OUT_DIR"
 
+# Clean up preliminary measurement directory if user specified a custom output directory
+if [ -n "${PRELIM_OUT_DIR:-}" ] && [ "$PRELIM_OUT_DIR" != "$ABS_OUT_DIR" ] && [ -d "$PRELIM_OUT_DIR" ]; then
+    if [ -d "$PRELIM_OUT_DIR/0_prep" ] && [ ! -d "$ABS_OUT_DIR/0_prep" ]; then
+        mv "$PRELIM_OUT_DIR/0_prep" "$ABS_OUT_DIR/0_prep" 2>/dev/null || true
+    fi
+    rmdir "$PRELIM_OUT_DIR" 2>/dev/null || true
+    rmdir "$(dirname "$PRELIM_OUT_DIR")" 2>/dev/null || true
+fi
+
 PID_FILE="$ABS_OUT_DIR/run.pid"
 LOG_FILE="$ABS_OUT_DIR/run.log"
 
