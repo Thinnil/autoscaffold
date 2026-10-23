@@ -1400,6 +1400,7 @@ class ChimeraScaffolder:
         self.donor_metadata: Dict[str, Any] = {}
         self.vessel_metadata: Dict[str, Any] = {}
         self.seed_pdb_path = ""
+        self.seed_pdb = ""
         self.contig_string = ""
         self.preserved_donor_segments: List[Tuple[int, int]] = []
         self.preserved_vessel_segments: List[Tuple[int, int]] = []
@@ -2239,6 +2240,7 @@ class ChimeraScaffolder:
             out.writelines(atom_lines)
 
         self.seed_pdb_path = seed_path
+        self.seed_pdb = seed_path
         return seed_path
 
     def map_fixed_positions_for_mpnn(self, backbone_pdb: str) -> Dict[str, List[int]]:
@@ -2617,7 +2619,8 @@ class ChimeraScaffolder:
             if des_seqs:
                 for s_idx, (hdr, seq) in enumerate(des_seqs, start=1):
                     th_pdb = safe_join_path(work_mpnn, f"{bb_name}_seq{s_idx}.pdb")
-                    if thread_sequence_onto_pdb(bb, seq, th_pdb, seed_pdb=self.seed_pdb):
+                    seed_source = getattr(self, "seed_pdb_path", None) or getattr(self, "seed_pdb", None)
+                    if thread_sequence_onto_pdb(bb, seq, th_pdb, seed_pdb=seed_source):
                         cand["threaded_pdbs"].append(th_pdb)
 
         summary_data["candidates"] = mpnn_results

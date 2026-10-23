@@ -1862,6 +1862,17 @@ class TestPerformanceOptimizations(unittest.TestCase):
             self.assertIn("CD1 TRP A   2", sc_content)
             self.assertIn("NE1 TRP A   2", sc_content)
 
+        # Verify ChimeraScaffolder initializes both seed_pdb and seed_pdb_path
+        from scripts.chimera_scaffold import ChimeraScaffolder
+        scaff = ChimeraScaffolder(
+            donor_pdb=mock_bb_backbone,
+            vessel_pdb=mock_bb_backbone,
+            out_dir=self.test_dir,
+            dry_run=True,
+        )
+        self.assertTrue(hasattr(scaff, "seed_pdb"))
+        self.assertTrue(hasattr(scaff, "seed_pdb_path"))
+
     def test_methodology_reporter_prevents_circular_symlinks(self):
         """Verify methodology_reporter produces valid regular files and never circular symlinks."""
         from scripts.methodology_reporter import generate_methodology_report
