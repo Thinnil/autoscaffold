@@ -244,9 +244,20 @@ def generate_methodology_report(
 
     report_content = "\n".join(lines)
 
-    # Write run_methodology.txt and methodology.txt strictly within clean_output_dir
-    file1 = os.path.realpath(os.path.join(clean_output_dir, "run_methodology.txt"))
-    file2 = os.path.realpath(os.path.join(clean_output_dir, "methodology.txt"))
+    # Write run_methodology.txt and methodology.txt strictly within clean_output_dir as regular files
+    file1 = os.path.abspath(os.path.join(clean_output_dir, "run_methodology.txt"))
+    file2 = os.path.abspath(os.path.join(clean_output_dir, "methodology.txt"))
+
+    # Clean up any stale or circular symlinks from previous runs
+    for target_f in (file1, file2):
+        if os.path.islink(target_f) or os.path.lexists(target_f):
+            try:
+                os.unlink(target_f)
+            except OSError:
+                try:
+                    os.remove(target_f)
+                except OSError:
+                    pass
 
     # Validate no path traversal
     for target_f in (file1, file2):
@@ -257,13 +268,8 @@ def generate_methodology_report(
     with open(file1, "w", buffering=BUFFER_SIZE, encoding="utf-8") as f:
         f.write(report_content)
 
-    # Symlink or copy to methodology.txt to avoid duplicate encoding and I/O overhead
-    try:
-        if os.path.lexists(file2):
-            os.remove(file2)
-        os.symlink(os.path.basename(file1), file2)
-    except (OSError, NotImplementedError, AttributeError):
-        shutil.copyfile(file1, file2)
+    # Write identical regular file to methodology.txt (avoids circular symlink traps)
+    shutil.copyfile(file1, file2)
 
     return report_content
 

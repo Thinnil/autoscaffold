@@ -97,6 +97,7 @@ fast_realpath() {
 canonicalize_out_dir() {
     local raw="$1"
     local repo_root="$2"
+    local caller_dir="${AUTOSCAFFOLD_CALLER_PWD:-$PWD}"
     local resolved=""
 
     if [ -z "$raw" ]; then
@@ -104,13 +105,17 @@ canonicalize_out_dir() {
     fi
 
     # If user passed default or relative path while already inside an 'outputs' directory
-    if [[ "$PWD" =~ [/\\]outputs$ ]] && [[ "$raw" =~ ^outputs[/\\] ]]; then
+    if [[ "$caller_dir" =~ [/\\]outputs$ ]] && [[ "$raw" =~ ^outputs[/\\] ]]; then
         raw="${raw#outputs/}"
         raw="${raw#outputs\\}"
     fi
 
-    # Resolve relative path against current working directory ($PWD)
-    resolved="$(fast_realpath "$raw")"
+    # Anchor relative path strictly to caller's working directory ($AUTOSCAFFOLD_CALLER_PWD or $PWD)
+    if [[ ! "$raw" =~ ^/ && ! "$raw" =~ ^[a-zA-Z]:[\\/] ]]; then
+        resolved="$caller_dir/$raw"
+    else
+        resolved="$raw"
+    fi
 
     # Collapse any accidental duplicated '/outputs/outputs/'
     while [[ "$resolved" =~ /outputs/outputs/ ]]; do
@@ -482,12 +487,14 @@ if [ -t 0 ]; then
     echo -e "${CYAN} 📏 MEASURING 3D JUNCTION GAPS & LINKER BUDGETING     ${NC}"
     echo -e "${CYAN}======================================================${NC}"
 
+    PRELIM_OUT_DIR="$(canonicalize_out_dir "$OUT_DIR" "$SCRIPT_DIR")"
     MEASURE_CMD=(
         python "$SCRIPT_DIR/scripts/chimera_scaffold.py" measure_junctions
         "--donor_id" "$DONOR_ID"
         "--vessel_id" "$VESSEL_ID"
         "--motif_residues" "$MOTIF_RESIDUES"
         "--chimera_mode" "$CHIMERA_MODE"
+        "--out_dir" "$PRELIM_OUT_DIR"
     )
     if [ -n "$ABS_INPUT_FILE" ]; then
         MEASURE_CMD+=("--input_file" "$ABS_INPUT_FILE")

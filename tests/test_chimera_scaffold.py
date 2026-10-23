@@ -1792,6 +1792,64 @@ class TestPerformanceOptimizations(unittest.TestCase):
             self.assertFalse(scaffolder_strict.mpnn_env_valid)
             self.assertEqual(scaffolder_strict.mpnn_runner, invalid_mpnn_runner)
 
+    def test_extract_and_thread_mpnn_sequences(self):
+        """Verify extract_mpnn_sequences and thread_sequence_onto_pdb generate complete 3D PDBs with designed AAs."""
+        from scripts.chimera_scaffold import extract_mpnn_sequences, thread_sequence_onto_pdb
+
+        # Create mock FASTA with native backbone + designed sequence
+        mock_fa = os.path.join(self.test_dir, "test_design.fa")
+        with open(mock_fa, "w", encoding="utf-8") as f:
+            f.write(">test_design, score=1.5\nAAAA\n>test_design_seq1, score=0.8\nKWER\n")
+
+        seqs = extract_mpnn_sequences(mock_fa)
+        self.assertEqual(len(seqs), 1)
+        self.assertEqual(seqs[0][1], "KWER")
+
+        # Create mock backbone PDB
+        mock_bb = os.path.join(self.test_dir, "test_bb.pdb")
+        with open(mock_bb, "w", encoding="utf-8") as f:
+            f.write("ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\n")
+            f.write("ATOM      2  CA  ALA A   2       3.800   0.000   0.000  1.00 20.00           C\n")
+            f.write("ATOM      3  CA  ALA A   3       7.600   0.000   0.000  1.00 20.00           C\n")
+            f.write("ATOM      4  CA  ALA A   4      11.400   0.000   0.000  1.00 20.00           C\n")
+
+        threaded_pdb = os.path.join(self.test_dir, "threaded.pdb")
+        res = thread_sequence_onto_pdb(mock_bb, "KWER", threaded_pdb)
+        self.assertTrue(res)
+        self.assertTrue(os.path.isfile(threaded_pdb))
+
+        with open(threaded_pdb, "r", encoding="utf-8") as f:
+            lines = [line for line in f if line.startswith("ATOM")]
+            self.assertIn("LYS", lines[0])
+            self.assertIn("TRP", lines[1])
+            self.assertIn("GLU", lines[2])
+            self.assertIn("ARG", lines[3])
+
+    def test_methodology_reporter_prevents_circular_symlinks(self):
+        """Verify methodology_reporter produces valid regular files and never circular symlinks."""
+        from scripts.methodology_reporter import generate_methodology_report
+
+        out_rep = os.path.join(self.test_dir, "methodology_test")
+        os.makedirs(out_rep, exist_ok=True)
+
+        # Run report generation twice
+        generate_methodology_report(
+            output_dir=out_rep,
+            run_name="TestRun1",
+            pipeline_mode="Chimera Scaffolding",
+        )
+        generate_methodology_report(
+            output_dir=out_rep,
+            run_name="TestRun2",
+            pipeline_mode="Chimera Scaffolding",
+        )
+
+        f1 = os.path.join(out_rep, "run_methodology.txt")
+        f2 = os.path.join(out_rep, "methodology.txt")
+        self.assertTrue(os.path.isfile(f1))
+        self.assertTrue(os.path.isfile(f2))
+        self.assertFalse(os.path.islink(f1))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,6 +99,77 @@ def clear_environment_cache() -> None:
     _CACHED_ROOTS = None
 
 
+ONE_TO_THREE = {
+    "A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE",
+    "G": "GLY", "H": "HIS", "I": "ILE", "K": "LYS", "L": "LEU",
+    "M": "MET", "N": "ASN", "P": "PRO", "Q": "GLN", "R": "ARG",
+    "S": "SER", "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR",
+}
+
+
+def extract_mpnn_sequences(fasta_path: str) -> List[Tuple[str, str]]:
+    """
+    Parses ProteinMPNN output fasta file.
+    Returns list of (header, sequence) for redesigned sequences (skipping the original record 0).
+    """
+    if not os.path.isfile(fasta_path):
+        return []
+    records = []
+    current_hdr = None
+    current_seq = []
+    with open(fasta_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if current_hdr is not None:
+                    records.append((current_hdr, "".join(current_seq)))
+                current_hdr = line
+                current_seq = []
+            else:
+                current_seq.append(line)
+        if current_hdr is not None:
+            records.append((current_hdr, "".join(current_seq)))
+    if len(records) > 1:
+        return records[1:]
+    return records
+
+
+def thread_sequence_onto_pdb(backbone_pdb: str, sequence: str, out_pdb: str) -> bool:
+    """
+    Threads an amino acid sequence onto a 3D backbone PDB file by updating residue names
+    in ATOM lines while preserving exact tertiary coordinates (N, CA, C, O, CB).
+    """
+    if not os.path.isfile(backbone_pdb) or not sequence:
+        return False
+    clean_seq = sequence.strip().upper()
+    lines_out = []
+    current_resi = None
+    seq_idx = -1
+    with open(backbone_pdb, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith("ATOM  ") or line.startswith("HETATM"):
+                try:
+                    resi = int(line[22:26])
+                except ValueError:
+                    lines_out.append(line)
+                    continue
+                if resi != current_resi:
+                    current_resi = resi
+                    seq_idx += 1
+                if 0 <= seq_idx < len(clean_seq):
+                    aa_1 = clean_seq[seq_idx]
+                    aa_3 = ONE_TO_THREE.get(aa_1, "ALA")
+                    line = f"{line[:17]}{aa_3:>3}{line[20:]}"
+                lines_out.append(line)
+            else:
+                lines_out.append(line)
+    with open(out_pdb, "w", encoding="utf-8", buffering=65536) as f:
+        f.writelines(lines_out)
+    return True
+
+
 def get_residue_ca_coords(
     pdb_path: str, chain_id: Optional[str] = None, resi: int = 1, buffer_size: int = 65536, use_cache: bool = True
 ) -> Optional[np.ndarray]:
@@ -2438,6 +2509,20 @@ class ChimeraScaffolder:
 
             mpnn_results.append(cand_info)
 
+        # Thread designed ProteinMPNN sequences onto 3D backbone PDB structures
+        for cand in mpnn_results:
+            bb = cand["backbone"]
+            bb_name = os.path.splitext(os.path.basename(bb))[0]
+            cand["threaded_pdbs"] = []
+            fa_path = safe_join_path(work_mpnn, "seqs", f"{bb_name}.fa")
+            des_seqs = extract_mpnn_sequences(fa_path)
+            cand["designed_sequences"] = des_seqs
+            if des_seqs:
+                for s_idx, (hdr, seq) in enumerate(des_seqs, start=1):
+                    th_pdb = safe_join_path(work_mpnn, f"{bb_name}_seq{s_idx}.pdb")
+                    if thread_sequence_onto_pdb(bb, seq, th_pdb):
+                        cand["threaded_pdbs"].append(th_pdb)
+
         summary_data["candidates"] = mpnn_results
 
         # Step 4: Verification & RMSD calculation
@@ -2451,6 +2536,8 @@ class ChimeraScaffolder:
             bb_path = cand["backbone"]
             bb_base = os.path.splitext(os.path.basename(bb_path))[0]
             safe_bb_base = _RE_SANITIZE_IDENT.sub("_", bb_base) or "model"
+            threaded_src = cand["threaded_pdbs"][0] if cand.get("threaded_pdbs") else bb_path
+            fa_src = safe_join_path(work_mpnn, "seqs", f"{bb_base}.fa")
 
             # Calculate Kabsch RMSD between donor structure and chimera model
             try:
@@ -2486,20 +2573,34 @@ class ChimeraScaffolder:
 
             if passed:
                 res_dest = safe_join_path(work_results, f"{safe_bb_base}_passed.pdb")
-                shutil.copyfile(bb_path, res_dest)
+                shutil.copyfile(threaded_src, res_dest)
                 passing_models.append(res_dest)
+                if os.path.isfile(fa_src):
+                    shutil.copyfile(fa_src, safe_join_path(work_results, f"{safe_bb_base}_passed.fa"))
 
-        # If no design passed strict RMSD cutoff, preserve the top-ranking candidates in 3_results
+        # If no design passed strict RMSD cutoff, preserve the top-ranking candidates in results
         if not passing_models and metrics_rows:
             sorted_by_rmsd = sorted(metrics_rows, key=lambda x: x.get("motif_rmsd", 999.0))
             top_cand = sorted_by_rmsd[0]
-            top_bb = top_cand["backbone_path"]
+            top_base = top_cand["model_id"]
+            cand_match = next(
+                (c for c in mpnn_results if os.path.splitext(os.path.basename(c["backbone"]))[0] == top_base),
+                None,
+            )
+            top_src = (
+                cand_match["threaded_pdbs"][0]
+                if (cand_match and cand_match.get("threaded_pdbs"))
+                else top_cand["backbone_path"]
+            )
             top_rmsd = top_cand.get("motif_rmsd", 0.0)
-            if os.path.isfile(top_bb):
-                fname = f"{top_cand['model_id']}_top_candidate_rmsd_{top_rmsd:.2f}A.pdb"
+            if os.path.isfile(top_src):
+                fname = f"{top_base}_top_candidate_rmsd_{top_rmsd:.2f}A.pdb"
                 top_dest = safe_join_path(work_results, fname)
-                shutil.copyfile(top_bb, top_dest)
+                shutil.copyfile(top_src, top_dest)
                 passing_models.append(top_dest)
+                top_fa = safe_join_path(work_mpnn, "seqs", f"{top_base}.fa")
+                if os.path.isfile(top_fa):
+                    shutil.copyfile(top_fa, safe_join_path(work_results, f"{top_base}_top_candidate.fa"))
 
         # Output metrics_summary.csv strictly within out_dir using 64KB buffering
         csv_path = safe_join_path(self.out_dir, "metrics_summary.csv")
