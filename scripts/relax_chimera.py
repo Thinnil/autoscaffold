@@ -13,18 +13,21 @@ import sys
 
 def find_default_input_pdb() -> str:
     patterns = [
+        "*/results/*.pdb",
+        "*/*/results/*.pdb",
+        "c_term/results/*.pdb",
         "n_terminal/results/*.pdb",
-        "n_terminal/2_mpnn/*_seq*.pdb",
-        "n_terminal/1_rfdiffusion/*.pdb",
-        "n_terminal/**/*.pdb",
-        "outputs/chimera_scaffold/results/*.pdb",
-        "outputs/chimera_scaffold/2_mpnn/*_seq*.pdb",
-        "results/*.pdb",
-        "*.pdb",
+        "*/2_mpnn/*_seq*.pdb",
+        "*/1_rfdiffusion/*.pdb",
+        "**/*.pdb",
     ]
     for pat in patterns:
         matches = glob.glob(pat, recursive=True)
-        valid = [m for m in matches if not any(k in m for k in ("relaxed", "clash_free", "minimized", "seed"))]
+        valid = [
+            m for m in matches
+            if not any(k in m for k in ("relaxed", "clash_free", "minimized", "seed", "0_prep"))
+            and os.path.isfile(m)
+        ]
         if valid:
             return sorted(valid, key=os.path.getmtime, reverse=True)[0]
     return ""
