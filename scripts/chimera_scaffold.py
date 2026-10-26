@@ -479,6 +479,39 @@ def build_multi_chain_manifest(
     )
 
 
+def _transform_pdb_coordinates(pdb_path: str, R: np.ndarray, t: np.ndarray) -> bool:
+    """
+    Transforms all 3D coordinates in a PDB file in-place by applying rotation R and translation t:
+        r_new = np.dot(r, R) + t
+    Used to place generated RFdiffusion candidates back into the exact original
+    crystallographic coordinate frame of the reference seed structure.
+    """
+    if not os.path.isfile(pdb_path):
+        return False
+    try:
+        lines_out = []
+        with open(pdb_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("ATOM  ") or line.startswith("HETATM"):
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                        r = np.array([x, y, z], dtype=np.float64)
+                        r_new = np.dot(r, R) + t
+                        mod_line = f"{line[:30]}{r_new[0]:8.3f}{r_new[1]:8.3f}{r_new[2]:8.3f}{line[54:]}"
+                        lines_out.append(mod_line)
+                    except (ValueError, IndexError):
+                        lines_out.append(line)
+                else:
+                    lines_out.append(line)
+        with open(pdb_path, "w", encoding="utf-8") as f:
+            f.writelines(lines_out)
+        return True
+    except Exception:
+        return False
+
+
 def audit_motif_cartesian_drift(
     candidate_pdb: str,
     reference_seed_pdb: str,
@@ -642,7 +675,30 @@ def audit_motif_cartesian_drift(
     if matched_pairs_cand:
         cand_arr = np.array(matched_pairs_cand, dtype=np.float64)
         seed_arr = np.array(matched_pairs_seed, dtype=np.float64)
-        vec_drifts = np.linalg.norm(cand_arr - seed_arr, axis=1)
+
+        # Check raw unaligned Euclidean deviation
+        raw_vec_drifts = np.linalg.norm(cand_arr - seed_arr, axis=1)
+
+        # Detect RFdiffusion bounding-box centering / coordinate origin shift:
+        # If candidate center of mass has shifted by > 5.0 Å from seed center of mass,
+        # RFdiffusion has re-centered the coordinate system around the origin.
+        # Align candidate back onto seed crystallographic frame using Kabsch fit.
+        cand_center = np.mean(cand_arr, axis=0)
+        seed_center = np.mean(seed_arr, axis=0)
+        com_shift = float(np.linalg.norm(cand_center - seed_center))
+
+        if com_shift > 5.0 and len(cand_arr) >= 3:
+            from kabsch_rmsd import kabsch_fit
+            try:
+                R_opt, t_opt, kabsch_rmsd, cand_aligned, sq_dist = kabsch_fit(
+                    cand_arr, seed_arr, return_aligned=True
+                )
+                vec_drifts = np.sqrt(sq_dist)
+                _transform_pdb_coordinates(real_cand, R_opt, t_opt)
+            except Exception:
+                vec_drifts = raw_vec_drifts
+        else:
+            vec_drifts = raw_vec_drifts
 
         matched_idx = 0
         for i, detail in enumerate(drift_details):
