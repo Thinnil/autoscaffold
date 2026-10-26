@@ -3008,14 +3008,56 @@ class ChimeraScaffolder:
                 pass
 
             # Automatic 2-Stage Soft-Core Minimization & PyMOL Clash Relief
+            relaxed_dest = safe_join_path(work_results, "chimera_minimized.pdb")
+            relax_script = safe_join_path(os.path.dirname(__file__), "relax_chimera.py")
+            relaxed_success = False
+
+            # Attempt 1: Direct in-process if OpenMM is available
             try:
                 from scripts.relax_chimera import relax_structure
-                relaxed_dest = safe_join_path(work_results, "chimera_minimized.pdb")
                 print("[+] Launching automatic 2-Stage Soft-Core Relaxation to eliminate PyMOL steric clashes...")
                 if relax_structure(canonical_res, relaxed_dest, max_iterations=150):
-                    print(f"✅ Polished clash-free structure ready at: {relaxed_dest}")
-            except Exception as e:
-                print(f"[*] Note on automated relaxation: {e}")
+                    relaxed_success = True
+            except Exception:
+                relaxed_success = False
+
+            # Attempt 2: If in-process failed (e.g. running in base conda), dispatch via colabfold_runner
+            if not relaxed_success and os.path.isfile(relax_script):
+                try:
+                    relax_cmd = self.colabfold_runner.build_command(
+                        relax_script,
+                        "--input",
+                        canonical_res,
+                        "--output",
+                        relaxed_dest,
+                        "--steps",
+                        "150",
+                    )
+                    cmd_str = " ".join(shlex.quote(arg) for arg in relax_cmd)
+                    print(f"[+] Dispatching relaxation via ColabFold environment: {cmd_str}")
+                    res = subprocess.run(relax_cmd, check=False, capture_output=True, text=True)
+                    if res.returncode == 0 and os.path.isfile(relaxed_dest):
+                        relaxed_success = True
+                    else:
+                        # Fallback to generic conda run -n colabfold
+                        res_conda = subprocess.run(
+                            [
+                                "conda", "run", "-n", "colabfold", "python",
+                                relax_script, "--input", canonical_res, "--output", relaxed_dest,
+                            ],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if res_conda.returncode == 0 and os.path.isfile(relaxed_dest):
+                            relaxed_success = True
+                except Exception as e:
+                    print(f"[*] Note on automated relaxation dispatch: {e}")
+
+            if relaxed_success:
+                print(f"✅ Polished clash-free structure ready at: {relaxed_dest}")
+                top_model_path = relaxed_dest
+                top_model_name = os.path.basename(relaxed_dest)
 
             pml_path = safe_join_path(work_results, "view_in_pymol.pml")
             pml_content = (

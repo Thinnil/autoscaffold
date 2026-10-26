@@ -213,6 +213,28 @@ def relax_structure(
         import openmm.app as app
         from openmm import unit
     except ImportError:
+        # Auto-dispatch via colabfold conda environment if available and not already dispatched
+        if not os.environ.get("_RELAX_DISPATCHED"):
+            try:
+                os.environ["_RELAX_DISPATCHED"] = "1"
+                cmd = [
+                    "conda", "run", "-n", "colabfold", "python",
+                    os.path.abspath(__file__),
+                    "--input", input_pdb,
+                    "--output", output_pdb,
+                    "--steps", str(max_iterations),
+                    "--k", str(restraint_k),
+                ]
+                print(
+                    "[+] OpenMM not in current Python environment. "
+                    "Auto-dispatching via 'colabfold' conda environment..."
+                )
+                res = subprocess.run(cmd, check=False)
+                if res.returncode == 0 and os.path.isfile(output_pdb):
+                    return True
+            except Exception as disp_err:
+                print(f"[*] Note on conda auto-dispatch: {disp_err}")
+
         print("[-] Error: OpenMM is not installed in the active Python environment.", file=sys.stderr)
         print("    Run: conda run -n colabfold python scripts/relax_chimera.py ...", file=sys.stderr)
         return False
