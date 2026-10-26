@@ -12,6 +12,31 @@ import os
 import shutil
 import subprocess
 import sys
+from typing import Any, List, Optional, Sequence, Union
+
+
+def validate_path(path: str, label: str = "Path", allow_missing: bool = False) -> str:
+    """
+    Validates a file path to prevent directory traversal and root directory overwrites.
+    Returns canonical real path.
+    """
+    if not path or not str(path).strip():
+        raise ValueError(f"{label} cannot be empty.")
+    raw = str(path).strip()
+    drive, rest = os.path.splitdrive(raw)
+    if (
+        (not drive and raw.rstrip("/\\") in ("", "/", "\\"))
+        or (drive and rest in ("/", "\\", ""))
+        or raw in ("/", "\\", "//", "\\\\")
+    ):
+        raise ValueError(f"Dangerous or root path specified for {label}: '{raw}'")
+    real = os.path.realpath(os.path.abspath(raw))
+    drive, rest = os.path.splitdrive(real)
+    if (not drive and real.rstrip("/\\") in ("", "/")) or (drive and rest in ("/", "\\", "")):
+        raise ValueError(f"Dangerous or root path specified for {label}: '{raw}'")
+    if not allow_missing and not os.path.isfile(real):
+        raise FileNotFoundError(f"{label} file not found: '{real}'")
+    return real
 
 
 def find_default_input_pdb() -> str:
@@ -39,7 +64,7 @@ def find_default_input_pdb() -> str:
     return ""
 
 
-def count_steric_clashes(topology, positions, cutoff_angstrom: float = 1.9) -> int:
+def count_steric_clashes(topology: Any, positions: Any, cutoff_angstrom: float = 1.9) -> int:
     """
     Counts pairs of non-bonded heavy atoms closer than cutoff_angstrom (default 1.9 Å).
     In PyMOL, interatomic distances below ~1.9 Å trigger false stick bonds.
@@ -76,7 +101,7 @@ def count_steric_clashes(topology, positions, cutoff_angstrom: float = 1.9) -> i
         return 0
 
 
-def untangle_severe_clashes(topology, positions, min_dist_angstrom: float = 1.2):
+def untangle_severe_clashes(topology: Any, positions: Any, min_dist_angstrom: float = 1.2) -> Any:
     """
     Soft-Core geometric pre-pass:
     Identifies non-bonded sidechain atoms that directly overlap (distance < 1.2 Å)
@@ -185,17 +210,181 @@ def relax_with_colabfold_amber(input_pdb: str, output_pdb: str) -> bool:
     return False
 
 
+def parse_res_indices(res_spec: Any) -> List[int]:
+    """
+    Parses comma-separated residue ranges or indices, e.g. '55-57,110-112' or '55,56,57'.
+    """
+    if not res_spec:
+        return []
+    if isinstance(res_spec, (list, tuple, set)):
+        return sorted(list(set(int(x) for x in res_spec)))
+    indices = []
+    for part in str(res_spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                s, e = part.split("-", 1)
+                indices.extend(range(int(s.strip()), int(e.strip()) + 1))
+            except ValueError:
+                pass
+        elif part.isdigit():
+            indices.append(int(part))
+    return sorted(list(set(indices)))
+
+
+def relax_with_selective_pinning(
+    input_pdb: str,
+    output_pdb: str,
+    motif_res_indices: Sequence[Union[int, str]],  # 1-based indices in input_pdb
+    vessel_res_indices: Sequence[Union[int, str]],  # 1-based indices in input_pdb
+    k_motif: float = 5000.0,  # kJ/mol/nm^2
+    k_vessel: float = 500.0,  # kJ/mol/nm^2
+    k_linker: float = 0.0,  # kJ/mol/nm^2
+    max_iterations: int = 200,
+) -> bool:
+    """
+    OpenMM minimization with 3-tier selective harmonic pinning:
+    - Motif heavy atoms (non-hydrogen): pinned at k_motif (5000 kJ/mol/nm^2)
+    - Vessel framework backbone (N, CA, C, O): pinned at k_vessel (500 kJ/mol/nm^2)
+    - Designed linkers: k_linker (0.0 kJ/mol/nm^2) to freely resolve clashes
+    """
+    try:
+        import openmm as mm
+        import openmm.app as app
+        from openmm import unit
+    except ImportError:
+        print("[-] Error: OpenMM is not installed in the active Python environment.", file=sys.stderr)
+        return False
+
+    try:
+        input_pdb = validate_path(input_pdb, label="Input PDB", allow_missing=False)
+        output_pdb = validate_path(output_pdb, label="Output PDB", allow_missing=True)
+    except Exception as e:
+        print(f"[-] Path validation error in selective pinning: {e}", file=sys.stderr)
+        return False
+
+    if not os.path.isfile(input_pdb):
+        print(f"[-] Error: Input PDB file not found: {input_pdb}", file=sys.stderr)
+        return False
+
+    pdb = app.PDBFile(input_pdb)
+    forcefield = app.ForceField("amber14-all.xml")
+
+    # 1. Soft-Core geometric pre-pass for overlapping sidechain atoms (d < 1.2 Å)
+    positions = untangle_severe_clashes(pdb.topology, pdb.positions, min_dist_angstrom=1.2)
+
+    system = forcefield.createSystem(pdb.topology, nonbondedMethod=app.NoCutoff, constraints=app.HBonds)
+
+    # 2. Configure Selective CustomExternalForce
+    restraint = mm.CustomExternalForce("0.5 * k * periodicdistance(x, y, z, x0, y0, z0)^2")
+    restraint.addPerParticleParameter("k")
+    restraint.addPerParticleParameter("x0")
+    restraint.addPerParticleParameter("y0")
+    restraint.addPerParticleParameter("z0")
+
+    motif_set = frozenset(parse_res_indices(motif_res_indices))
+    vessel_set = frozenset(parse_res_indices(vessel_res_indices))
+
+    # Pre-classify residues once in O(R) time for O(1) atom lookups
+    res_classification = {}
+    for residue in pdb.topology.residues():
+        res_idx = residue.index + 1  # 1-based sequential
+        try:
+            pdb_res_idx = int(residue.id)
+        except (ValueError, TypeError):
+            pdb_res_idx = res_idx
+        is_m = (res_idx in motif_set) or (pdb_res_idx in motif_set)
+        is_v = (res_idx in vessel_set) or (pdb_res_idx in vessel_set)
+        res_classification[residue.index] = (is_m, is_v)
+
+    backbone_names = frozenset(("N", "CA", "C", "O"))
+
+    for atom in pdb.topology.atoms():
+        is_motif, is_vessel = res_classification.get(atom.residue.index, (False, False))
+
+        # Skip linker atoms completely when k_linker == 0.0 to avoid unused force particles
+        if not (is_motif or is_vessel or k_linker > 0.0):
+            continue
+
+        pos = positions[atom.index]
+        if hasattr(pos, "value_in_unit"):
+            p_nm = pos.value_in_unit(unit.nanometer)
+            px, py, pz = p_nm[0], p_nm[1], p_nm[2]
+        elif hasattr(pos, "x"):
+            px, py, pz = pos.x, pos.y, pos.z
+        else:
+            px, py, pz = pos[0], pos[1], pos[2]
+
+        if is_motif:
+            # Pin both backbone and heavy atoms of motif to preserve catalytic rotamers
+            if atom.element and atom.element.symbol != "H":
+                restraint.addParticle(atom.index, [k_motif, px, py, pz])
+        elif is_vessel:
+            # Restrain vessel backbone only
+            if atom.name in backbone_names:
+                restraint.addParticle(atom.index, [k_vessel, px, py, pz])
+        elif k_linker > 0.0:
+            restraint.addParticle(atom.index, [k_linker, px, py, pz])
+
+    system.addForce(restraint)
+
+    integrator = mm.LangevinIntegrator(300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds)
+    simulation = app.Simulation(pdb.topology, system, integrator)
+    simulation.context.setPositions(positions)
+
+    # Stage 1: Soft-Core L-BFGS de-clashing (50 steps)
+    simulation.minimizeEnergy(tolerance=10.0 * unit.kilojoules_per_mole / unit.nanometer, maxIterations=50)
+
+    # Stage 2: High-Precision AMBER14 Minimization
+    simulation.minimizeEnergy(tolerance=1.0 * unit.kilojoules_per_mole / unit.nanometer, maxIterations=max_iterations)
+
+    final_state = simulation.context.getState(getPositions=True)
+    out_dir = os.path.dirname(os.path.abspath(output_pdb))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(output_pdb, "w", encoding="utf-8") as f:
+        app.PDBFile.writeFile(pdb.topology, final_state.getPositions(), f)
+
+    return True
+
+
 def relax_structure(
     input_pdb: str,
     output_pdb: str,
     max_iterations: int = 150,
     restraint_k: float = 1000.0,
     engine: str = "auto",
+    motif_res_indices: Optional[Sequence[Union[int, str]]] = None,
+    vessel_res_indices: Optional[Sequence[Union[int, str]]] = None,
+    k_motif: float = 5000.0,
+    k_vessel: float = 500.0,
+    k_linker: float = 0.0,
 ) -> bool:
     """
     Performs 2-Stage Soft-Core Minimization with harmonic backbone restraints.
+    If motif_res_indices or vessel_res_indices are provided, applies 3-tier selective harmonic pinning.
     Guarantees elimination of false covalent bonds in PyMOL (< 1.9 Å clashes).
     """
+    try:
+        input_pdb = validate_path(input_pdb, label="Input PDB", allow_missing=False)
+        output_pdb = validate_path(output_pdb, label="Output PDB", allow_missing=True)
+    except Exception as e:
+        print(f"[-] Path validation error in relax_structure: {e}", file=sys.stderr)
+        return False
+
+    if motif_res_indices is not None or vessel_res_indices is not None:
+        return relax_with_selective_pinning(
+            input_pdb=input_pdb,
+            output_pdb=output_pdb,
+            motif_res_indices=motif_res_indices or [],
+            vessel_res_indices=vessel_res_indices or [],
+            k_motif=k_motif,
+            k_vessel=k_vessel,
+            k_linker=k_linker,
+            max_iterations=max_iterations,
+        )
     if not os.path.isfile(input_pdb):
         print(f"[-] Error: Input PDB file not found: {input_pdb}", file=sys.stderr)
         return False
@@ -346,6 +535,32 @@ def main():
         default="auto",
         help="Relaxation engine [Default: auto]",
     )
+    parser.add_argument(
+        "--motif_res",
+        help="Comma-separated residue indices for motif heavy atoms (e.g. '55-57,110-112' or '55,56,57')",
+    )
+    parser.add_argument(
+        "--vessel_res",
+        help="Comma-separated residue indices for vessel framework",
+    )
+    parser.add_argument(
+        "--k_motif",
+        type=float,
+        default=5000.0,
+        help="Force constant for motif heavy atoms in kJ/mol/nm^2 [Default: 5000.0]",
+    )
+    parser.add_argument(
+        "--k_vessel",
+        type=float,
+        default=500.0,
+        help="Force constant for vessel backbone atoms in kJ/mol/nm^2 [Default: 500.0]",
+    )
+    parser.add_argument(
+        "--k_linker",
+        type=float,
+        default=0.0,
+        help="Force constant for designed linkers in kJ/mol/nm^2 [Default: 0.0]",
+    )
 
     args = parser.parse_args()
     input_file = args.input or find_default_input_pdb()
@@ -354,13 +569,34 @@ def main():
         print("    Specify explicitly with: python scripts/relax_chimera.py --input /path/to/file.pdb", file=sys.stderr)
         sys.exit(1)
 
+    try:
+        input_file = validate_path(input_file, label="Input PDB", allow_missing=False)
+    except Exception as e:
+        print(f"[-] Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     output_file = args.output
     if not output_file:
         base, ext = os.path.splitext(input_file)
         output_file = f"{base}_relaxed{ext}"
 
+    try:
+        output_file = validate_path(output_file, label="Output PDB", allow_missing=True)
+    except Exception as e:
+        print(f"[-] Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     success = relax_structure(
-        input_file, output_file, max_iterations=args.steps, restraint_k=args.k, engine=args.engine
+        input_file,
+        output_file,
+        max_iterations=args.steps,
+        restraint_k=args.k,
+        engine=args.engine,
+        motif_res_indices=parse_res_indices(args.motif_res) if args.motif_res else None,
+        vessel_res_indices=parse_res_indices(args.vessel_res) if args.vessel_res else None,
+        k_motif=args.k_motif,
+        k_vessel=args.k_vessel,
+        k_linker=args.k_linker,
     )
     sys.exit(0 if success else 1)
 

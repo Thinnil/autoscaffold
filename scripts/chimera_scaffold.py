@@ -26,6 +26,8 @@ Performs:
 
 import argparse
 import csv
+import functools
+import gc
 import json
 import math
 import os
@@ -50,6 +52,7 @@ from pse_pdb_extractor import (  # noqa: E402
     extract_and_merge_objects,
     safe_join_path,
     validate_output_dir,
+    SafeSessionUnpickler,
 )
 from extract_fixed_motif import parse_residue_spec  # noqa: E402
 from kabsch_rmsd import calculate_motif_rmsd, extract_coordinates  # noqa: E402
@@ -61,6 +64,15 @@ from methodology_reporter import generate_methodology_report  # noqa: E402
 _CA_COORDS_CACHE: Dict[Tuple[str, float], Dict[Tuple[str, int], np.ndarray]] = {}
 _FALLBACK_COORDS_CACHE: Dict[Tuple[str, float], Dict[Tuple[str, int], np.ndarray]] = {}
 _RESI_COORDS_CACHE: Dict[Tuple[str, float], Dict[int, np.ndarray]] = {}
+
+# In-memory session cache for parsed residue anchor atoms:
+# Key: (real_path, mtime) -> {(chain, resi, atom_name): np.ndarray}
+_ANCHOR_COORDS_CACHE: Dict[Tuple[str, float], Dict[Tuple[str, int, str], np.ndarray]] = {}
+_ANCHOR_FALLBACK_CACHE: Dict[Tuple[str, float], Dict[Tuple[str, int], np.ndarray]] = {}
+
+# In-memory session cache for parsed reference seed CA coordinates:
+# Key: (real_path, mtime) -> {seed_resi: np.ndarray}
+_SEED_CA_CACHE: Dict[Tuple[str, float], Dict[int, np.ndarray]] = {}
 
 # In-memory session cache for Python environment probes:
 # Key: (tuple(cmd_prefix) or real_bin, tuple(sorted(req_modules))) -> probe_result_dict
@@ -85,6 +97,9 @@ def clear_ca_coords_cache() -> None:
     _CA_COORDS_CACHE.clear()
     _FALLBACK_COORDS_CACHE.clear()
     _RESI_COORDS_CACHE.clear()
+    _ANCHOR_COORDS_CACHE.clear()
+    _ANCHOR_FALLBACK_CACHE.clear()
+    _SEED_CA_CACHE.clear()
 
 
 def clear_probe_cache() -> None:
@@ -105,6 +120,670 @@ ONE_TO_THREE = {
     "M": "MET", "N": "ASN", "P": "PRO", "Q": "GLN", "R": "ARG",
     "S": "SER", "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR",
 }
+
+
+@dataclass(frozen=True)
+class MotifAtom:
+    atom_name: str
+    element: str
+    coords: np.ndarray  # shape: (3,), dtype: float64
+    occupancy: float = 1.0
+    b_factor: float = 0.0
+
+
+@dataclass
+class MotifResidue:
+    source_file: str
+    source_chain: str
+    orig_resi: int
+    resn: str
+    insertion_code: str = ""
+    atoms: Dict[str, MotifAtom] = field(default_factory=dict)
+
+    @property
+    def ca_coords(self) -> Optional[np.ndarray]:
+        if "CA" in self.atoms:
+            return self.atoms["CA"].coords
+        for name in ("N", "C", "CB"):
+            if name in self.atoms:
+                return self.atoms[name].coords
+        return None
+
+
+@dataclass
+class MotifSegment:
+    segment_id: str  # e.g. "D1_S1", "D2_S1", "D1", "D2"
+    source_file: str
+    source_chain: str
+    residues: List[MotifResidue]
+
+    @property
+    def start_resi(self) -> int:
+        return self.residues[0].orig_resi
+
+    @property
+    def end_resi(self) -> int:
+        return self.residues[-1].orig_resi
+
+    @property
+    def length(self) -> int:
+        return len(self.residues)
+
+    @property
+    def n_term_ca(self) -> Optional[np.ndarray]:
+        return self.residues[0].ca_coords
+
+    @property
+    def c_term_ca(self) -> Optional[np.ndarray]:
+        return self.residues[-1].ca_coords
+
+    @property
+    def n_term_n(self) -> Optional[np.ndarray]:
+        if not self.residues:
+            return None
+        res = self.residues[0]
+        if "N" in res.atoms:
+            return res.atoms["N"].coords
+        return res.ca_coords
+
+    @property
+    def c_term_c(self) -> Optional[np.ndarray]:
+        if not self.residues:
+            return None
+        res = self.residues[-1]
+        if "C" in res.atoms:
+            return res.atoms["C"].coords
+        return res.ca_coords
+
+
+@dataclass
+class MultiChainMotifManifest:
+    source_files: List[str]
+    segments: List[MotifSegment]
+    total_residues: int
+    provenance_map: Dict[int, Dict[str, Any]]  # seed_resi -> original metadata
+
+
+@functools.lru_cache(maxsize=4096)
+def compute_gap_linker_length(d_gap: float) -> Tuple[int, int]:
+    """
+    Calculates dynamic linker length interval [L_min, L_max] from Euclidean gap distance.
+    L_min = max(3, ceil(d_gap / 3.2))
+    L_max = L_min + 5
+    """
+    l_min = max(3, int(math.ceil(float(d_gap) / 3.2)))
+    l_max = l_min + 5
+    return (l_min, l_max)
+
+
+@functools.lru_cache(maxsize=4096)
+def compute_gap_linker_string(d_gap: float) -> str:
+    """Returns formatted linker string 'L_min-L_max' from Euclidean gap distance."""
+    l_min, l_max = compute_gap_linker_length(round(float(d_gap), 3))
+    return f"{l_min}-{l_max}"
+
+
+def parse_multi_chain_motif_spec(
+    motif_spec: str,
+    default_source_file: str = "",
+    default_chain: str = "A",
+) -> List[Tuple[str, str, int]]:
+    """
+    Parses a multi-chain or multi-PDB motif specification into ordered (source_file, chain_id, resi) tuples.
+    Grammar:
+      <motif_spec>       ::= <motif_entry> ( "," <motif_entry> )*
+      <motif_entry>      ::= [ <source_file> ":" ] <chain_id> ":" <residue_ranges>
+      <source_file>      ::= [a-zA-Z0-9_\\-\\.\\/\\\\]+
+      <chain_id>         ::= [a-zA-Z0-9]
+      <residue_ranges>   ::= <range_item> ( "+" <range_item> | "," <range_item> )*
+      <range_item>       ::= <integer> [ "-" <integer> ]
+    """
+    if not motif_spec or not str(motif_spec).strip():
+        return []
+
+    tokens = [t.strip() for t in str(motif_spec).split(",") if t.strip()]
+    results: List[Tuple[str, str, int]] = []
+
+    curr_file = default_source_file
+    curr_chain = default_chain
+
+    for token in tokens:
+        # Check colons, accounting for Windows drive letters (e.g. C:\path\file.pdb:A:1-10)
+        parts = token.split(":")
+        if len(parts) >= 3:
+            range_str = parts[-1].strip()
+            chain_cand = parts[-2].strip()
+            file_cand = ":".join(parts[:-2]).strip()
+            curr_file = file_cand
+            curr_chain = chain_cand
+        elif len(parts) == 2:
+            first, second = parts[0].strip(), parts[1].strip()
+            if len(first) <= 4:
+                curr_chain = first
+                range_str = second
+            else:
+                curr_file = first
+                curr_chain = second
+                range_str = ""
+        else:
+            range_str = token.strip()
+
+        # Validate chain ID against directory traversal
+        if ".." in curr_chain or "/" in curr_chain or "\\" in curr_chain:
+            raise ValueError(f"Path traversal detected in motif chain ID: '{curr_chain}'")
+
+        # Validate file path against root system directory paths
+        if curr_file:
+            p_drive, p_rest = os.path.splitdrive(curr_file)
+            if (
+                (not p_drive and curr_file.rstrip("/\\") in ("", "/", "\\"))
+                or (p_drive and p_rest in ("/", "\\", ""))
+                or curr_file in ("/", "\\", "//", "\\\\")
+            ):
+                raise ValueError(f"Dangerous or root file specified in motif specification: '{curr_file}'")
+
+        # Parse range items split by '+'
+        for sub in range_str.split("+"):
+            sub = sub.strip()
+            if not sub:
+                continue
+            if "-" in sub:
+                try:
+                    s_str, e_str = sub.split("-", 1)
+                    s_int = int(s_str.strip())
+                    e_int = int(e_str.strip())
+                    step = 1 if s_int <= e_int else -1
+                    for r in range(s_int, e_int + step, step):
+                        results.append((curr_file, curr_chain, r))
+                except ValueError:
+                    pass
+            elif sub.isdigit():
+                results.append((curr_file, curr_chain, int(sub)))
+
+    return results
+
+
+def build_multi_chain_manifest(
+    motif_spec: str,
+    default_source_file: str = "",
+    default_chain: str = "A",
+    file_atom_cache: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> MultiChainMotifManifest:
+    """
+    Parses motif specification and partitions into continuous MotifSegment instances.
+    Auto-segmentation triggers when:
+      1. source_file changes
+      2. source_chain changes
+      3. Delta resi > 1
+      4. CA-CA distance > 4.20 Å
+    """
+    ordered_items = parse_multi_chain_motif_spec(motif_spec, default_source_file, default_chain)
+    if not ordered_items:
+        raise ValueError(f"No valid residues found in motif specification: '{motif_spec}'")
+
+    unique_files = []
+    for f, _, _ in ordered_items:
+        if f and f not in unique_files:
+            unique_files.append(f)
+    if not unique_files and default_source_file:
+        unique_files.append(default_source_file)
+
+    # Cache atom lines per file
+    atoms_by_file: Dict[str, Dict[Tuple[str, int], Dict[str, Any]]] = {}
+    for fpath in unique_files:
+        if not fpath:
+            continue
+        p_drive, p_rest = os.path.splitdrive(fpath)
+        if (
+            (not p_drive and fpath.rstrip("/\\") in ("", "/", "\\"))
+            or (p_drive and p_rest in ("/", "\\", ""))
+            or fpath in ("/", "\\", "//", "\\\\")
+        ):
+            raise ValueError(f"Dangerous or root file specified in multi-PDB motif: '{fpath}'")
+        real_fpath = os.path.realpath(os.path.abspath(fpath))
+        p_drive, p_rest = os.path.splitdrive(real_fpath)
+        if (not p_drive and real_fpath.rstrip("/\\") in ("", "/")) or (p_drive and p_rest in ("/", "\\", "")):
+            raise ValueError(f"Dangerous or root file specified in multi-PDB motif: '{fpath}'")
+        if not os.path.isfile(real_fpath):
+            continue
+        res_atoms: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        with open(real_fpath, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("ATOM  ") or line.startswith("HETATM"):
+                    try:
+                        resi = int(line[22:26])
+                    except ValueError:
+                        continue
+                    ch = line[21].strip() or "A"
+                    atom_name = line[12:16].strip()
+                    resn = line[17:20].strip()
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                    except ValueError:
+                        continue
+                    try:
+                        occ = float(line[54:60])
+                    except (ValueError, IndexError):
+                        occ = 1.0
+                    try:
+                        b_fac = float(line[60:66])
+                    except (ValueError, IndexError):
+                        b_fac = 0.0
+                    elem = line[76:78].strip() if len(line) >= 78 else atom_name[:1]
+
+                    key = (ch, resi)
+                    if key not in res_atoms:
+                        res_atoms[key] = {"resn": resn, "atoms": {}}
+                    res_atoms[key]["atoms"][atom_name] = MotifAtom(
+                        atom_name=atom_name,
+                        element=elem,
+                        coords=np.array([x, y, z], dtype=np.float64),
+                        occupancy=occ,
+                        b_factor=b_fac,
+                    )
+        atoms_by_file[fpath] = res_atoms
+
+    # Construct MotifResidue objects
+    residues: List[MotifResidue] = []
+    for fpath, ch, resi in ordered_items:
+        file_data = atoms_by_file.get(fpath, {})
+        key = (ch, resi)
+        if key in file_data:
+            resn = file_data[key]["resn"]
+            atoms = file_data[key]["atoms"]
+        else:
+            resn = "GLY"
+            atoms = {}
+        residues.append(
+            MotifResidue(
+                source_file=fpath,
+                source_chain=ch,
+                orig_resi=resi,
+                resn=resn,
+                atoms=atoms,
+            )
+        )
+
+    # Auto-segmentation
+    segments: List[MotifSegment] = []
+    curr_seg_res: List[MotifResidue] = []
+    seg_idx = 1
+
+    for i, res in enumerate(residues):
+        if i == 0:
+            curr_seg_res.append(res)
+            continue
+
+        prev_res = residues[i - 1]
+        break_segment = False
+
+        if res.source_file != prev_res.source_file:
+            break_segment = True
+        elif res.source_chain != prev_res.source_chain:
+            break_segment = True
+        elif (res.orig_resi - prev_res.orig_resi) != 1:
+            break_segment = True
+        else:
+            c1 = prev_res.ca_coords
+            c2 = res.ca_coords
+            if c1 is not None and c2 is not None:
+                dist = float(np.linalg.norm(c1 - c2))
+                if dist > 4.20:
+                    break_segment = True
+
+        if break_segment:
+            segments.append(
+                MotifSegment(
+                    segment_id=f"D{seg_idx}",
+                    source_file=curr_seg_res[0].source_file,
+                    source_chain=curr_seg_res[0].source_chain,
+                    residues=curr_seg_res,
+                )
+            )
+            seg_idx += 1
+            curr_seg_res = [res]
+        else:
+            curr_seg_res.append(res)
+
+    if curr_seg_res:
+        segments.append(
+            MotifSegment(
+                segment_id=f"D{seg_idx}",
+                source_file=curr_seg_res[0].source_file,
+                source_chain=curr_seg_res[0].source_chain,
+                residues=curr_seg_res,
+            )
+        )
+
+    # Build provenance map (1-based sequential seed residue index)
+    provenance_map: Dict[int, Dict[str, Any]] = {}
+    seed_idx = 1
+    for seg in segments:
+        for res in seg.residues:
+            provenance_map[seed_idx] = {
+                "source_file": seg.source_file,
+                "source_chain": seg.source_chain,
+                "orig_resi": res.orig_resi,
+                "resn": res.resn,
+                "segment_id": seg.segment_id,
+            }
+            seed_idx += 1
+
+    return MultiChainMotifManifest(
+        source_files=unique_files,
+        segments=segments,
+        total_residues=len(residues),
+        provenance_map=provenance_map,
+    )
+
+
+def audit_motif_cartesian_drift(
+    candidate_pdb: str,
+    reference_seed_pdb: str,
+    seed_provenance: Dict[Union[int, str], Dict[str, Any]],
+) -> Tuple[float, float, List[Dict[str, Any]]]:
+    """
+    Strict Cartesian drift audit against original seed coordinates.
+    Computes absolute unaligned Euclidean deviation between candidate backbone CA
+    and reference seed CA coordinates.
+    Returns (max_drift, mean_drift, drift_details).
+    Pass criteria:
+      max_drift <= 0.80 Å and mean_drift <= 0.50 Å
+    """
+    if not candidate_pdb or not os.path.isfile(candidate_pdb):
+        return 999.0, 999.0, [{"error": "candidate_pdb_not_found"}]
+    if not reference_seed_pdb or not os.path.isfile(reference_seed_pdb):
+        return 999.0, 999.0, [{"error": "reference_seed_pdb_not_found"}]
+
+    # Path validation against dangerous/root paths
+    for p_label, p_path in [("candidate_pdb", candidate_pdb), ("reference_seed_pdb", reference_seed_pdb)]:
+        p_drive, p_rest = os.path.splitdrive(p_path)
+        if (
+            (not p_drive and p_path.rstrip("/\\") in ("", "/", "\\"))
+            or (p_drive and p_rest in ("/", "\\", ""))
+            or p_path in ("/", "\\", "//", "\\\\")
+        ):
+            raise ValueError(f"Dangerous or root file specified for {p_label}: '{p_path}'")
+
+    real_seed = os.path.realpath(os.path.abspath(reference_seed_pdb))
+    real_cand = os.path.realpath(os.path.abspath(candidate_pdb))
+
+    # Fast in-memory cached extraction of reference seed motif CA coordinates (O(1) on repeated audits)
+    try:
+        seed_mtime = os.path.getmtime(real_seed)
+    except OSError:
+        seed_mtime = 0.0
+    seed_cache_key = (real_seed, seed_mtime)
+
+    if seed_cache_key in _SEED_CA_CACHE:
+        seed_ca = _SEED_CA_CACHE[seed_cache_key]
+    else:
+        seed_ca: Dict[int, np.ndarray] = {}
+        with open(real_seed, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if (line.startswith("ATOM  ") or line.startswith("HETATM")) and line[12:16].strip() == "CA":
+                    try:
+                        resi = int(line[22:26])
+                        ch = line[21].strip()
+                        if ch in ("D", "A", ""):
+                            x = float(line[30:38])
+                            y = float(line[38:46])
+                            z = float(line[46:54])
+                            seed_ca[resi] = np.array([x, y, z], dtype=np.float64)
+                    except ValueError:
+                        continue
+        _SEED_CA_CACHE[seed_cache_key] = seed_ca
+
+    # Extract candidate CA coordinates with O(1) resi indexing & vectorized coordinates
+    cand_ca_by_resi: Dict[Tuple[str, int], np.ndarray] = {}
+    cand_ca_by_num: Dict[int, np.ndarray] = {}
+    cand_coords_list: List[np.ndarray] = []
+
+    with open(real_cand, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if (line.startswith("ATOM  ") or line.startswith("HETATM")) and line[12:16].strip() == "CA":
+                try:
+                    resi = int(line[22:26])
+                    ch = line[21].strip()
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coord = np.array([x, y, z], dtype=np.float64)
+                    cand_ca_by_resi[(ch, resi)] = coord
+                    if resi not in cand_ca_by_num:
+                        cand_ca_by_num[resi] = coord
+                    cand_coords_list.append(coord)
+                except ValueError:
+                    continue
+
+    cand_coords_matrix = (
+        np.array(cand_coords_list, dtype=np.float64)
+        if cand_coords_list
+        else np.empty((0, 3), dtype=np.float64)
+    )
+
+    # TRB mapping if available (safely unpickled using restricted SafeSessionUnpickler)
+    trb_path = real_cand[:-4] + ".trb" if real_cand.endswith(".pdb") else real_cand + ".trb"
+    trb_map: Dict[int, int] = {}
+    if os.path.isfile(trb_path):
+        try:
+            with open(trb_path, "rb") as pf:
+                trb_data = SafeSessionUnpickler(pf).load()
+            if isinstance(trb_data, dict) and "con_ref_pdb_idx" in trb_data:
+                for h_idx, r_item in enumerate(trb_data["con_ref_pdb_idx"]):
+                    if r_item is not None:
+                        ref_ch = str(r_item[0]).strip().upper()
+                        ref_r = int(r_item[1])
+                        if ref_ch in ("D", "A"):
+                            trb_map[ref_r] = h_idx + 1
+        except Exception:
+            pass
+
+    drift_details = []
+    matched_pairs_cand: List[np.ndarray] = []
+    matched_pairs_seed: List[np.ndarray] = []
+    unmatched_indices: List[int] = []
+
+    for seed_key, meta in seed_provenance.items():
+        s_resi = int(seed_key)
+        target_seed_ca = seed_ca.get(s_resi)
+        if target_seed_ca is None:
+            orig_r = meta.get("orig_resi")
+            if orig_r in seed_ca:
+                target_seed_ca = seed_ca[orig_r]
+
+        if target_seed_ca is None:
+            continue
+
+        matched_cand_ca = None
+        # Priority 1: TRB file hal index mapping (O(1) dictionary lookup)
+        if s_resi in trb_map:
+            hal_resi = trb_map[s_resi]
+            matched_cand_ca = cand_ca_by_num.get(hal_resi)
+
+        # Priority 2: Direct chain D / resi match (O(1) dictionary lookup)
+        if matched_cand_ca is None and ("D", s_resi) in cand_ca_by_resi:
+            matched_cand_ca = cand_ca_by_resi[("D", s_resi)]
+
+        # Priority 3: Direct resi match in single-chain candidate (O(1) lookup)
+        if matched_cand_ca is None:
+            cand_c = cand_ca_by_num.get(s_resi)
+            if cand_c is not None and np.linalg.norm(cand_c - target_seed_ca) < 4.5:
+                matched_cand_ca = cand_c
+
+        # Priority 4: Nearest neighbor CA within 6.0 Å (Vectorized NumPy matrix distance)
+        if matched_cand_ca is None and len(cand_coords_matrix) > 0:
+            diffs = cand_coords_matrix - target_seed_ca
+            dists_sq = np.sum(diffs * diffs, axis=1)
+            min_idx = int(np.argmin(dists_sq))
+            if dists_sq[min_idx] < 36.0:  # 6.0 Å squared
+                matched_cand_ca = cand_coords_matrix[min_idx]
+
+        curr_detail_idx = len(drift_details)
+        drift_details.append({
+            "seed_resi": s_resi,
+            "orig_resi": meta.get("orig_resi"),
+            "source_chain": meta.get("source_chain"),
+            "drift": 999.0,
+        })
+
+        if matched_cand_ca is not None:
+            matched_pairs_cand.append(matched_cand_ca)
+            matched_pairs_seed.append(target_seed_ca)
+        else:
+            unmatched_indices.append(curr_detail_idx)
+
+    if not drift_details:
+        return 999.0, 999.0, [{"error": "no_motif_residues_audited"}]
+
+    drifts: List[float] = []
+    if matched_pairs_cand:
+        cand_arr = np.array(matched_pairs_cand, dtype=np.float64)
+        seed_arr = np.array(matched_pairs_seed, dtype=np.float64)
+        vec_drifts = np.linalg.norm(cand_arr - seed_arr, axis=1)
+
+        matched_idx = 0
+        for i, detail in enumerate(drift_details):
+            if i not in unmatched_indices:
+                d_val = float(vec_drifts[matched_idx])
+                detail["drift"] = d_val
+                drifts.append(d_val)
+                matched_idx += 1
+            else:
+                drifts.append(999.0)
+    else:
+        drifts = [999.0] * len(drift_details)
+
+    max_drift = float(np.max(drifts))
+    mean_drift = float(np.mean(drifts))
+    return max_drift, mean_drift, drift_details
+
+
+def _purge_candidate_artifacts(prefix: str, cand_pdb: Optional[str] = None) -> None:
+    """
+    Safely purges all artifacts generated for a rejected or failed candidate attempt,
+    including candidate PDB, TRB, and any intermediate output files, preventing disk bloating
+    and file handle leaks.
+    """
+    to_delete = set()
+    if cand_pdb:
+        to_delete.add(cand_pdb)
+        trb = cand_pdb[:-4] + ".trb" if cand_pdb.endswith(".pdb") else cand_pdb + ".trb"
+        to_delete.add(trb)
+
+    if prefix:
+        work_dir = os.path.dirname(os.path.abspath(prefix))
+        base_prefix = os.path.basename(prefix)
+        if os.path.isdir(work_dir):
+            try:
+                for fname in os.listdir(work_dir):
+                    if fname.startswith(base_prefix):
+                        to_delete.add(os.path.join(work_dir, fname))
+            except OSError:
+                pass
+
+    for file_path in to_delete:
+        try:
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def run_closed_loop_backbone_generation(
+    seed_pdb: str,
+    contig_str: str,
+    seed_provenance: Dict[Union[int, str], Dict[str, Any]],
+    target_passing_designs: int = 3,
+    max_attempts: int = 50,
+    max_drift_cutoff: float = 0.8,
+    mean_drift_cutoff: float = 0.5,
+    rfdiff_runner: Optional[Any] = None,
+    rfdiff_script: Optional[str] = None,
+    work_dir: str = "1_rfdiffusion",
+    sampler_fn: Optional[Any] = None,
+) -> List[str]:
+    """
+    Executes an active, iterative trial-and-error generation loop.
+    Discards non-viable designs in-flight, stopping only when target_passing_designs
+    pass strict Cartesian drift auditing, or max_attempts is reached.
+    Safely purges all rejected micro-batch candidate artifacts and manages memory.
+    """
+    p_drive, p_rest = os.path.splitdrive(work_dir)
+    if (
+        (not p_drive and work_dir.rstrip("/\\") in ("", "/", "\\"))
+        or (p_drive and p_rest in ("/", "\\", ""))
+        or work_dir in ("/", "\\", "//", "\\\\")
+    ):
+        raise ValueError(f"Dangerous or root work directory specified: '{work_dir}'")
+
+    os.makedirs(work_dir, exist_ok=True)
+    passing_backbones: List[str] = []
+    attempt = 0
+
+    while len(passing_backbones) < target_passing_designs and attempt < max_attempts:
+        attempt += 1
+        prefix = safe_join_path(work_dir, f"candidate_{attempt}")
+
+        cand_pdb = None
+        if sampler_fn is not None:
+            cand_pdb = sampler_fn(seed_pdb, contig_str, prefix, attempt)
+        else:
+            if not rfdiff_runner or not rfdiff_script or not os.path.isfile(rfdiff_script):
+                raise FileNotFoundError(f"RFdiffusion script not found: '{rfdiff_script}'")
+            cmd = rfdiff_runner.build_command(
+                rfdiff_script,
+                f"inference.output_prefix={prefix}",
+                f"inference.input_pdb={seed_pdb}",
+                f"contigmap.contigs=[{contig_str}]",
+                "inference.num_designs=1",
+                "denoiser.noise_scale_ca=0.0",
+                "denoiser.noise_scale_frame=0.0",
+            )
+            rfdiff_repo = os.path.dirname(os.path.dirname(os.path.abspath(rfdiff_script)))
+            subprocess.run(cmd, check=True, shell=False, cwd=rfdiff_repo)
+            expected_out = f"{prefix}_0.pdb"
+            if os.path.isfile(expected_out):
+                cand_pdb = expected_out
+
+        if not cand_pdb or not os.path.isfile(cand_pdb):
+            _purge_candidate_artifacts(prefix, None)
+            continue
+
+        max_drift, mean_drift, drift_details = audit_motif_cartesian_drift(
+            candidate_pdb=cand_pdb,
+            reference_seed_pdb=seed_pdb,
+            seed_provenance=seed_provenance,
+        )
+
+        if max_drift > max_drift_cutoff or mean_drift > mean_drift_cutoff:
+            print(
+                f"[-] [Attempt {attempt}/{max_attempts}] REJECTED: Max drift {max_drift:.3f} Å > {max_drift_cutoff} Å "
+                f"(Mean: {mean_drift:.3f} Å). Discarding."
+            )
+            _purge_candidate_artifacts(prefix, cand_pdb)
+            del drift_details
+            continue
+
+        print(
+            f"[+] [Attempt {attempt}/{max_attempts}] ACCEPTED: Max drift {max_drift:.3f} Å <= {max_drift_cutoff} Å "
+            f"(Mean: {mean_drift:.3f} Å)"
+        )
+        passing_backbones.append(cand_pdb)
+        del drift_details
+
+    if not passing_backbones:
+        raise RuntimeError(
+            f"Closed-loop scaffolding failed to produce any passing models within {max_attempts} attempts. "
+            f"All candidates exceeded max drift cutoff of {max_drift_cutoff} Å."
+        )
+
+    gc.collect()
+    return passing_backbones
 
 
 def extract_mpnn_sequences(fasta_path: str) -> List[Tuple[str, str]]:
@@ -487,6 +1166,86 @@ def thread_sequence_onto_pdb(
     with open(out_pdb, "w", encoding="utf-8", buffering=65536) as f:
         f.writelines(lines_out)
     return True
+
+
+def get_residue_anchor_coords(
+    pdb_path: str, chain: str, resi: int, atom_type: str = "CA", use_cache: bool = True
+) -> Optional[np.ndarray]:
+    """
+    Returns 3D coords for atom_type ('C', 'N', 'CA') of specified residue in pdb_path.
+    Falls back to 'CA' or first heavy atom.
+    Caches parsed atom coordinates per (file, mtime) for O(1) terminal and junction anchor lookups.
+    """
+    if not pdb_path:
+        return None
+    try:
+        real_path = os.path.realpath(pdb_path)
+        if not os.path.isfile(real_path):
+            return None
+        mtime = os.path.getmtime(real_path)
+    except (OSError, ValueError):
+        return None
+
+    cache_key = (real_path, mtime)
+    if not use_cache or cache_key not in _ANCHOR_COORDS_CACHE:
+        atom_map: Dict[Tuple[str, int, str], np.ndarray] = {}
+        fallback_map: Dict[Tuple[str, int], np.ndarray] = {}
+        with open(real_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("ATOM  ") or line.startswith("HETATM"):
+                    try:
+                        r = int(line[22:26])
+                        ch = line[21].strip() or "A"
+                        name = line[12:16].strip().upper()
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                    except ValueError:
+                        continue
+                    pt = np.array([x, y, z], dtype=np.float64)
+                    atom_key = (ch, r, name)
+                    if atom_key not in atom_map:
+                        atom_map[atom_key] = pt
+                    fb_key = (ch, r)
+                    if fb_key not in fallback_map:
+                        fallback_map[fb_key] = pt
+                    elif name == "CA":
+                        fallback_map[fb_key] = pt
+
+        if use_cache:
+            _ANCHOR_COORDS_CACHE[cache_key] = atom_map
+            _ANCHOR_FALLBACK_CACHE[cache_key] = fallback_map
+    else:
+        atom_map = _ANCHOR_COORDS_CACHE[cache_key]
+        fallback_map = _ANCHOR_FALLBACK_CACHE[cache_key]
+
+    target_chain = chain.strip() if chain else ""
+    target_resi = int(resi)
+    target_atom = atom_type.strip().upper()
+
+    if target_chain:
+        k = (target_chain, target_resi, target_atom)
+        if k in atom_map:
+            return atom_map[k].copy()
+        ca_k = (target_chain, target_resi, "CA")
+        if ca_k in atom_map:
+            return atom_map[ca_k].copy()
+        fb_k = (target_chain, target_resi)
+        if fb_k in fallback_map:
+            return fallback_map[fb_k].copy()
+        return None
+
+    # Search across chains for target_resi
+    for (c, r, a), pt in atom_map.items():
+        if r == target_resi and a == target_atom:
+            return pt.copy()
+    for (c, r, a), pt in atom_map.items():
+        if r == target_resi and a == "CA":
+            return pt.copy()
+    for (c, r), pt in fallback_map.items():
+        if r == target_resi:
+            return pt.copy()
+    return None
 
 
 def get_residue_ca_coords(
@@ -1436,6 +2195,7 @@ class ChimeraScaffolder:
         donor_id: str = "A",
         vessel_id: str = "B",
         motif_residues: str = "",
+        motifs: Optional[str] = None,
         chimera_mode: str = "replace",
         vessel_replace_range: Optional[str] = None,
         vessel_split_after: Optional[int] = None,
@@ -1487,7 +2247,17 @@ class ChimeraScaffolder:
 
         self.donor_id = donor_id
         self.vessel_id = vessel_id
-        self.motif_residues = motif_residues
+        self.motifs = motifs
+        raw_motif = motifs if motifs is not None else motif_residues
+        self.motif_residues = raw_motif
+        self.is_multichain = (
+            bool(motifs)
+            or (":" in str(raw_motif))
+            or (isinstance(donor_id, (list, tuple)) and len(donor_id) > 1)
+            or (isinstance(donor_id, str) and "," in donor_id)
+        )
+        self.manifest: Optional[MultiChainMotifManifest] = None
+        self.seed_provenance: Dict[int, Dict[str, Any]] = {}
         self.chimera_mode = chimera_mode.lower()
         self.vessel_replace_range = vessel_replace_range
         self.vessel_split_after = vessel_split_after
@@ -1747,7 +2517,7 @@ class ChimeraScaffolder:
         if not v_objs:
             raise ValueError(f"No valid atom/residue records in vessel structure: {self.working_vessel_pdb}")
 
-        if len(d_objs) > 1:
+        if len(d_objs) > 1 and not getattr(self, "is_multichain", False):
             # Donor structure is multi-chain (e.g. PyMOL selection containing residues
             # from multiple subunits like HSPA + HSPB).
             # Merge all donor chains into a unified single chain 'D' to preserve all residues from all subunits.
@@ -2178,6 +2948,120 @@ class ChimeraScaffolder:
     # Efficient alias for junction measurement
     measure_junction_distances = measure_junctions
 
+    def _compute_multichain_contigs_and_segments(self) -> Tuple[str, List[Tuple[int, int]], List[Tuple[int, int]]]:
+        if not self.working_donor_pdb or not self.working_vessel_pdb:
+            self.prepare_input_structures()
+
+        self.manifest = build_multi_chain_manifest(
+            motif_spec=self.motif_residues,
+            default_source_file=self.working_donor_pdb,
+            default_chain=self.donor_chain_id,
+        )
+        self.seed_provenance = self.manifest.provenance_map
+
+        # Map donor segments into sequential seed coordinates starting at 1
+        donor_seed_segments = []
+        curr_seed = 1
+        for seg in self.manifest.segments:
+            seg_start = curr_seed
+            seg_end = curr_seed + seg.length - 1
+            donor_seed_segments.append((seg, seg_start, seg_end))
+            curr_seed = seg_end + 1
+        self.preserved_donor_segments = [(s, e) for _, s, e in donor_seed_segments]
+
+        vessel_intervals = self.parse_vessel_intervals()
+        v_min, v_max = self.vessel_metadata.get("range", (1, 100))
+
+        def get_vessel_anchor(resi: int, atom_type: str) -> Optional[np.ndarray]:
+            return get_residue_anchor_coords(self.working_vessel_pdb, self.vessel_chain_id, resi, atom_type)
+
+        def get_donor_anchor(res_obj: MotifResidue, atom_type: str) -> Optional[np.ndarray]:
+            if atom_type in res_obj.atoms:
+                return res_obj.atoms[atom_type].coords
+            return res_obj.ca_coords
+
+        left_vessel: List[Tuple[int, int]] = []
+        right_vessel: List[Tuple[int, int]] = []
+
+        if self.chimera_mode in ["replace", "graft"]:
+            if not self.vessel_replace_range:
+                mid = (v_min + v_max) // 2
+                rep_start = max(v_min + 5, mid - 10)
+                rep_end = min(v_max - 5, mid + 10)
+            else:
+                rep_match = _RE_HYPHEN_RANGE.match(str(self.vessel_replace_range).strip())
+                if not rep_match:
+                    raise ValueError(
+                        f"Invalid vessel_replace_range: '{self.vessel_replace_range}'. "
+                        "Expected format: 'START-END' (e.g. '55-70')."
+                    )
+                rep_start = int(rep_match.group(1))
+                rep_end = int(rep_match.group(2))
+                if rep_start > rep_end:
+                    rep_start, rep_end = rep_end, rep_start
+
+            left_vessel = self.slice_intervals(vessel_intervals, None, rep_start - 1)
+            right_vessel = self.slice_intervals(vessel_intervals, rep_end + 1, None)
+            self.preserved_vessel_segments = left_vessel + right_vessel
+
+        elif self.chimera_mode in ["ligate_nterm", "nterm"]:
+            right_vessel = list(vessel_intervals)
+            self.preserved_vessel_segments = list(vessel_intervals)
+
+        elif self.chimera_mode in ["ligate_cterm", "cterm"]:
+            left_vessel = list(vessel_intervals)
+            self.preserved_vessel_segments = list(vessel_intervals)
+
+        elif self.chimera_mode in ["insert_loop", "loop", "insert"]:
+            split_at = self.vessel_split_after
+            if split_at is None:
+                split_at = (v_min + v_max) // 2
+            elif not (v_min <= split_at <= v_max):
+                raise ValueError(f"vessel_split_after ({split_at}) is out of vessel residue range [{v_min}, {v_max}].")
+
+            left_vessel = self.slice_intervals(vessel_intervals, None, split_at)
+            right_vessel = self.slice_intervals(vessel_intervals, split_at + 1, None)
+            self.preserved_vessel_segments = left_vessel + right_vessel
+        else:
+            raise ValueError(f"Unknown chimera_mode: '{self.chimera_mode}'")
+
+        # Formulate ordered structural blocks for Euclidean Gap Graph
+        blocks: List[Dict[str, Any]] = []
+
+        if left_vessel:
+            v_str = self.format_segments_to_contig(left_vessel, "V")
+            n_c = get_vessel_anchor(left_vessel[0][0], "N")
+            c_c = get_vessel_anchor(left_vessel[-1][1], "C")
+            blocks.append({"str": v_str, "n_coord": n_c, "c_coord": c_c})
+
+        for seg, s_seed, e_seed in donor_seed_segments:
+            d_str = f"D{s_seed}-{e_seed}"
+            n_c = seg.n_term_n
+            c_c = seg.c_term_c
+            blocks.append({"str": d_str, "n_coord": n_c, "c_coord": c_c})
+
+        if right_vessel:
+            v_str = self.format_segments_to_contig(right_vessel, "V")
+            n_c = get_vessel_anchor(right_vessel[0][0], "N")
+            c_c = get_vessel_anchor(right_vessel[-1][1], "C")
+            blocks.append({"str": v_str, "n_coord": n_c, "c_coord": c_c})
+
+        contig_parts = []
+        for i in range(len(blocks)):
+            contig_parts.append(blocks[i]["str"])
+            if i < len(blocks) - 1:
+                c1 = blocks[i]["c_coord"]
+                n2 = blocks[i + 1]["n_coord"]
+                if c1 is not None and n2 is not None:
+                    d_gap = float(np.linalg.norm(c1 - n2))
+                else:
+                    d_gap = 15.0
+                l_str = compute_gap_linker_string(d_gap)
+                contig_parts.append(l_str)
+
+        self.contig_string = "/".join(contig_parts)
+        return self.contig_string, self.preserved_donor_segments, self.preserved_vessel_segments
+
     def compute_contigs_and_segments(self) -> Tuple[str, List[Tuple[int, int]], List[Tuple[int, int]]]:
         """
         Computes RFdiffusion contigs and list of preserved donor & vessel segments
@@ -2189,6 +3073,9 @@ class ChimeraScaffolder:
         """
         if not self.working_donor_pdb or not self.working_vessel_pdb:
             self.prepare_input_structures()
+
+        if getattr(self, "is_multichain", False):
+            return self._compute_multichain_contigs_and_segments()
 
         motif_segments = self.parse_motif_ranges()
         vessel_intervals = self.parse_vessel_intervals()
@@ -2393,6 +3280,64 @@ class ChimeraScaffolder:
             for r in range(s, e + 1):
                 vessel_set.add(r)
 
+        if getattr(self, "is_multichain", False) and self.manifest:
+            # Multi-chain spatial coordinate fusion into Chain D and Chain V
+            atom_lines = []
+            atom_idx = 1
+
+            # 1. Write Vessel framework residues with Chain V
+            if self.working_vessel_pdb and os.path.isfile(self.working_vessel_pdb):
+                with open(self.working_vessel_pdb, "r", encoding="utf-8", errors="ignore", buffering=buffer_size) as f:
+                    for line in f:
+                        if line.startswith("ATOM  ") or line.startswith("HETATM"):
+                            try:
+                                resi = int(line[22:26])
+                            except ValueError:
+                                continue
+                            ch = line[21].strip() or "A"
+                            if (not self.vessel_chain_id or ch == self.vessel_chain_id) and resi in vessel_set:
+                                atom_lines.append(
+                                    f"{line[:6]}{atom_idx:>5}{line[11:21]}V{resi:>4}{line[26:80].rstrip()}\n"
+                                )
+                                atom_idx += 1
+
+            # 2. Write Donor motif residues with Chain D (sequential 1-based seed numbering)
+            seed_resi = 1
+            for seg in self.manifest.segments:
+                for res in seg.residues:
+                    for atom_name, atom_obj in res.atoms.items():
+                        c = atom_obj.coords
+                        occ = atom_obj.occupancy
+                        b_fac = atom_obj.b_factor
+                        elem = atom_obj.element
+                        if len(atom_name) == 4 or (len(atom_name) >= 1 and atom_name[0].isdigit()):
+                            atom_field = f"{atom_name:<4s}"
+                        else:
+                            atom_field = f" {atom_name:<3s}"
+                        line = (
+                            f"ATOM  {atom_idx:>5d} {atom_field:4s} {res.resn:>3s} D{seed_resi:>4d}    "
+                            f"{c[0]:8.3f}{c[1]:8.3f}{c[2]:8.3f}{occ:6.2f}{b_fac:6.2f}          {elem:>2s}\n"
+                        )
+                        atom_lines.append(line)
+                        atom_idx += 1
+                    seed_resi += 1
+
+            if atom_lines:
+                atom_lines.append("TER\n")
+            atom_lines.append("END\n")
+
+            with open(seed_path, "w", encoding="utf-8", buffering=buffer_size) as out:
+                out.writelines(atom_lines)
+
+            # Write seed_provenance.json
+            prov_path = safe_join_path(work_prep, "seed_provenance.json")
+            with open(prov_path, "w", encoding="utf-8") as f:
+                json.dump(self.seed_provenance, f, indent=2)
+
+            self.seed_pdb_path = seed_path
+            self.seed_pdb = seed_path
+            return seed_path
+
         atom_lines = []
         atom_idx = 1
         unified_chain = getattr(self, "seed_chain_id", "A")
@@ -2471,6 +3416,25 @@ class ChimeraScaffolder:
         with open(seed_path, "w", encoding="utf-8", buffering=buffer_size) as out:
             out.writelines(atom_lines)
 
+        # Write seed_provenance.json for legacy path as well
+        prov_path = safe_join_path(work_prep, "seed_provenance.json")
+        if not self.seed_provenance:
+            single_prov = {}
+            s_idx = 1
+            for s, e in self.preserved_donor_segments:
+                for r in range(s, e + 1):
+                    single_prov[s_idx] = {
+                        "source_file": self.working_donor_pdb,
+                        "source_chain": self.donor_chain_id,
+                        "orig_resi": r,
+                        "resn": "ALA",
+                        "segment_id": "D1",
+                    }
+                    s_idx += 1
+            self.seed_provenance = single_prov
+        with open(prov_path, "w", encoding="utf-8") as f:
+            json.dump(self.seed_provenance, f, indent=2)
+
         self.seed_pdb_path = seed_path
         self.seed_pdb = seed_path
         return seed_path
@@ -2503,7 +3467,6 @@ class ChimeraScaffolder:
         trb_path = os.path.splitext(backbone_pdb)[0] + ".trb"
         if os.path.isfile(trb_path):
             try:
-                from scripts.pse_pdb_extractor import SafeSessionUnpickler
                 with open(trb_path, "rb") as pf:
                     trb_data = SafeSessionUnpickler(pf).load()
                 if isinstance(trb_data, dict) and "con_ref_pdb_idx" in trb_data:
@@ -2532,16 +3495,20 @@ class ChimeraScaffolder:
             if len(chain_keys) == 1:
                 main_chain = chain_keys[0]
 
+            donor_src_pdb = self.seed_pdb_path if getattr(self, "is_multichain", False) else self.working_donor_pdb
+            donor_src_chain = "D" if getattr(self, "is_multichain", False) else self.donor_chain_id
             donor_ca_coords, _ = extract_coordinates(
-                self.working_donor_pdb,
-                chain_id=self.donor_chain_id,
+                donor_src_pdb,
+                chain_id=donor_src_chain,
                 residue_list=ref_donor_res,
                 atom_names=["CA"],
                 extract_meta=False,
             )
+            vessel_src_pdb = self.seed_pdb_path if getattr(self, "is_multichain", False) else self.working_vessel_pdb
+            vessel_src_chain = "V" if getattr(self, "is_multichain", False) else self.vessel_chain_id
             vessel_ca_coords, _ = extract_coordinates(
-                self.working_vessel_pdb,
-                chain_id=self.vessel_chain_id,
+                vessel_src_pdb,
+                chain_id=vessel_src_chain,
                 residue_list=ref_vessel_res,
                 atom_names=["CA"],
                 extract_meta=False,
@@ -2678,9 +3645,9 @@ class ChimeraScaffolder:
         self.compute_contigs_and_segments()
         self.create_merged_seed_pdb()
 
-        work_rfdiff = os.path.join(self.out_dir, "1_rfdiffusion")
-        work_mpnn = os.path.join(self.out_dir, "2_mpnn")
-        work_results = os.path.join(self.out_dir, "results")
+        work_rfdiff = safe_join_path(self.out_dir, "1_rfdiffusion")
+        work_mpnn = safe_join_path(self.out_dir, "2_mpnn")
+        work_results = safe_join_path(self.out_dir, "results")
         os.makedirs(work_rfdiff, exist_ok=True)
         os.makedirs(work_mpnn, exist_ok=True)
         os.makedirs(work_results, exist_ok=True)
@@ -2756,7 +3723,7 @@ class ChimeraScaffolder:
         )
         summary_data["rfdiffusion_command"] = rfdiff_cmd
 
-        # Step 2: Backbone Generation
+        # Step 2: Backbone Generation (Closed-loop in-flight Cartesian drift audit)
         generated_backbones = []
         if not self.dry_run:
             if not self.rfdiff_script or not os.path.isfile(self.rfdiff_script):
@@ -2764,23 +3731,18 @@ class ChimeraScaffolder:
                     f"RFdiffusion script not found. Looked in: '{self.rfdiff_script}'. "
                     "Please configure RFDIFF_DIR in config.env or run: autoscaffold install"
                 )
-            # Clean old generated backbones so RFdiffusion cautious mode does not skip designs
-            if os.path.isdir(work_rfdiff):
-                for f in os.listdir(work_rfdiff):
-                    if f.startswith("chimera_design") and (f.endswith(".pdb") or f.endswith(".trb")):
-                        try:
-                            os.remove(os.path.join(work_rfdiff, f))
-                        except OSError:
-                            pass
-            rfdiff_repo = os.path.dirname(os.path.dirname(os.path.abspath(self.rfdiff_script)))
-            cmd_display = " ".join(shlex.quote(arg) for arg in rfdiff_cmd)
-            print(f"[+] Running RFdiffusion: {cmd_display}")
-            subprocess.run(rfdiff_cmd, check=True, shell=False, cwd=rfdiff_repo)
-            for f in os.listdir(work_rfdiff):
-                if f.endswith(".pdb") and "chimera_design" in f:
-                    generated_backbones.append(os.path.join(work_rfdiff, f))
-            if not generated_backbones:
-                raise RuntimeError(f"RFdiffusion execution completed but generated 0 output backbones in {work_rfdiff}")
+            generated_backbones = run_closed_loop_backbone_generation(
+                seed_pdb=self.seed_pdb_path,
+                contig_str=self.contig_string,
+                seed_provenance=self.seed_provenance,
+                target_passing_designs=self.num_designs,
+                max_attempts=max(50, self.num_designs * 5),
+                max_drift_cutoff=0.8,
+                mean_drift_cutoff=0.5,
+                rfdiff_runner=self.rfdiff_runner,
+                rfdiff_script=self.rfdiff_script,
+                work_dir=work_rfdiff,
+            )
         else:
             # Create synthetic/mock backbone placeholder in dry_run or fallback
             # RFdiffusion outputs single-chain designs (usually Chain A) with contiguous residues
@@ -2973,30 +3935,6 @@ class ChimeraScaffolder:
                 if os.path.isfile(fa_src):
                     shutil.copyfile(fa_src, safe_join_path(work_results, f"{safe_bb_base}_passed.fa"))
 
-        # If no design passed strict RMSD cutoff, preserve the top-ranking candidates in results
-        if not passing_models and metrics_rows:
-            sorted_by_rmsd = sorted(metrics_rows, key=lambda x: x.get("motif_rmsd", 999.0))
-            top_cand = sorted_by_rmsd[0]
-            top_base = top_cand["model_id"]
-            cand_match = next(
-                (c for c in mpnn_results if os.path.splitext(os.path.basename(c["backbone"]))[0] == top_base),
-                None,
-            )
-            top_src = (
-                cand_match["threaded_pdbs"][0]
-                if (cand_match and cand_match.get("threaded_pdbs"))
-                else top_cand["backbone_path"]
-            )
-            top_rmsd = top_cand.get("motif_rmsd", 0.0)
-            if os.path.isfile(top_src):
-                fname = f"{top_base}_top_candidate_rmsd_{top_rmsd:.2f}A.pdb"
-                top_dest = safe_join_path(work_results, fname)
-                shutil.copyfile(top_src, top_dest)
-                passing_models.append(top_dest)
-                top_fa = safe_join_path(work_mpnn, "seqs", f"{top_base}.fa")
-                if os.path.isfile(top_fa):
-                    shutil.copyfile(top_fa, safe_join_path(work_results, f"{top_base}_top_candidate.fa"))
-
         # Generate automated PyMOL visualization script in results/
         if passing_models:
             top_model_path = passing_models[0]
@@ -3007,16 +3945,36 @@ class ChimeraScaffolder:
             except Exception:
                 pass
 
-            # Automatic 2-Stage Soft-Core Minimization & PyMOL Clash Relief
+            # Automatic 2-Stage Soft-Core Minimization & PyMOL Clash Relief with 3-tier selective pinning
             relaxed_dest = safe_join_path(work_results, "chimera_minimized.pdb")
             relax_script = safe_join_path(os.path.dirname(__file__), "relax_chimera.py")
             relaxed_success = False
+
+            motif_indices: List[int] = []
+            if getattr(self, "is_multichain", False) and self.manifest:
+                motif_indices = [int(k) for k in self.seed_provenance.keys()]
+            else:
+                for s, e in self.preserved_donor_segments:
+                    motif_indices.extend(range(s, e + 1))
+
+            vessel_indices: List[int] = []
+            for s, e in self.preserved_vessel_segments:
+                vessel_indices.extend(range(s, e + 1))
 
             # Attempt 1: Direct in-process if OpenMM is available
             try:
                 from scripts.relax_chimera import relax_structure
                 print("[+] Launching automatic 2-Stage Soft-Core Relaxation to eliminate PyMOL steric clashes...")
-                if relax_structure(canonical_res, relaxed_dest, max_iterations=150):
+                if relax_structure(
+                    canonical_res,
+                    relaxed_dest,
+                    max_iterations=150,
+                    motif_res_indices=motif_indices,
+                    vessel_res_indices=vessel_indices,
+                    k_motif=5000.0,
+                    k_vessel=500.0,
+                    k_linker=0.0,
+                ):
                     relaxed_success = True
             except Exception:
                 relaxed_success = False
@@ -3024,6 +3982,13 @@ class ChimeraScaffolder:
             # Attempt 2: If in-process failed (e.g. running in base conda), dispatch via colabfold_runner
             if not relaxed_success and os.path.isfile(relax_script):
                 try:
+                    extra_relax_args = []
+                    if motif_indices:
+                        extra_relax_args.extend(["--motif_res", ",".join(str(x) for x in motif_indices)])
+                    if vessel_indices:
+                        extra_relax_args.extend(["--vessel_res", ",".join(str(x) for x in vessel_indices)])
+                    extra_relax_args.extend(["--k_motif", "5000.0", "--k_vessel", "500.0", "--k_linker", "0.0"])
+
                     relax_cmd = self.colabfold_runner.build_command(
                         relax_script,
                         "--input",
@@ -3032,6 +3997,7 @@ class ChimeraScaffolder:
                         relaxed_dest,
                         "--steps",
                         "150",
+                        *extra_relax_args,
                     )
                     cmd_str = " ".join(shlex.quote(arg) for arg in relax_cmd)
                     print(f"[+] Dispatching relaxation via ColabFold environment: {cmd_str}")
@@ -3243,8 +4209,20 @@ def main() -> None:
     parser.add_argument("--vessel_pdb", help="Path to standalone vessel PDB")
     parser.add_argument("--donor_id", default="A", help="Donor chain ID or object name [Default: A]")
     parser.add_argument("--vessel_id", default="B", help="Vessel chain ID or object name [Default: B]")
+    parser.add_argument("--donor_chain", help="Alias for donor chain ID(s) (e.g. 'A' or 'A,B')")
     parser.add_argument(
-        "--motif_residues", "-m", required=True, help="Donor motif residue range(s) (e.g. '30-45' or '30-45,78-82')"
+        "--motif_residues", "-m", help="Donor motif residue range(s) (e.g. '30-45' or '30-45,78-82')"
+    )
+    parser.add_argument(
+        "--motifs",
+        help=(
+            "Multi-chain or multi-PDB motif specification "
+            "(e.g. 'A:312-313, B:191, B:200' or 'f1.pdb:A:1-10, f2.pdb:B:20-30')"
+        ),
+    )
+    parser.add_argument(
+        "--donor_range",
+        help="Alias for motif residue range or multi-chain spec",
     )
     parser.add_argument(
         "--chimera_mode",
@@ -3329,13 +4307,19 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    motif_val = args.motifs or args.donor_range or args.motif_residues
+    if not motif_val:
+        parser.error("One of --motifs, --motif_residues, or --donor_range is required.")
+    donor_id_val = args.donor_chain or args.donor_id
+
     scaffolder = ChimeraScaffolder(
         input_file=args.input_file,
         donor_pdb=args.donor_pdb,
         vessel_pdb=args.vessel_pdb,
-        donor_id=args.donor_id,
+        donor_id=donor_id_val,
         vessel_id=args.vessel_id,
-        motif_residues=args.motif_residues,
+        motif_residues=motif_val,
+        motifs=args.motifs,
         chimera_mode=args.chimera_mode,
         vessel_replace_range=args.vessel_replace_range,
         vessel_split_after=args.vessel_split_after,

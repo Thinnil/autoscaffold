@@ -219,7 +219,7 @@ while [[ $# -gt 0 ]]; do
             VESSEL_PDB="$2"
             shift 2
             ;;
-        --donor_id)
+        --donor_id|--donor_chain)
             DONOR_ID="$2"
             shift 2
             ;;
@@ -227,7 +227,7 @@ while [[ $# -gt 0 ]]; do
             VESSEL_ID="$2"
             shift 2
             ;;
-        --motif_residues|-m)
+        --motif_residues|-m|--motifs|--donor_range)
             MOTIF_RESIDUES="$2"
             shift 2
             ;;
@@ -417,7 +417,7 @@ if [ -z "$MOTIF_RESIDUES" ]; then
     echo -e "${RED}[ERROR] Motif residues cannot be empty.${NC}"
     exit 1
 fi
-if [[ ! "$MOTIF_RESIDUES" =~ ^[-a-zA-Z0-9,:\ \*%]+$ ]]; then
+if [[ ! "$MOTIF_RESIDUES" =~ ^[-a-zA-Z0-9,:\ \*%+_./\\]+$ ]]; then
     echo -e "${RED}[ERROR] Invalid motif residues specification '$MOTIF_RESIDUES'.${NC}"
     exit 1
 fi
