@@ -410,6 +410,12 @@ def probe_python_environment(
     if key_bin:
         _PROBE_CACHE[key_bin] = cached_entry
 
+    if isinstance(python_bin, RunnerSpec):
+        python_bin.cuda_available = bool(result.get("cuda_available", False))
+        python_bin.torch_version = result.get("torch_version")
+        python_bin.cuda_device_name = result.get("cuda_device_name")
+        python_bin.missing_modules = list(result.get("missing_modules", []))
+
     if raise_on_error and result["missing_modules"]:
         disp_label = format_runner_display(python_bin)
         display_dependency_alert(tool_name, disp_label, result["missing_modules"], suggested_env)
@@ -905,6 +911,14 @@ def resolve_neural_python(
     )
 
 
+_LAST_CLOSED_LOOP_HISTORY: List[Dict[str, Any]] = []
+
+
+def get_last_closed_loop_history() -> List[Dict[str, Any]]:
+    """Returns a copy of the attempt history from the most recent closed-loop generation."""
+    return list(_LAST_CLOSED_LOOP_HISTORY)
+
+
 def run_closed_loop_backbone_generation(
     seed_pdb: str,
     contig_str: str,
@@ -917,6 +931,7 @@ def run_closed_loop_backbone_generation(
     rfdiff_script: Optional[str] = None,
     work_dir: str = "1_rfdiffusion",
     sampler_fn: Optional[Any] = None,
+    attempt_history_out: Optional[List[Dict[str, Any]]] = None,
 ) -> List[str]:
     """
     Executes an active, iterative trial-and-error generation loop.
@@ -924,6 +939,10 @@ def run_closed_loop_backbone_generation(
     pass strict Cartesian drift auditing, or max_attempts is reached.
     Safely purges all rejected micro-batch candidate artifacts and manages memory.
     """
+    global _LAST_CLOSED_LOOP_HISTORY
+    _LAST_CLOSED_LOOP_HISTORY = []
+    rejection_history: List[Dict[str, Any]] = []
+
     work_dir = validate_output_dir(work_dir)
     os.makedirs(work_dir, exist_ok=True)
 
@@ -947,7 +966,7 @@ def run_closed_loop_backbone_generation(
         else:
             if not rfdiff_runner or not rfdiff_script or not os.path.isfile(rfdiff_script):
                 raise FileNotFoundError(f"RFdiffusion script not found: '{rfdiff_script}'")
-            cmd = rfdiff_runner.build_command(
+            cmd_args = [
                 rfdiff_script,
                 f"inference.output_prefix={prefix}",
                 f"inference.input_pdb={seed_pdb}",
@@ -955,7 +974,10 @@ def run_closed_loop_backbone_generation(
                 "inference.num_designs=1",
                 "denoiser.noise_scale_ca=0.0",
                 "denoiser.noise_scale_frame=0.0",
-            )
+            ]
+            if not getattr(rfdiff_runner, "cuda_available", False):
+                cmd_args.append("inference.device=cpu")
+            cmd = rfdiff_runner.build_command(*cmd_args)
             rfdiff_repo = os.path.dirname(os.path.dirname(os.path.abspath(rfdiff_script)))
             cwd_dir = rfdiff_repo if os.path.isdir(rfdiff_repo) else None
             subprocess.run(cmd, check=True, shell=False, cwd=cwd_dir)
@@ -973,7 +995,20 @@ def run_closed_loop_backbone_generation(
             seed_provenance=seed_provenance,
         )
 
-        if max_drift > max_drift_cutoff or mean_drift > mean_drift_cutoff:
+        is_accepted = (max_drift <= max_drift_cutoff and mean_drift <= mean_drift_cutoff)
+        attempt_record = {
+            "attempt": attempt,
+            "max_drift": max_drift,
+            "mean_drift": mean_drift,
+            "status": "ACCEPTED" if is_accepted else "REJECTED_DRIFT",
+            "pdb": cand_pdb if is_accepted else None,
+        }
+        rejection_history.append(attempt_record)
+        _LAST_CLOSED_LOOP_HISTORY.append(attempt_record)
+        if attempt_history_out is not None:
+            attempt_history_out.append(attempt_record)
+
+        if not is_accepted:
             print(
                 f"[-] [Attempt {attempt}/{max_attempts}] REJECTED: Max drift {max_drift:.3f} Å > {max_drift_cutoff} Å "
                 f"(Mean: {mean_drift:.3f} Å). Discarding."
@@ -992,10 +1027,12 @@ def run_closed_loop_backbone_generation(
         del drift_details
 
     if not passing_backbones:
-        raise RuntimeError(
+        err = RuntimeError(
             f"Closed-loop scaffolding failed to produce any passing models within {max_attempts} attempts. "
             f"All candidates exceeded max drift cutoff of {max_drift_cutoff} Å."
         )
+        setattr(err, "rejection_history", list(rejection_history))
+        raise err
 
     gc.collect()
     return passing_backbones

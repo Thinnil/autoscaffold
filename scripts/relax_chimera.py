@@ -9,20 +9,77 @@ structure firmly restrained.
 import argparse
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
 from typing import Any, List, Optional, Sequence, Union
 
+try:
+    from scipy.spatial import cKDTree
+except ImportError:
+    cKDTree = None
+
+_RE_SHELL_INJECTION = re.compile(r"[;&|`><\n\r\$]")
+_SYS_EXACT = (
+    "/etc", "/usr", "/bin", "/sbin", "/boot", "/dev", "/sys", "/proc",
+    "/windows", "/program files", "/program files (x86)", "/system32"
+)
+_SYS_PREFIXES = tuple(s + "/" for s in _SYS_EXACT)
+
+# Enforce reasonable CPU thread limits to prevent thread oversaturation in CPU fallback mode
+try:
+    import torch
+    if not torch.cuda.is_available():
+        env_threads = os.environ.get("OMP_NUM_THREADS") or os.environ.get("TORCH_NUM_THREADS")
+        if env_threads and env_threads.isdigit():
+            torch.set_num_threads(max(1, int(env_threads)))
+        else:
+            torch.set_num_threads(min(4, os.cpu_count() or 2))
+except Exception:
+    pass
+
+
+def get_openmm_platform() -> Any:
+    """
+    Safely selects the best functional OpenMM platform with fallback to CPU/Reference.
+    Tolerates absent or unprivileged CUDA drivers without raising unhandled exceptions.
+    """
+    try:
+        import openmm as mm
+    except ImportError:
+        try:
+            import simtk.openmm as mm
+        except ImportError:
+            return None
+
+    for plat_name in ["CUDA", "OpenCL", "CPU", "Reference"]:
+        try:
+            platform = mm.Platform.getPlatformByName(plat_name)
+            test_sys = mm.System()
+            test_sys.addParticle(1.0)
+            test_integ = mm.VerletIntegrator(0.001)
+            test_context = mm.Context(test_sys, test_integ, platform)
+            del test_context, test_integ, test_sys
+            return platform
+        except Exception:
+            continue
+    try:
+        return mm.Platform.getPlatformByName("Reference")
+    except Exception:
+        return None
+
 
 def validate_path(path: str, label: str = "Path", allow_missing: bool = False) -> str:
     """
-    Validates a file path to prevent directory traversal and root directory overwrites.
+    Validates a file path to prevent directory traversal, system dir writes, and root overwrites.
     Returns canonical real path.
     """
     if not path or not str(path).strip():
         raise ValueError(f"{label} cannot be empty.")
     raw = str(path).strip()
+    if _RE_SHELL_INJECTION.search(raw):
+        raise ValueError(f"Dangerous shell characters detected in {label}: '{raw}'")
     drive, rest = os.path.splitdrive(raw)
     if (
         (not drive and raw.rstrip("/\\") in ("", "/", "\\"))
@@ -34,6 +91,13 @@ def validate_path(path: str, label: str = "Path", allow_missing: bool = False) -
     drive, rest = os.path.splitdrive(real)
     if (not drive and real.rstrip("/\\") in ("", "/")) or (drive and rest in ("/", "\\", "")):
         raise ValueError(f"Dangerous or root path specified for {label}: '{raw}'")
+
+    norm_posix = real.replace("\\", "/").lower()
+    drive_stripped = re.sub(r'^[a-zA-Z]:', '', norm_posix)
+    for check_p in (norm_posix, drive_stripped):
+        if check_p in _SYS_EXACT or check_p.startswith(_SYS_PREFIXES):
+            raise ValueError(f"{label} cannot reside within protected system directory: '{real}'")
+
     if not allow_missing and not os.path.isfile(real):
         raise FileNotFoundError(f"{label} file not found: '{real}'")
     return real
@@ -85,6 +149,16 @@ def count_steric_clashes(topology: Any, positions: Any, cutoff_angstrom: float =
         clashes = 0
         res_indices = [a.residue.index for a in atoms]
         names = [a.name for a in atoms]
+
+        if cKDTree is not None and n > 0:
+            tree = cKDTree(pos_arr)
+            pairs = tree.query_pairs(cutoff_nm)
+            for i, j in pairs:
+                ri = res_indices[i]
+                rj = res_indices[j]
+                if abs(ri - rj) >= 1 or (names[i] not in ("C", "N") and names[j] not in ("C", "N")):
+                    clashes += 1
+            return clashes
 
         for i in range(n):
             ri = res_indices[i]
@@ -171,7 +245,7 @@ def run_faspr_repack(input_pdb: str, output_pdb: str) -> bool:
                 faspr_bin = c
                 break
 
-    if not faspr_bin:
+    if not faspr_bin or _RE_SHELL_INJECTION.search(faspr_bin):
         return False
 
     try:
@@ -181,6 +255,7 @@ def run_faspr_repack(input_pdb: str, output_pdb: str) -> bool:
             capture_output=True,
             text=True,
             check=False,
+            shell=False,
             timeout=30,
         )
         if res.returncode == 0 and os.path.isfile(output_pdb):
@@ -331,7 +406,11 @@ def relax_with_selective_pinning(
     system.addForce(restraint)
 
     integrator = mm.LangevinIntegrator(300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds)
-    simulation = app.Simulation(pdb.topology, system, integrator)
+    plat = get_openmm_platform()
+    if plat is not None:
+        simulation = app.Simulation(pdb.topology, system, integrator, plat)
+    else:
+        simulation = app.Simulation(pdb.topology, system, integrator)
     simulation.context.setPositions(positions)
 
     # Stage 1: Soft-Core L-BFGS de-clashing (50 steps)
@@ -344,7 +423,7 @@ def relax_with_selective_pinning(
     out_dir = os.path.dirname(os.path.abspath(output_pdb))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    with open(output_pdb, "w", encoding="utf-8") as f:
+    with open(output_pdb, "w", encoding="utf-8", buffering=65536) as f:
         app.PDBFile.writeFile(pdb.topology, final_state.getPositions(), f)
 
     return True
@@ -414,11 +493,14 @@ def relax_structure(
                     "--steps", str(max_iterations),
                     "--k", str(restraint_k),
                 ]
+                for part in cmd:
+                    if _RE_SHELL_INJECTION.search(str(part)):
+                        raise ValueError(f"Dangerous characters detected in command parameter: '{part}'")
                 print(
                     "[+] OpenMM not in current Python environment. "
                     "Auto-dispatching via 'colabfold' conda environment..."
                 )
-                res = subprocess.run(cmd, check=False)
+                res = subprocess.run(cmd, check=False, shell=False)
                 if res.returncode == 0 and os.path.isfile(output_pdb):
                     return True
             except Exception as disp_err:
@@ -490,7 +572,11 @@ def relax_structure(
     system.addForce(restraint)
 
     integrator = mm.LangevinIntegrator(300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds)
-    simulation = app.Simulation(topology, system, integrator)
+    plat = get_openmm_platform()
+    if plat is not None:
+        simulation = app.Simulation(topology, system, integrator, plat)
+    else:
+        simulation = app.Simulation(topology, system, integrator)
     simulation.context.setPositions(positions)
 
     init_state = simulation.context.getState(getEnergy=True)
@@ -516,7 +602,7 @@ def relax_structure(
     print(f"[+] Final PyMOL-sensitive steric clashes (d < 1.9 Å): {clashes_final} (Eliminated {diff_clashes})")
 
     os.makedirs(os.path.dirname(os.path.abspath(output_pdb)), exist_ok=True)
-    with open(output_pdb, "w", encoding="utf-8") as f:
+    with open(output_pdb, "w", encoding="utf-8", buffering=65536) as f:
         app.PDBFile.writeFile(topology, final_positions, f)
 
     print(f"✅ SUCCESS: Relaxed, clash-free structure saved to:\n    {output_pdb}\n")

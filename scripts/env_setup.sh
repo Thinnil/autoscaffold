@@ -25,6 +25,27 @@ elif [ -f "$SCRIPT_DIR/config.env.example" ]; then
     source "$SCRIPT_DIR/config.env.example"
 fi
 
+# Version Single Source of Truth
+AUTOSCAFFOLD_VERSION=$(python3 -c "import sys, os; sys.path.insert(0, os.path.join(sys.argv[1], 'scripts')); from version import __version__; print(__version__)" "$SCRIPT_DIR" 2>/dev/null || python -c "import sys, os; sys.path.insert(0, os.path.join(sys.argv[1], 'scripts')); from version import __version__; print(__version__)" "$SCRIPT_DIR" 2>/dev/null || echo "2.2.0")
+export AUTOSCAFFOLD_VERSION
+
+check_git_sync_status() {
+    if [ -d "$SCRIPT_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+        local local_sha upstream_sha
+        local_sha=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || echo "")
+        upstream_sha=$(git -C "$SCRIPT_DIR" rev-parse origin/main 2>/dev/null || echo "")
+        if [ -n "$local_sha" ] && [ -n "$upstream_sha" ]; then
+            if [ "$local_sha" = "$upstream_sha" ]; then
+                echo "Up-to-date with origin/main"
+            else
+                echo "Update Available (run Option [7] to update)"
+            fi
+            return 0
+        fi
+    fi
+    echo "Local Installation (v$AUTOSCAFFOLD_VERSION)"
+}
+
 # Apply fallbacks
 RFDIFF_DIR="${RFDIFF_DIR:-$HOME/programs/RFdiffusion}"
 MPNN_DIR="${MPNN_DIR:-$HOME/programs/ProteinMPNN}"

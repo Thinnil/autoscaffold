@@ -8,6 +8,10 @@ trap 'echo -e "\n\n${YELLOW}[!] Operation cancelled by user.${NC}"; exit 130' IN
 
 # Resolve script directory and source shared environment
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" = "/" ] || [ "$SCRIPT_DIR" = "\\" ] || [[ "$SCRIPT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+    echo -e "\033[0;31m[ERROR] Invalid or dangerous SCRIPT_DIR root: '$SCRIPT_DIR'.\033[0m"
+    exit 1
+fi
 
 # Verify and self-heal scripts directory if missing
 if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
@@ -51,9 +55,9 @@ fi
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/scripts/env_setup.sh"
 
-echo -e "${CYAN}======================================================${NC}"
-echo -e "${CYAN} 🏗️  AUTOSCAFFOLD: DE NOVO MOTIF SCAFFOLDING 🏗️       ${NC}"
-echo -e "${CYAN}======================================================${NC}"
+echo -e "${CYAN}======================================================================${NC}"
+echo -e "${CYAN} 🏗️  AUTOSCAFFOLD v2.2.0: DE NOVO MOTIF SCAFFOLDING 🏗️                ${NC}"
+echo -e "${CYAN}======================================================================${NC}"
 echo -e "Tip: Press ${YELLOW}Ctrl + C${NC} to cancel. (For the Master Suite menu, run ${BOLD}autoscaffold_suite.sh${NC} or ${BOLD}autoscaffold${NC})\n"
 
 BACKGROUND_MODE=false

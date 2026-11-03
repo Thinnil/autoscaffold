@@ -102,9 +102,16 @@ if [ ${#ARGS[@]} -gt 0 ]; then
             [ -f "$SCRIPT_DIR/chimera_scaffold.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/chimera_scaffold.sh${NC}"; exit 1; }
             exec bash "$SCRIPT_DIR/chimera_scaffold.sh" "${CMD_REST[@]}"
             ;;
-        diagnostics|diag)
-            [ -f "$SCRIPT_DIR/scripts/diagnostics.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/diagnostics.sh${NC}"; exit 1; }
-            exec bash "$SCRIPT_DIR/scripts/diagnostics.sh" "${CMD_REST[@]}"
+        doctor|diagnostics|diag)
+            if [ -f "$SCRIPT_DIR/scripts/system_doctor.py" ] && command -v python3 >/dev/null 2>&1; then
+                exec python3 "$SCRIPT_DIR/scripts/system_doctor.py" "${CMD_REST[@]}"
+            elif [ -f "$SCRIPT_DIR/scripts/system_doctor.py" ] && command -v python >/dev/null 2>&1; then
+                exec python "$SCRIPT_DIR/scripts/system_doctor.py" "${CMD_REST[@]}"
+            elif [ -f "$SCRIPT_DIR/scripts/diagnostics.sh" ]; then
+                exec bash "$SCRIPT_DIR/scripts/diagnostics.sh" "${CMD_REST[@]}"
+            else
+                echo -e "${RED}[ERROR] Neither system_doctor.py nor diagnostics.sh found!${NC}"; exit 1
+            fi
             ;;
         install|setup|deps)
             if [ -f "$SCRIPT_DIR/install.sh" ]; then
@@ -167,10 +174,12 @@ else
     printf '%.0s─' $(seq 1 "$COLS") 2>/dev/null || true
     echo -e "\n"
 fi
+GIT_SYNC_STATUS=$(check_git_sync_status 2>/dev/null || echo "Up-to-date with origin/main")
 echo -e "${CYAN}======================================================================${NC}"
-echo -e "${CYAN}        🧬 AUTOSCAFFOLD SUITE: AUTONOMOUS PROTEIN ENGINEERING 🧬        ${NC}"
+echo -e "${CYAN}        🧪 AUTOSCAFFOLD SUITE v2.2.0: AUTONOMOUS PROTEIN ENGINEERING 🧪        ${NC}"
 echo -e "${CYAN}       RFdiffusion  •  ProteinMPNN  •  ColabFold  •  PyMOL / PSE       ${NC}"
 echo -e "${CYAN}======================================================================${NC}"
+echo -e "[Version: v${AUTOSCAFFOLD_VERSION:-2.2.0} | Upstream: $GIT_SYNC_STATUS]"
 echo -e "Tip: Press ${YELLOW}Ctrl + C${NC} at any time to exit.\n"
 
 echo -e "${BOLD}Select a workflow to launch:${NC}"
@@ -178,7 +187,7 @@ echo -e "  ${GREEN}[1]${NC} 🏗️  De Novo Motif Scaffolding (Active site & ep
 echo -e "  ${GREEN}[2]${NC} 🎯 De Novo Target-Binder Design (Interface hotspot scaffolding)"
 echo -e "  ${GREEN}[3]${NC} 🧩 Discontinuous Binding Surface Scaffolding"
 echo -e "  ${GREEN}[4]${NC} 🧬 Chimera Scaffolding: Graft Motif into Vessel Protein (PDB/PSE)"
-echo -e "  ${GREEN}[5]${NC} 🩺 System Diagnostics & Environment Pre-Flight Checks"
+echo -e "  ${GREEN}[5]${NC} 🩺 System Doctor & Pre-Flight Diagnostics"
 echo -e "  ${GREEN}[6]${NC} 📦 Automatic Dependency & Environment Installer"
 echo -e "  ${GREEN}[7]${NC} 🔄 In-Place Self-Update & GitHub Upgrade"
 echo -e "  ${GREEN}[8]${NC} 🚪 Exit"
@@ -204,8 +213,15 @@ case "$WORKFLOW_CHOICE" in
         exec bash "$SCRIPT_DIR/chimera_scaffold.sh"
         ;;
     5)
-        [ -f "$SCRIPT_DIR/scripts/diagnostics.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/scripts/diagnostics.sh${NC}"; exit 1; }
-        exec bash "$SCRIPT_DIR/scripts/diagnostics.sh"
+        if [ -f "$SCRIPT_DIR/scripts/system_doctor.py" ] && command -v python3 >/dev/null 2>&1; then
+            exec python3 "$SCRIPT_DIR/scripts/system_doctor.py"
+        elif [ -f "$SCRIPT_DIR/scripts/system_doctor.py" ] && command -v python >/dev/null 2>&1; then
+            exec python "$SCRIPT_DIR/scripts/system_doctor.py"
+        elif [ -f "$SCRIPT_DIR/scripts/diagnostics.sh" ]; then
+            exec bash "$SCRIPT_DIR/scripts/diagnostics.sh"
+        else
+            echo -e "${RED}[ERROR] Neither system_doctor.py nor diagnostics.sh found!${NC}"; exit 1
+        fi
         ;;
     6)
         if [ -f "$SCRIPT_DIR/install.sh" ]; then

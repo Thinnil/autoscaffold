@@ -96,9 +96,11 @@ def _transform_pdb_coordinates(pdb_path: str, R: np.ndarray, t: np.ndarray) -> b
                         x = float(line[30:38])
                         y = float(line[38:46])
                         z = float(line[46:54])
-                        r = np.array([x, y, z], dtype=np.float64)
-                        r_new = np.dot(r, R) + t
-                        mod_line = f"{line[:30]}{r_new[0]:8.3f}{r_new[1]:8.3f}{r_new[2]:8.3f}{line[54:]}"
+                        # Zero-allocation scalar matrix multiplication
+                        r0 = x * R[0, 0] + y * R[1, 0] + z * R[2, 0] + t[0]
+                        r1 = x * R[0, 1] + y * R[1, 1] + z * R[2, 1] + t[1]
+                        r2 = x * R[0, 2] + y * R[1, 2] + z * R[2, 2] + t[2]
+                        mod_line = f"{line[:30]}{r0:8.3f}{r1:8.3f}{r2:8.3f}{line[54:]}"
                         lines_out.append(mod_line)
                     except (ValueError, IndexError):
                         lines_out.append(line)
@@ -284,25 +286,35 @@ def audit_motif_cartesian_drift(
         # Check raw unaligned Euclidean deviation
         raw_vec_drifts = np.linalg.norm(cand_arr - seed_arr, axis=1)
 
-        # Detect RFdiffusion bounding-box centering / coordinate origin shift:
-        # If candidate center of mass has shifted by > 5.0 Å from seed center of mass,
-        # RFdiffusion has re-centered the coordinate system around the origin.
-        # Align candidate back onto seed crystallographic frame using Kabsch fit.
+        # Detect RFdiffusion bounding-box centering or global SE(3) rotation:
+        # 1. Coordinate origin re-centering / large translation (com_shift > 5.0 Å)
+        # 2. Rotational SE(3) frame offset around center of mass (rot_offset > 0.05 with >= 3 atoms)
         cand_center = np.mean(cand_arr, axis=0)
         seed_center = np.mean(seed_arr, axis=0)
         com_shift = float(np.linalg.norm(cand_center - seed_center))
+        is_frame_shifted = (com_shift > 5.0)
 
-        if com_shift > 5.0 and len(cand_arr) >= 3:
+        if len(cand_arr) >= 3:
             try:
                 R_opt, t_opt, kabsch_rmsd, cand_aligned, sq_dist = kabsch_fit(
                     cand_arr, seed_arr, return_aligned=True
                 )
-                vec_drifts = np.sqrt(sq_dist)
-                _transform_pdb_coordinates(real_cand, R_opt, t_opt)
+                rot_offset = float(np.linalg.norm(R_opt - np.eye(3)))
+                if rot_offset > 0.05 or is_frame_shifted:
+                    vec_drifts = np.sqrt(np.maximum(0.0, sq_dist))
+                    _transform_pdb_coordinates(real_cand, R_opt, t_opt)
+                else:
+                    vec_drifts = raw_vec_drifts
             except Exception:
                 vec_drifts = raw_vec_drifts
         else:
-            vec_drifts = raw_vec_drifts
+            if is_frame_shifted:
+                t_shift = seed_center - cand_center
+                cand_trans = cand_arr + t_shift
+                vec_drifts = np.linalg.norm(cand_trans - seed_arr, axis=1)
+                _transform_pdb_coordinates(real_cand, np.eye(3), t_shift)
+            else:
+                vec_drifts = raw_vec_drifts
 
         matched_idx = 0
         for i, detail in enumerate(drift_details):
@@ -327,26 +339,41 @@ def _purge_candidate_artifacts(prefix: str, cand_pdb: Optional[str] = None) -> N
     including candidate PDB, TRB, and any intermediate output files.
     Enforces strict directory boundary verification to prevent arbitrary file deletion.
     """
+    work_dir = None
+    clean_prefix = str(prefix).strip() if prefix else ""
+    if clean_prefix:
+        work_dir = os.path.realpath(os.path.abspath(os.path.dirname(clean_prefix)))
+    elif cand_pdb and str(cand_pdb).strip():
+        work_dir = os.path.realpath(os.path.abspath(os.path.dirname(str(cand_pdb).strip())))
+
+    if not work_dir:
+        return
+
+    p_drive, p_rest = os.path.splitdrive(work_dir)
+    is_root = (
+        (not p_drive and work_dir.rstrip("/\\") in ("", "/"))
+        or (p_drive and p_rest in ("/", "\\", ""))
+        or work_dir in ("/", "\\", "//", "\\\\")
+    )
+    if is_root or not os.path.isdir(work_dir):
+        return
+
     to_delete = set()
     if cand_pdb and str(cand_pdb).strip():
         real_cand = os.path.realpath(os.path.abspath(cand_pdb))
-        p_drive, p_rest = os.path.splitdrive(real_cand)
-        if not ((not p_drive and real_cand.rstrip("/\\") in ("", "/")) or (p_drive and p_rest in ("/", "\\", ""))):
-            to_delete.add(real_cand)
-            trb = real_cand[:-4] + ".trb" if real_cand.endswith(".pdb") else real_cand + ".trb"
-            to_delete.add(trb)
+        # Ensure candidate PDB is strictly contained within work_dir
+        try:
+            if os.path.commonpath([work_dir, real_cand]) == work_dir and real_cand != work_dir:
+                to_delete.add(real_cand)
+                trb = real_cand[:-4] + ".trb" if real_cand.endswith(".pdb") else real_cand + ".trb"
+                if os.path.commonpath([work_dir, trb]) == work_dir and trb != work_dir:
+                    to_delete.add(trb)
+        except (ValueError, OSError):
+            pass
 
-    if prefix and str(prefix).strip():
-        clean_prefix = str(prefix).strip()
+    if clean_prefix:
         base_prefix = os.path.basename(clean_prefix)
-        work_dir = os.path.realpath(os.path.abspath(os.path.dirname(clean_prefix)))
-        p_drive, p_rest = os.path.splitdrive(work_dir)
-        is_root = (
-            (not p_drive and work_dir.rstrip("/\\") in ("", "/"))
-            or (p_drive and p_rest in ("/", "\\", ""))
-            or work_dir in ("/", "\\", "//", "\\\\")
-        )
-        if not is_root and base_prefix and os.path.isdir(work_dir):
+        if base_prefix and os.path.isdir(work_dir):
             try:
                 for fname in os.listdir(work_dir):
                     if fname.startswith(base_prefix):
@@ -467,27 +494,23 @@ def map_fixed_positions_for_mpnn(
                     if np.any(v_valid):
                         vessel_fixed = (v_idxs[v_valid] + 1).tolist()
             else:
-                if len(donor_ca_coords) > 0:
-                    d_found = []
-                    for d_coord in donor_ca_coords:
-                        diffs = bb_ca_coords - d_coord
-                        sq_dists = np.sum(diffs * diffs, axis=1)
-                        min_idx = int(np.argmin(sq_dists))
-                        if sq_dists[min_idx] < 0.4225:  # (0.65 Å)^2
-                            d_found.append(min_idx + 1)
-                    if len(d_found) > 0:
-                        donor_fixed = d_found
+                if len(donor_ca_coords) > 0 and len(bb_ca_coords) > 0:
+                    diffs = donor_ca_coords[:, None, :] - bb_ca_coords[None, :, :]
+                    sq_dists = np.sum(diffs * diffs, axis=-1)
+                    min_idxs = np.argmin(sq_dists, axis=1)
+                    min_vals = sq_dists[np.arange(len(donor_ca_coords)), min_idxs]
+                    valid = min_vals < 0.4225  # (0.65 Å)^2
+                    if np.any(valid):
+                        donor_fixed = (min_idxs[valid] + 1).tolist()
 
-                if lock_vessel and len(vessel_ca_coords) > 0:
-                    v_found = []
-                    for v_coord in vessel_ca_coords:
-                        diffs = bb_ca_coords - v_coord
-                        sq_dists = np.sum(diffs * diffs, axis=1)
-                        min_idx = int(np.argmin(sq_dists))
-                        if sq_dists[min_idx] < 0.4225:
-                            v_found.append(min_idx + 1)
-                    if len(v_found) > 0:
-                        vessel_fixed = v_found
+                if lock_vessel and len(vessel_ca_coords) > 0 and len(bb_ca_coords) > 0:
+                    v_diffs = vessel_ca_coords[:, None, :] - bb_ca_coords[None, :, :]
+                    v_sq_dists = np.sum(v_diffs * v_diffs, axis=-1)
+                    v_min_idxs = np.argmin(v_sq_dists, axis=1)
+                    v_min_vals = v_sq_dists[np.arange(len(vessel_ca_coords)), v_min_idxs]
+                    v_valid = v_min_vals < 0.4225
+                    if np.any(v_valid):
+                        vessel_fixed = (v_min_idxs[v_valid] + 1).tolist()
     except Exception:
         pass
 

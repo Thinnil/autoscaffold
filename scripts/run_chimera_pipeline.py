@@ -9,6 +9,7 @@ diagnostic error reporting, and typed context and result dataclasses.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -23,7 +24,31 @@ REPO_ROOT = os.path.dirname(SCRIPTS_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from chimera_stages.stage1_parsing import (
+# Enforce reasonable CPU thread limits to prevent thread oversaturation in CPU fallback mode
+try:
+    import torch
+    if not torch.cuda.is_available():
+        env_threads = os.environ.get("OMP_NUM_THREADS") or os.environ.get("TORCH_NUM_THREADS")
+        if env_threads and env_threads.isdigit():
+            torch.set_num_threads(max(1, int(env_threads)))
+        else:
+            torch.set_num_threads(min(4, os.cpu_count() or 2))
+except Exception:
+    pass
+
+try:
+    from scripts.version import __version__, __version_info__, get_version
+except ImportError:
+    try:
+        from version import __version__, __version_info__, get_version
+    except ImportError:
+        __version__ = "2.2.0"
+        __version_info__ = (2, 2, 0)
+
+        def get_version() -> str:
+            return __version__
+
+from chimera_stages.stage1_parsing import (  # noqa: E402
     MultiChainMotifManifest,
     prepare_input_structures,
     validate_output_dir,
@@ -31,21 +56,21 @@ from chimera_stages.stage1_parsing import (
     _RE_SHELL_INJECTION,
     _RE_OUTPUTS_DEDUP_MID,
 )
-from chimera_stages.stage2_clash import (
+from chimera_stages.stage2_clash import (  # noqa: E402
     map_fixed_positions_for_mpnn,
 )
-from chimera_stages.stage3_geometry import (
+from chimera_stages.stage3_geometry import (  # noqa: E402
     compute_contigs_and_segments,
     measure_junctions,
 )
-from chimera_stages.stage4_runners import (
+from chimera_stages.stage4_runners import (  # noqa: E402
     RunnerSpec,
     resolve_execution_runner,
     probe_python_environment,
     display_cuda_warning,
     run_closed_loop_backbone_generation,
 )
-from chimera_stages.stage5_export import (
+from chimera_stages.stage5_export import (  # noqa: E402
     create_merged_seed_pdb,
     extract_mpnn_sequences,
     thread_sequence_onto_pdb,
@@ -54,7 +79,9 @@ from chimera_stages.stage5_export import (
 )
 
 try:
-    from scripts.format_complex_fasta import make_fixed_positions_dict
+    from scripts.format_complex_fasta import make_fixed_positions_dict  # noqa: E402
+except ImportError:
+    from format_complex_fasta import make_fixed_positions_dict  # noqa: E402
 except ImportError:
     from format_complex_fasta import make_fixed_positions_dict
 
@@ -314,6 +341,20 @@ class ChimeraPipelineOrchestrator:
             # Stage 5B: All-atom threading, relaxation, PyMOL & reporting
             summary = self._execute_stage5_export(mpnn_results)
 
+            # Trial Advisor Analysis & Artifacts
+            try:
+                from scripts.trial_advisor import generate_trial_recommendations
+                advice = generate_trial_recommendations(
+                    context=self.ctx,
+                    summary_data=summary,
+                    output_dir=self.ctx.out_dir,
+                    status="SUCCESS",
+                )
+                if advice:
+                    summary["trial_recommendations"] = advice
+            except Exception as adv_err:
+                print(f"[*] Note on Trial Advisor execution: {adv_err}")
+
             elapsed = time.time() - start_time
             return PipelineResult(
                 status="SUCCESS",
@@ -323,8 +364,30 @@ class ChimeraPipelineOrchestrator:
                 execution_time_seconds=elapsed,
             )
         except StageExecutionError as e:
+            try:
+                from scripts.trial_advisor import generate_trial_recommendations
+                generate_trial_recommendations(
+                    context=self.ctx,
+                    summary_data=None,
+                    output_dir=self.ctx.out_dir,
+                    status="FAILED",
+                    error=e,
+                )
+            except Exception:
+                pass
             return self._handle_stage_failure(e, time.time() - start_time)
         except Exception as e:
+            try:
+                from scripts.trial_advisor import generate_trial_recommendations
+                generate_trial_recommendations(
+                    context=self.ctx,
+                    summary_data=None,
+                    output_dir=self.ctx.out_dir,
+                    status="FAILED",
+                    error=e,
+                )
+            except Exception:
+                pass
             return self._handle_unexpected_failure(e, time.time() - start_time)
 
     def _execute_stage1(self):
@@ -399,7 +462,10 @@ class ChimeraPipelineOrchestrator:
                 message=str(e),
                 remediation_tips=[
                     "Verify the chimera_mode is one of: replace, ligate_nterm, ligate_cterm, or insert_loop.",
-                    "Check that vessel_replace_range or vessel_split_after falls strictly within the vessel sequence bounds.",
+                    (
+                        "Check that vessel_replace_range or vessel_split_after "
+                        "falls strictly within the vessel sequence bounds."
+                    ),
                     "Ensure motif_residues contains valid residue numbers present in the donor structure.",
                 ],
             ) from e
@@ -491,14 +557,16 @@ class ChimeraPipelineOrchestrator:
                 generated_backbones = [mock_bb]
 
             if not ctx.dry_run and ctx.mpnn_script and os.path.isfile(ctx.mpnn_script):
-                probe_python_environment(
+                probe_mpnn = probe_python_environment(
                     ctx.mpnn_runner,
                     required_modules=["torch"],
-                    check_cuda=False,
+                    check_cuda=True,
                     raise_on_error=True,
                     tool_name="ProteinMPNN",
                     suggested_env="mlfold",
                 )
+                if not probe_mpnn.get("cuda_available", False):
+                    display_cuda_warning(ctx.mpnn_runner.display_label(), tool_name="ProteinMPNN")
 
             mpnn_results = []
             for bb in generated_backbones:
@@ -523,7 +591,7 @@ class ChimeraPipelineOrchestrator:
                 jsonl_path = safe_join_path(work_mpnn, f"{safe_bb_name}_fixed_positions.jsonl")
                 make_fixed_positions_dict(bb_name, fixed_map, out_jsonl=jsonl_path)
 
-                mpnn_cmd = ctx.mpnn_runner.build_command(
+                mpnn_args = [
                     ctx.mpnn_script or "protein_mpnn_run.py",
                     "--pdb_path",
                     bb,
@@ -539,7 +607,10 @@ class ChimeraPipelineOrchestrator:
                     str(ctx.mpnn_batch_size),
                     "--seed",
                     "37",
-                )
+                ]
+                if not getattr(ctx.mpnn_runner, "cuda_available", False):
+                    mpnn_args.extend(["--device", "cpu"])
+                mpnn_cmd = ctx.mpnn_runner.build_command(*mpnn_args)
 
                 cand_info = {
                     "backbone": bb,
@@ -732,8 +803,26 @@ def main() -> None:
         print(json.dumps(res, indent=2))
         sys.exit(0)
 
+    if "--doctor" in sys.argv:
+        try:
+            from scripts.system_doctor import main as doctor_main
+        except ImportError:
+            from system_doctor import main as doctor_main
+        sys.exit(doctor_main())
+
     parser = argparse.ArgumentParser(
         description="Run Chimera Scaffolding Pipeline: Modular multi-stage molecular engineering."
+    )
+    parser.add_argument(
+        "--version",
+        "-v",
+        action="version",
+        version=f"AutoScaffold v{__version__}",
+    )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run comprehensive preflight environment and system diagnostics",
     )
     parser.add_argument(
         "--input_file", "--input", "-i", dest="input_file", help="Input multi-chain PDB or PyMOL session (.pse) file"

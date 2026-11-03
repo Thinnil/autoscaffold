@@ -25,7 +25,13 @@ import shlex
 import shutil
 from typing import Dict, List, Any, Optional
 
-AUTOSCAFFOLD_VERSION = "2.1.0"
+try:
+    from scripts.version import __version__ as AUTOSCAFFOLD_VERSION
+except ImportError:
+    try:
+        from version import __version__ as AUTOSCAFFOLD_VERSION
+    except ImportError:
+        AUTOSCAFFOLD_VERSION = "2.2.0"
 
 _SYSTEM_HARDWARE_CACHE: Optional[Dict[str, str]] = None
 
@@ -124,25 +130,66 @@ def generate_methodology_report(
     if not methodology_steps:
         if "Chimera" in pipeline_mode:
             methodology_steps = [
-                "1. Structural Extraction & Atom Parsing: Parsed donor motif coordinates and vessel host framework from source files (PDB/PSE).",
-                "2. Coordinate Seeding & Merging: Merged preserved donor motif atoms and preserved vessel framework into a single SE(3) coordinate seed.",
-                "3. Backbone Generation (RFdiffusion): Executed SE(3) equivariant diffusion with coordinate pinning (denoiser.noise_scale_ca=0.0, noise_scale_frame=0.0) to synthesize de novo linkers while preserving native donor motif and vessel coordinates.",
-                "4. Sequence Design (ProteinMPNN): Redesigned de novo linkers and connecting junctions. Pinned donor motif residue identities and locked vessel framework residue positions in fixed_positions_dict.jsonl.",
-                "5. Structural Validation: Evaluated generated chimeras using Kabsch C-alpha superposition against native donor coordinates (RMSD threshold) and assessed folding quality/pLDDT."
+                (
+                    "1. Structural Extraction & Atom Parsing: Parsed donor motif coordinates and vessel "
+                    "host framework from source files (PDB/PSE)."
+                ),
+                (
+                    "2. Coordinate Seeding & Merging: Merged preserved donor motif atoms and preserved vessel "
+                    "framework into a single SE(3) coordinate seed."
+                ),
+                (
+                    "3. Backbone Generation (RFdiffusion): Executed SE(3) equivariant diffusion with coordinate "
+                    "pinning (denoiser.noise_scale_ca=0.0, noise_scale_frame=0.0) to synthesize de novo linkers "
+                    "while preserving native donor motif and vessel coordinates."
+                ),
+                (
+                    "4. Sequence Design (ProteinMPNN): Redesigned de novo linkers and connecting junctions. "
+                    "Pinned donor motif residue identities and locked vessel framework residue positions in "
+                    "fixed_positions_dict.jsonl."
+                ),
+                (
+                    "5. Structural Validation: Evaluated generated chimeras using Kabsch C-alpha superposition "
+                    "against native donor coordinates (RMSD threshold) and assessed folding quality/pLDDT."
+                ),
             ]
         elif "Discontinuous" in pipeline_mode:
             methodology_steps = [
-                "1. Discontinuous Motif Extraction: Extracted non-contiguous catalytic / binding epitope segments and target context coordinates.",
-                "2. Backbone Scaffolding (RFdiffusion): Diffused intervening loops and scaffold framework with SE(3) coordinate pinning (noise_scale=0.0) around fixed epitope residues.",
-                "3. Sequence Optimization (ProteinMPNN): Locked native motif sequence identities; designed all scaffold and linker positions.",
-                "4. Multimer Validation (ColabFold / AlphaFold2): Assessed complex interface prediction, ipTM, pLDDT, and calculated motif Kabsch RMSD."
+                (
+                    "1. Discontinuous Motif Extraction: Extracted non-contiguous catalytic / binding epitope segments "
+                    "and target context coordinates."
+                ),
+                (
+                    "2. Backbone Scaffolding (RFdiffusion): Diffused intervening loops and scaffold framework with "
+                    "SE(3) coordinate pinning (noise_scale=0.0) around fixed epitope residues."
+                ),
+                (
+                    "3. Sequence Optimization (ProteinMPNN): Locked native motif sequence identities; designed "
+                    "all scaffold and linker positions."
+                ),
+                (
+                    "4. Multimer Validation (ColabFold / AlphaFold2): Assessed complex interface prediction, ipTM, "
+                    "pLDDT, and calculated motif Kabsch RMSD."
+                ),
             ]
         elif "Binder" in pipeline_mode or "Novo" in pipeline_mode:
             methodology_steps = [
-                "1. Target Structural Ingestion: Extracted target chain coordinate frame and identified interaction hotspots.",
-                "2. De Novo Diffusion (RFdiffusion): Generated target-binding backbones using SE(3) equivariant reverse diffusion guided by hotspot potentials.",
-                "3. Sequence Design (ProteinMPNN): Fixed target chain sequence identities; sampled de novo sequence for the newly generated binder.",
-                "4. Interface Validation (ColabFold / AlphaFold-Multimer): Predicted target-binder complex, filtering by interface pLDDT and ipTM."
+                (
+                    "1. Target Structural Ingestion: Extracted target chain coordinate frame and identified "
+                    "interaction hotspots."
+                ),
+                (
+                    "2. De Novo Diffusion (RFdiffusion): Generated target-binding backbones using SE(3) equivariant "
+                    "reverse diffusion guided by hotspot potentials."
+                ),
+                (
+                    "3. Sequence Design (ProteinMPNN): Fixed target chain sequence identities; "
+                    "sampled de novo sequence for the newly generated binder."
+                ),
+                (
+                    "4. Interface Validation (ColabFold / AlphaFold-Multimer): Predicted target-binder complex, "
+                    "filtering by interface pLDDT and ipTM."
+                ),
             ]
         else:
             methodology_steps = [

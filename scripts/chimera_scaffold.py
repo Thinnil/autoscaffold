@@ -15,7 +15,6 @@ modular chimera_stages package.
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -29,8 +28,32 @@ REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+# Enforce reasonable CPU thread limits to prevent thread oversaturation in CPU fallback mode
+try:
+    import torch
+    if not torch.cuda.is_available():
+        env_threads = os.environ.get("OMP_NUM_THREADS") or os.environ.get("TORCH_NUM_THREADS")
+        if env_threads and env_threads.isdigit():
+            torch.set_num_threads(max(1, int(env_threads)))
+        else:
+            torch.set_num_threads(min(4, os.cpu_count() or 2))
+except Exception:
+    pass
+
+try:
+    from scripts.version import __version__, __version_info__, get_version  # noqa: E402
+except ImportError:
+    try:
+        from version import __version__, __version_info__, get_version  # noqa: E402
+    except ImportError:
+        __version__ = "2.2.0"
+        __version_info__ = (2, 2, 0)
+
+        def get_version() -> str:
+            return __version__
+
 # 1. Stage 1 Imports & Re-exports
-from chimera_stages.stage1_parsing import (
+from chimera_stages.stage1_parsing import (  # noqa: E402, F401
     ONE_TO_THREE,
     _RE_SANITIZE_IDENT,
     _RE_OUTPUTS_DEDUP_MID,
@@ -52,6 +75,7 @@ from chimera_stages.stage1_parsing import (
     _ANCHOR_RESI_FALLBACK_CACHE,
     _SEED_CA_CACHE,
     _REALPATH_CACHE,
+    _STAT_MTIME_CACHE,
     clear_ca_coords_cache,
     parse_multi_chain_motif_spec,
     build_multi_chain_manifest,
@@ -61,7 +85,7 @@ from chimera_stages.stage1_parsing import (
 )
 
 # 2. Stage 2 Imports & Re-exports
-from chimera_stages.stage2_clash import (
+from chimera_stages.stage2_clash import (  # noqa: E402, F401
     calculate_anchor_distance,
     batch_anchor_distances,
     _transform_pdb_coordinates,
@@ -71,7 +95,7 @@ from chimera_stages.stage2_clash import (
 )
 
 # 3. Stage 3 Imports & Re-exports
-from chimera_stages.stage3_geometry import (
+from chimera_stages.stage3_geometry import (  # noqa: E402, F401
     compute_gap_linker_length,
     compute_gap_linker_string,
     compute_recommended_linker,
@@ -86,7 +110,7 @@ from chimera_stages.stage3_geometry import (
 )
 
 # 4. Stage 4 Imports & Re-exports
-from chimera_stages.stage4_runners import (
+from chimera_stages.stage4_runners import (  # noqa: E402, F401
     RunnerSpec,
     clear_probe_cache,
     clear_environment_cache,
@@ -107,7 +131,7 @@ from chimera_stages.stage4_runners import (
 )
 
 # 5. Stage 5 Imports & Re-exports
-from chimera_stages.stage5_export import (
+from chimera_stages.stage5_export import (  # noqa: E402, F401
     create_merged_seed_pdb as _stage5_create_merged_seed_pdb,
     place_atom_nerf,
     build_sidechain_atoms,
@@ -119,17 +143,17 @@ from chimera_stages.stage5_export import (
 )
 
 try:
-    from scripts.pse_pdb_extractor import (
+    from scripts.pse_pdb_extractor import (  # noqa: E402
         validate_output_dir,
         safe_join_path,
     )
-    from scripts.format_complex_fasta import make_fixed_positions_dict
+    from scripts.format_complex_fasta import make_fixed_positions_dict  # noqa: E402
 except ImportError:
-    from pse_pdb_extractor import (
+    from pse_pdb_extractor import (  # noqa: E402
         validate_output_dir,
         safe_join_path,
     )
-    from format_complex_fasta import make_fixed_positions_dict
+    from format_complex_fasta import make_fixed_positions_dict  # noqa: E402
 
 
 # Dynamic module attribute lookup for Trap 2 (_CACHED_MANAGERS, _CACHED_ROOTS)
@@ -628,7 +652,7 @@ class ChimeraScaffolder:
             if not probe_res.get("cuda_available", False):
                 display_cuda_warning(self.rfdiff_runner.display_label(), tool_name="RFdiffusion")
 
-        rfdiff_cmd = self.rfdiff_runner.build_command(
+        rfdiff_args = [
             self.rfdiff_script or "scripts/run_inference.py",
             f"inference.output_prefix={os.path.join(work_rfdiff, 'chimera_design')}",
             f"inference.input_pdb={self.seed_pdb_path}",
@@ -636,7 +660,10 @@ class ChimeraScaffolder:
             f"inference.num_designs={self.num_designs}",
             "denoiser.noise_scale_ca=0.0",
             "denoiser.noise_scale_frame=0.0",
-        )
+        ]
+        if not getattr(self.rfdiff_runner, "cuda_available", False):
+            rfdiff_args.append("inference.device=cpu")
+        rfdiff_cmd = self.rfdiff_runner.build_command(*rfdiff_args)
         summary_data["rfdiffusion_command"] = rfdiff_cmd
 
         generated_backbones = []
@@ -726,7 +753,7 @@ class ChimeraScaffolder:
             jsonl_path = safe_join_path(work_mpnn, f"{safe_bb_name}_fixed_positions.jsonl")
             make_fixed_positions_dict(bb_name, fixed_map, out_jsonl=jsonl_path)
 
-            mpnn_cmd = self.mpnn_runner.build_command(
+            mpnn_args = [
                 self.mpnn_script or "protein_mpnn_run.py",
                 "--pdb_path",
                 bb,
@@ -742,7 +769,10 @@ class ChimeraScaffolder:
                 str(self.mpnn_batch_size),
                 "--seed",
                 "37",
-            )
+            ]
+            if not getattr(self.mpnn_runner, "cuda_available", False):
+                mpnn_args.extend(["--device", "cpu"])
+            mpnn_cmd = self.mpnn_runner.build_command(*mpnn_args)
 
             cand_info = {
                 "backbone": bb,
@@ -808,6 +838,18 @@ class ChimeraScaffolder:
             seed_provenance=getattr(self, "seed_provenance", None),
         )
         summary_data.update(export_summary)
+        try:
+            from scripts.trial_advisor import generate_trial_recommendations
+            advice = generate_trial_recommendations(
+                context=self,
+                summary_data=summary_data,
+                output_dir=self.out_dir,
+                status="SUCCESS",
+            )
+            if advice:
+                summary_data["trial_recommendations"] = advice
+        except Exception as adv_err:
+            print(f"[*] Note on Trial Advisor execution: {adv_err}")
         return summary_data
 
 
@@ -863,8 +905,26 @@ def main() -> None:
         print(json.dumps(res, indent=2))
         sys.exit(0)
 
+    if "--doctor" in sys.argv:
+        try:
+            from scripts.system_doctor import main as doctor_main
+        except ImportError:
+            from system_doctor import main as doctor_main
+        sys.exit(doctor_main())
+
     parser = argparse.ArgumentParser(
         description="Chimera Scaffolding: Graft active motifs into host scaffold proteins."
+    )
+    parser.add_argument(
+        "--version",
+        "-v",
+        action="version",
+        version=f"AutoScaffold v{__version__}",
+    )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run comprehensive preflight environment and system diagnostics",
     )
     parser.add_argument(
         "--input_file", "--input", "-i", dest="input_file", help="Input multi-chain PDB or PyMOL session (.pse) file"

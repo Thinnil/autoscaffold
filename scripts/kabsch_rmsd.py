@@ -14,8 +14,16 @@ Calculates:
 
 import argparse
 import json
+import os
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
+
+_EXTRACT_COORDS_CACHE: Dict[Tuple, Tuple[np.ndarray, List[Dict[str, Any]]]] = {}
+
+
+def clear_extract_coords_cache() -> None:
+    """Clears the in-memory extract_coordinates session cache."""
+    _EXTRACT_COORDS_CACHE.clear()
 
 
 def kabsch_fit(
@@ -28,8 +36,10 @@ def kabsch_fit(
         Q_approx = np.dot(P, R) + t
     Both P and Q must be (N, 3) arrays where N >= 3.
     Returns (R, t, rmsd) or (R, t, rmsd, P_aligned, sq_dist) if return_aligned is True.
-    Optimized for in-memory execution without redundant matrix allocations.
+    Optimized for zero-copy in-memory execution without redundant matrix allocations.
     """
+    P = np.asarray(P, dtype=np.float64)
+    Q = np.asarray(Q, dtype=np.float64)
     if P.shape != Q.shape:
         raise ValueError(f"Shape mismatch in Kabsch fit: P is {P.shape}, Q is {Q.shape}")
     if len(P.shape) != 2 or P.shape[1] != 3:
@@ -100,6 +110,22 @@ def extract_coordinates(
         atom_names = ["CA"]
     atom_names_upper = set(a.upper().strip() for a in atom_names)
 
+    # O(1) Session caching check
+    try:
+        real_p = os.path.realpath(pdb_path)
+        mtime = os.path.getmtime(real_p)
+    except OSError:
+        real_p = pdb_path
+        mtime = 0.0
+
+    res_tuple = tuple(residue_list) if residue_list is not None else None
+    atom_tuple = tuple(sorted(atom_names_upper))
+    cache_key = (real_p, mtime, chain_id, res_tuple, atom_tuple, extract_meta)
+
+    if cache_key in _EXTRACT_COORDS_CACHE:
+        c_cached, m_cached = _EXTRACT_COORDS_CACHE[cache_key]
+        return c_cached.copy(), list(m_cached)
+
     coords = []
     meta = []
 
@@ -141,7 +167,9 @@ def extract_coordinates(
                         "line": line.rstrip()
                     })
 
-    return np.array(coords, dtype=float), meta
+    coords_arr = np.array(coords, dtype=float)
+    _EXTRACT_COORDS_CACHE[cache_key] = (coords_arr, meta)
+    return coords_arr.copy(), meta
 
 
 def calculate_motif_rmsd(

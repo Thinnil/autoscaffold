@@ -12,6 +12,7 @@ Handles:
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -82,10 +83,11 @@ _SEED_CA_CACHE: Dict[Tuple[str, float], Dict[int, np.ndarray]] = {}
 
 # In-memory canonical path cache to avoid repeated os.path.realpath filesystem traversals
 _REALPATH_CACHE: Dict[str, str] = {}
+_STAT_MTIME_CACHE: Dict[str, Tuple[float, float]] = {}
 
 
 def _get_path_and_mtime(path: str) -> Optional[Tuple[str, float]]:
-    """Resolves canonical realpath and mtime using a single cached stat call."""
+    """Resolves canonical realpath and mtime using an O(1) cached stat call with rate-limiting."""
     if not path:
         return None
     try:
@@ -93,8 +95,16 @@ def _get_path_and_mtime(path: str) -> Optional[Tuple[str, float]]:
         if real_path is None:
             real_path = os.path.realpath(path)
             _REALPATH_CACHE[path] = real_path
+
+        now = time.monotonic()
+        cached = _STAT_MTIME_CACHE.get(real_path)
+        if cached is not None and (now - cached[1]) < 2.0:
+            return real_path, cached[0]
+
         st = os.stat(real_path)
-        return real_path, st.st_mtime
+        mtime = st.st_mtime
+        _STAT_MTIME_CACHE[real_path] = (mtime, now)
+        return real_path, mtime
     except (OSError, ValueError):
         return None
 
@@ -110,6 +120,7 @@ def clear_ca_coords_cache() -> None:
     _ANCHOR_RESI_FALLBACK_CACHE.clear()
     _SEED_CA_CACHE.clear()
     _REALPATH_CACHE.clear()
+    _STAT_MTIME_CACHE.clear()
 
 
 @dataclass(frozen=True)
