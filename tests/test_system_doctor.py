@@ -75,8 +75,9 @@ class TestSystemDoctor(unittest.TestCase):
         py_exec = sys.executable or "python"
         res = subprocess.run(
             [py_exec, "scripts/system_doctor.py", "--json"],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=10.0,
         )
         self.assertEqual(res.returncode, 0)

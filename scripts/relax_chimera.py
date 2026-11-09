@@ -252,8 +252,9 @@ def run_faspr_repack(input_pdb: str, output_pdb: str) -> bool:
         print(f"[+] Running FASPR graph-cut rotamer repacking: {faspr_bin}")
         res = subprocess.run(
             [faspr_bin, "-i", input_pdb, "-o", output_pdb],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
             check=False,
             shell=False,
             timeout=30,

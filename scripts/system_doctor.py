@@ -95,8 +95,9 @@ def probe_cuda_hardware(use_cache: bool = True) -> Dict[str, Any]:
         try:
             p = subprocess.run(
                 ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
                 timeout=3.0,
                 shell=False,
             )
@@ -130,8 +131,9 @@ def probe_cuda_hardware(use_cache: bool = True) -> Dict[str, Any]:
     try:
         proc = subprocess.run(
             [py_exec, "-c", probe_code],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=5.0,
             shell=False,
         )
@@ -279,8 +281,9 @@ def discover_package_managers(use_cache: bool = True) -> Dict[str, Dict[str, Any
             try:
                 out = subprocess.run(
                     [found_bin, "--version"],
-                    capture_output=True,
-                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
                     timeout=2.0,
                     shell=False,
                 )
@@ -402,8 +405,9 @@ def inspect_virtual_environments(use_cache: bool = True) -> Dict[str, Dict[str, 
             try:
                 proc = subprocess.run(
                     [found_py, "-c", probe_code],
-                    capture_output=True,
-                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
                     timeout=3.0,
                     shell=False,
                 )

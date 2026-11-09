@@ -69,7 +69,7 @@ def get_system_hardware_info() -> Dict[str, str]:
             ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            universal_newlines=True,
             shell=False,
             timeout=1.5
         )

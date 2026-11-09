@@ -648,7 +648,7 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
             "--vessel_replace_range",
             "40-60",
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True)
         cli_data = json.loads(res.stdout)
         self.assertEqual(cli_data["mode"], "replace")
         self.assertIn("junctions", cli_data)
@@ -661,12 +661,12 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         self.assertTrue(os.path.isfile(launcher), f"Launcher script not found: {launcher}")
 
         # Run launcher help via bash from repository root and from an external working directory
-        res = subprocess.run(["bash", launcher, "help"], capture_output=True, text=True)
+        res = subprocess.run(["bash", launcher, "help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         self.assertEqual(res.returncode, 0)
         self.assertIn("AutoScaffold Master Suite CLI", res.stdout)
 
         # Run from an external temporary directory to verify cwd-independence
-        res_external = subprocess.run(["bash", launcher, "help"], cwd=self.test_dir, capture_output=True, text=True)
+        res_external = subprocess.run(["bash", launcher, "help"], cwd=self.test_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         self.assertEqual(res_external.returncode, 0)
         self.assertIn("AutoScaffold Master Suite CLI", res_external.stdout)
 

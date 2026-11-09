@@ -63,8 +63,9 @@ def get_git_sync_status(repo_dir: Optional[str] = None, refresh: bool = False) -
         # Check local HEAD
         local_res = subprocess.run(
             ["git", "-C", repo_dir, "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=2.0,
             shell=False,
         )
@@ -77,8 +78,9 @@ def get_git_sync_status(repo_dir: Optional[str] = None, refresh: bool = False) -
         # Check origin/main
         remote_res = subprocess.run(
             ["git", "-C", repo_dir, "rev-parse", "origin/main"],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=2.0,
             shell=False,
         )

@@ -500,7 +500,7 @@ with open({repr(temp_json)}, "w", encoding="utf-8") as f:
             [pymol_bin, "-cq", temp_script],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            universal_newlines=True,
             timeout=30
         )
         if proc.returncode != 0 or not os.path.exists(temp_json) or os.path.getsize(temp_json) == 0:
@@ -1279,7 +1279,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Inspect and extract chains/objects from PDB or PyMOL session (.pse) files."
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
 
     # Subcommand: inspect
     inspect_parser = subparsers.add_parser("inspect", help="Inspect PDB or PSE and output JSON summary")

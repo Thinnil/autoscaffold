@@ -38,8 +38,9 @@ class TestVersioning(unittest.TestCase):
         for tool in tools:
             res = subprocess.run(
                 [py_exec, tool, "--version"],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
                 timeout=5.0,
             )
             self.assertEqual(res.returncode, 0, f"Tool {tool} --version failed with exit code {res.returncode}")
