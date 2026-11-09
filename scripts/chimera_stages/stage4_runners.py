@@ -391,8 +391,17 @@ def probe_python_environment(
     full_cmd = list(cmd_prefix) + ["-c", probe_code]
     effective_timeout = max(1.0, timeout_sec)
 
+    probe_env = dict(os.environ)
+    target_py = real_bin or (cmd_prefix[0] if cmd_prefix else None)
+    if target_py and isinstance(target_py, (str, os.PathLike)) and os.path.isfile(target_py):
+        env_lib = os.path.realpath(os.path.join(os.path.dirname(target_py), "..", "lib"))
+        if os.path.isdir(env_lib):
+            cur_ld = probe_env.get("LD_LIBRARY_PATH", "")
+            if env_lib not in cur_ld.split(":"):
+                probe_env["LD_LIBRARY_PATH"] = f"{env_lib}:{cur_ld}" if cur_ld else env_lib
+
     try:
-        proc = subprocess.run(full_cmd, capture_output=True, text=True, timeout=effective_timeout, shell=False)
+        proc = subprocess.run(full_cmd, capture_output=True, text=True, timeout=effective_timeout, shell=False, env=probe_env)
         if proc.returncode == 0 and proc.stdout:
             lines = [ln.strip() for ln in proc.stdout.strip().splitlines() if ln.strip()]
             parsed = None

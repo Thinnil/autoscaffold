@@ -420,8 +420,16 @@ discover_conda_python() {
         if [[ ! "$base_py" =~ ^[pP][yY][tT][hH][oO][nN]([0-9]+(\.[0-9]+)?)?(\.[eE][xX][eE])?$ ]]; then
             return 1
         fi
+        local pydir
+        pydir="$(dirname "$py")"
+        local env_lib
+        env_lib="$(cd "$pydir/.." 2>/dev/null && pwd)/lib"
         if [ -n "$req_module" ]; then
-            "$py" -c "import sys; import $req_module" >/dev/null 2>&1
+            if [ -d "$env_lib" ]; then
+                LD_LIBRARY_PATH="$env_lib:${LD_LIBRARY_PATH:-}" "$py" -c "import sys; import $req_module" >/dev/null 2>&1
+            else
+                "$py" -c "import sys; import $req_module" >/dev/null 2>&1
+            fi
         else
             "$py" -c "import sys" >/dev/null 2>&1
         fi

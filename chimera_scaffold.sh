@@ -768,7 +768,26 @@ interactive_environment_healing_menu() {
                         echo -e "${RED}[!] Provided file is not a legitimate Python executable: '$custom_py'${NC}"
                         continue
                     fi
+                    local env_lib
+                    env_lib="$(cd "$(dirname "$custom_py")/.." 2>/dev/null && pwd)/lib"
+                    local check_ok=false
                     if "$custom_py" -c "import torch, hydra" >/dev/null 2>&1; then
+                        check_ok=true
+                    elif [ -d "$env_lib" ] && LD_LIBRARY_PATH="$env_lib:${LD_LIBRARY_PATH:-}" "$custom_py" -c "import torch, hydra" >/dev/null 2>&1; then
+                        check_ok=true
+                        export LD_LIBRARY_PATH="$env_lib:${LD_LIBRARY_PATH:-}"
+                    else
+                        local conda_bin
+                        conda_bin="$(find_conda_bin 2>/dev/null || true)"
+                        local env_dir
+                        env_dir="$(cd "$(dirname "$custom_py")/.." 2>/dev/null && pwd)"
+                        if [ -n "$conda_bin" ] && [ -x "$conda_bin" ] && "$conda_bin" run -p "$env_dir" python -c "import torch, hydra" >/dev/null 2>&1; then
+                            check_ok=true
+                            [ -d "$env_lib" ] && export LD_LIBRARY_PATH="$env_lib:${LD_LIBRARY_PATH:-}"
+                        fi
+                    fi
+
+                    if [ "$check_ok" = true ]; then
                         export PYTHON_RFDIFF="$custom_py"
                         echo -e "${GREEN}[✓] Verified interpreter: $PYTHON_RFDIFF${NC}"
                         read -r -p "▶ Persist this interpreter to config.env? [y/N]: " save_cfg
@@ -778,7 +797,12 @@ interactive_environment_healing_menu() {
                         fi
                         return 0
                     else
-                        echo -e "${RED}[!] Provided Python binary lacks required modules (torch, hydra).${NC}"
+                        local test_err
+                        test_err="$(LD_LIBRARY_PATH="$env_lib:${LD_LIBRARY_PATH:-}" "$custom_py" -c "import torch, hydra" 2>&1 || true)"
+                        echo -e "${RED}[!] Provided Python binary failed dependency verification check.${NC}"
+                        if [ -n "$test_err" ]; then
+                            echo -e "${YELLOW}Detailed Python error:${NC}\n$test_err\n"
+                        fi
                     fi
                 else
                     echo -e "${RED}[!] File does not exist, is not a regular file, or is not executable: '$custom_py'${NC}"
@@ -808,7 +832,11 @@ preflight_neural_environment_check() {
 
     # Check if PYTHON_RFDIFF is set and operational with torch and hydra
     if [ -n "${PYTHON_RFDIFF:-}" ] && [ -f "$PYTHON_RFDIFF" ] && [ -x "$PYTHON_RFDIFF" ] && ! _is_unsafe_path "$PYTHON_RFDIFF"; then
-        if "$PYTHON_RFDIFF" -c "import torch, hydra" >/dev/null 2>&1; then
+        local pydir="$(dirname "$PYTHON_RFDIFF")"
+        local env_lib="$(cd "$pydir/.." 2>/dev/null && pwd)/lib"
+        if "$PYTHON_RFDIFF" -c "import torch, hydra" >/dev/null 2>&1 || \
+           ( [ -d "$env_lib" ] && LD_LIBRARY_PATH="$env_lib:${LD_LIBRARY_PATH:-}" "$PYTHON_RFDIFF" -c "import torch, hydra" >/dev/null 2>&1 ); then
+            [ -d "$env_lib" ] && export LD_LIBRARY_PATH="$env_lib:${LD_LIBRARY_PATH:-}"
             return 0
         fi
     fi
@@ -817,7 +845,10 @@ preflight_neural_environment_check() {
     if [ -n "${CONDA_PREFIX:-}" ]; then
         for cand in "$CONDA_PREFIX/bin/python" "$CONDA_PREFIX/python.exe"; do
             if [ -f "$cand" ] && [ -x "$cand" ] && ! _is_unsafe_path "$cand"; then
-                if "$cand" -c "import torch, hydra" >/dev/null 2>&1; then
+                local cand_lib="$(cd "$CONDA_PREFIX" 2>/dev/null && pwd)/lib"
+                if "$cand" -c "import torch, hydra" >/dev/null 2>&1 || \
+                   ( [ -d "$cand_lib" ] && LD_LIBRARY_PATH="$cand_lib:${LD_LIBRARY_PATH:-}" "$cand" -c "import torch, hydra" >/dev/null 2>&1 ); then
+                    [ -d "$cand_lib" ] && export LD_LIBRARY_PATH="$cand_lib:${LD_LIBRARY_PATH:-}"
                     export PYTHON_RFDIFF="$cand"
                     return 0
                 fi
@@ -828,9 +859,25 @@ preflight_neural_environment_check() {
     # Check if discover_conda_python can resolve a candidate with torch and hydra
     local disc_py
     disc_py="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 1 2>/dev/null || true)"
-    if [ -n "$disc_py" ] && [ -f "$disc_py" ] && [ -x "$disc_py" ] && ! _is_unsafe_path "$disc_py" && "$disc_py" -c "import torch, hydra" >/dev/null 2>&1; then
-        export PYTHON_RFDIFF="$disc_py"
-        return 0
+    if [ -z "$disc_py" ]; then
+        for cand in \
+            "/data1/mgs/micromamba/envs/${CONDA_ENV_RFDIFF:-SE3nv}/bin/python" \
+            "$HOME/micromamba/envs/${CONDA_ENV_RFDIFF:-SE3nv}/bin/python" \
+            "$HOME/.micromamba/envs/${CONDA_ENV_RFDIFF:-SE3nv}/bin/python"; do
+            if [ -f "$cand" ] && [ -x "$cand" ]; then
+                disc_py="$cand"
+                break
+            fi
+        done
+    fi
+    if [ -n "$disc_py" ] && [ -f "$disc_py" ] && [ -x "$disc_py" ] && ! _is_unsafe_path "$disc_py"; then
+        local disc_lib="$(cd "$(dirname "$disc_py")/.." 2>/dev/null && pwd)/lib"
+        if "$disc_py" -c "import torch, hydra" >/dev/null 2>&1 || \
+           ( [ -d "$disc_lib" ] && LD_LIBRARY_PATH="$disc_lib:${LD_LIBRARY_PATH:-}" "$disc_py" -c "import torch, hydra" >/dev/null 2>&1 ); then
+            [ -d "$disc_lib" ] && export LD_LIBRARY_PATH="$disc_lib:${LD_LIBRARY_PATH:-}"
+            export PYTHON_RFDIFF="$disc_py"
+            return 0
+        fi
     fi
     disc_py="$(discover_conda_python "rfdiffusion" "torch" 1 2>/dev/null || true)"
     if [ -n "$disc_py" ] && [ -f "$disc_py" ] && [ -x "$disc_py" ] && ! _is_unsafe_path "$disc_py" && "$disc_py" -c "import torch, hydra" >/dev/null 2>&1; then
