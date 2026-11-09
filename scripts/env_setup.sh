@@ -29,6 +29,24 @@ fi
 AUTOSCAFFOLD_VERSION=$(python3 -c "import sys, os; sys.path.insert(0, os.path.join(sys.argv[1], 'scripts')); from version import __version__; print(__version__)" "$SCRIPT_DIR" 2>/dev/null || python -c "import sys, os; sys.path.insert(0, os.path.join(sys.argv[1], 'scripts')); from version import __version__; print(__version__)" "$SCRIPT_DIR" 2>/dev/null || echo "2.2.0")
 export AUTOSCAFFOLD_VERSION
 
+# Discover and export general Python interpreter (prioritizing python3 over unaliased python)
+if [ -z "${PYTHON_BIN:-}" ] || [ ! -x "${PYTHON_BIN:-}" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    elif [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
+        PYTHON_BIN="$CONDA_PREFIX/bin/python"
+    elif [ -n "${PYTHON_RFDIFF:-}" ] && [ -x "$PYTHON_RFDIFF" ]; then
+        PYTHON_BIN="$PYTHON_RFDIFF"
+    elif [ -n "${PYTHON_MPNN:-}" ] && [ -x "$PYTHON_MPNN" ]; then
+        PYTHON_BIN="$PYTHON_MPNN"
+    else
+        PYTHON_BIN="python"
+    fi
+fi
+export PYTHON_BIN
+
 check_git_sync_status() {
     if [ -d "$SCRIPT_DIR/.git" ] && command -v git >/dev/null 2>&1; then
         local local_sha upstream_sha
@@ -214,7 +232,7 @@ run_in_env() {
     local env_name="$1"
     shift
     activate_env "$env_name"
-    python "$@"
+    "${PYTHON_BIN:-python}" "$@"
 }
 
 # Function to discover python executable for a target conda environment across standard roots

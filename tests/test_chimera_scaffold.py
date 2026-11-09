@@ -1210,6 +1210,58 @@ class TestSecurityHardening(unittest.TestCase):
         with self.assertRaises((RuntimeError, pickle.UnpicklingError)):
             try_extract_pse_with_pymol(malicious_pse)
 
+    def test_safe_session_unpickler_permits_pymol_dummy_classes(self):
+        """Verify SafeSessionUnpickler permits PyMOL and GUI classes as safe inert dummy stubs."""
+        import pickle
+        from scripts.pse_pdb_extractor import safe_pickle_loads
+
+        # Construct pickle bytecode referencing PyMOL/GUI internal classes
+        for mod, cls_name in [
+            ("pymol", "Session"),
+            ("pymol.cmd", "Cmd"),
+            ("chempy.models", "Indexed"),
+            ("pmg_tk.skins.normal", "SkinNormal"),
+            ("Pmw.Pmw_1_3_3.lib.PmwBase", "MegaArchetype"),
+            ("epymol.draw", "DrawEngine"),
+        ]:
+            payload = ("c%s\n%s\n)\x81}q\x00b." % (mod, cls_name)).encode("latin-1")
+            obj = safe_pickle_loads(payload)
+            self.assertIsNotNone(obj)
+            self.assertEqual(obj.__class__.__name__, "DummySessionClass")
+
+    def test_inspect_file_on_mock_pse(self):
+        """Verify inspect_file successfully parses a mock PyMOL session containing atoms."""
+        import gzip
+        import pickle
+        from scripts.pse_pdb_extractor import inspect_file
+
+        mock_atoms = [
+            # PyMOL atom tuple layout: [rank, atom_name, resn, resi, chain, ...]
+            [1, "CA", "ALA", "1", "A", "ALA", "CA", "C"],
+            [2, "CA", "GLY", "2", "A", "GLY", "CA", "C"],
+            [3, "CA", "SER", "3", "A", "SER", "CA", "C"],
+            [4, "CA", "VAL", "4", "A", "VAL", "CA", "C"],
+        ]
+        # Coordinates: flat list of 3*N floats (4 atoms * 3 coords = 12 floats)
+        flat_coords = [0.0, 0.0, 0.0, 1.5, 2.0, 0.0, 3.0, 4.0, 0.0, 4.5, 5.0, 0.0]
+        cs0 = [flat_coords, None, None, None, [0, 1, 2, 3]]
+        mol_record = [None, None, None, None, [cs0], None, None, mock_atoms]
+        session_dict = {
+            "names": [
+                ["mock_protein", 0, 0, 0, 0, mol_record]
+            ]
+        }
+        mock_pse_path = os.path.join(self.test_dir, "mock_test.pse")
+        with open(mock_pse_path, "wb") as f:
+            f.write(gzip.compress(pickle.dumps(session_dict)))
+
+        res = inspect_file(mock_pse_path)
+        self.assertEqual(res["file_type"], "pse")
+        self.assertIn("mock_protein", res["objects"])
+        obj = res["objects"]["mock_protein"]
+        self.assertEqual(obj["length"], 4)
+        self.assertEqual(obj["sequence"], "AGSV")
+
     def test_safe_join_path_prevents_directory_traversal(self):
         """Verify safe_join_path strictly bounds output paths within the base directory."""
         base = os.path.join(self.test_dir, "base_dir")

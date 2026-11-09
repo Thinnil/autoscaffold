@@ -343,13 +343,20 @@ if [ -n "$INPUT_FILE" ]; then
     ABS_INPUT_FILE="$(fast_realpath "$INPUT_FILE")"
     echo -e "\n${CYAN}🔍 Inspecting structural units in '$INPUT_FILE'...${NC}"
 
-    if ! INSPECT_JSON=$(python "$SCRIPT_DIR/scripts/pse_pdb_extractor.py" inspect --input "$ABS_INPUT_FILE" 2>/dev/null); then
+    INSPECT_LOG=$(mktemp 2>/dev/null || echo "/tmp/autoscaffold_inspect_$$.log")
+    if ! INSPECT_JSON=$("$PYTHON_BIN" "$SCRIPT_DIR/scripts/pse_pdb_extractor.py" inspect --input "$ABS_INPUT_FILE" 2>"$INSPECT_LOG"); then
         echo -e "${RED}[ERROR] Failed to inspect structural units in '$ABS_INPUT_FILE'.${NC}"
+        if [ -s "$INSPECT_LOG" ]; then
+            echo -e "${YELLOW}Detailed Diagnostic Output:${NC}"
+            cat "$INSPECT_LOG"
+        fi
+        rm -f "$INSPECT_LOG"
         exit 1
     fi
+    rm -f "$INSPECT_LOG"
 
     echo -e "\n${GREEN}Detected structural objects/chains:${NC}"
-    if ! echo "$INSPECT_JSON" | python -c "
+    if ! echo "$INSPECT_JSON" | "$PYTHON_BIN" -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -378,7 +385,7 @@ if [ -z "$DONOR_ID" ]; then
 fi
 DONOR_ID=${DONOR_ID:-A}
 if [ -n "$INSPECT_JSON" ]; then
-    RESOLVED_DONOR=$(echo "$INSPECT_JSON" | python -c "
+    RESOLVED_DONOR=$(echo "$INSPECT_JSON" | "$PYTHON_BIN" -c "
 import sys, json
 raw_donor = sys.argv[1].strip()
 try:
@@ -428,7 +435,7 @@ if [ -z "$VESSEL_ID" ]; then
 fi
 VESSEL_ID=${VESSEL_ID:-B}
 if [ -n "$INSPECT_JSON" ] && [[ "$VESSEL_ID" =~ ^[0-9]+$ ]]; then
-    RESOLVED_VESSEL=$(echo "$INSPECT_JSON" | python -c "
+    RESOLVED_VESSEL=$(echo "$INSPECT_JSON" | "$PYTHON_BIN" -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -494,7 +501,7 @@ if [ -t 0 ]; then
 
     PRELIM_OUT_DIR="$(canonicalize_out_dir "$OUT_DIR" "$SCRIPT_DIR")"
     MEASURE_CMD=(
-        python "$SCRIPT_DIR/scripts/chimera_scaffold.py" measure_junctions
+        "$PYTHON_BIN" "$SCRIPT_DIR/scripts/chimera_scaffold.py" measure_junctions
         "--donor_id" "$DONOR_ID"
         "--vessel_id" "$VESSEL_ID"
         "--motif_residues" "$MOTIF_RESIDUES"
@@ -521,7 +528,7 @@ if [ -t 0 ]; then
 
     if [ -n "$MEASURE_JSON" ] && echo "$MEASURE_JSON" | grep -q "junctions"; then
         # Parse recommended linkers, fragments table, and display summary in Python
-        PARSED_RECOMMENDATIONS=$(echo "$MEASURE_JSON" | python -c "
+        PARSED_RECOMMENDATIONS=$(echo "$MEASURE_JSON" | "$PYTHON_BIN" -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -719,7 +726,7 @@ fi
 echo -e "\n${CYAN}>>> Executing Chimera Scaffolding Pipeline <<<${NC}\n"
 
 CMD_ARGS=(
-    "python" "$SCRIPT_DIR/scripts/chimera_scaffold.py"
+    "$PYTHON_BIN" "$SCRIPT_DIR/scripts/chimera_scaffold.py"
     "--donor_id" "$DONOR_ID"
     "--vessel_id" "$VESSEL_ID"
     "--motif_residues" "$MOTIF_RESIDUES"

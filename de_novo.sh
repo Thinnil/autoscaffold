@@ -6,7 +6,11 @@ set -e
 trap 'echo -e "\n\n${YELLOW}[!] Operation cancelled by user.${NC}"; exit 130' INT
 
 # Resolve script directory and source shared environment
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "$AUTOSCAFFOLD_HOME" ] && [ -f "$AUTOSCAFFOLD_HOME/de_novo.sh" ]; then
+    SCRIPT_DIR="$AUTOSCAFFOLD_HOME"
+else
+    SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" = "/" ] || [ "$SCRIPT_DIR" = "\\" ] || [[ "$SCRIPT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
     echo -e "\033[0;31m[ERROR] Invalid or dangerous SCRIPT_DIR root: '$SCRIPT_DIR'.\033[0m"
     exit 1
@@ -359,7 +363,7 @@ VALIDATION_FASTA="${ABS_OUT_DIR}/4_colabfold_validation/final_complex.fa"
 
 # Robust Python-based FASTA formatting (fixing grep/cut and [: 50-65: integer error)
 FORMATTER_SCRIPT="$SCRIPT_DIR/scripts/format_complex_fasta.py"
-python "$FORMATTER_SCRIPT" \
+"$PYTHON_BIN" "$FORMATTER_SCRIPT" \
     "${ABS_OUT_DIR}/2_mpnn_inputs/parsed.jsonl" \
     "$CHAIN_A" \
     "$MPNN_FASTA" \
@@ -402,7 +406,7 @@ echo -e "Validated complex files located in:"
 echo -e "${CYAN}${ABS_OUT_DIR}/4_colabfold_validation/${NC}\n"
 
 # Generate Automated Methodology & Reproducibility Report
-python "$SCRIPT_DIR/scripts/methodology_reporter.py" \
+"$PYTHON_BIN" "$SCRIPT_DIR/scripts/methodology_reporter.py" \
     --run_name "${OUT_PREFIX}_Binder_Design" \
     --mode "De Novo Target-Binder Design" \
     --out_dir "$ABS_OUT_DIR" \

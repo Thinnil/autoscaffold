@@ -7,7 +7,15 @@ set -e
 trap 'echo -e "\n\n${YELLOW}[!] Operation cancelled by user.${NC}"; exit 130' INT
 
 # Resolve script directory and source shared environment
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "$AUTOSCAFFOLD_HOME" ] && [ -f "$AUTOSCAFFOLD_HOME/discontinuous_scaffold.sh" ]; then
+    SCRIPT_DIR="$AUTOSCAFFOLD_HOME"
+else
+    SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
+if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" = "/" ] || [ "$SCRIPT_DIR" = "\\" ] || [[ "$SCRIPT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+    echo -e "\033[0;31m[ERROR] Invalid or dangerous SCRIPT_DIR root: '$SCRIPT_DIR'.\033[0m"
+    exit 1
+fi
 
 # Verify and self-heal scripts directory if missing
 if [ ! -f "$SCRIPT_DIR/scripts/env_setup.sh" ]; then
@@ -466,7 +474,7 @@ if [ -n "$DRY_RUN" ]; then
 fi
 
 echo -e "\n${CYAN}>>> Executing Discontinuous Motif Scaffolding Pipeline <<<${NC}\n"
-python "${CMD_ARGS[@]}"
+"$PYTHON_BIN" "${CMD_ARGS[@]}"
 
 echo -e "\n${GREEN}[✓] Discontinuous scaffolding workflow finished successfully.${NC}"
 echo -e "Results stored in: ${CYAN}${ABS_OUT_DIR}${NC}\n"

@@ -24,11 +24,43 @@ import argparse
 from typing import Dict, List, Any, Optional, Tuple
 
 
+class DummySessionClass:
+    """
+    Safe inert stub for PyMOL internal session objects during unpickling.
+    Prevents arbitrary code execution by discarding executable methods and
+    safely absorbing arbitrary session state, constructor args, and attributes.
+    """
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __new__(cls, *args, **kwargs):
+        return super().__new__(cls)
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+        elif isinstance(state, (list, tuple)):
+            self._state = state
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def __getattr__(self, name):
+        return None
+
+    def __str__(self):
+        return ""
+
+    def __repr__(self):
+        return "<DummySessionObject>"
+
+
 class SafeSessionUnpickler(pickle.Unpickler):
     """
     Restricted unpickler that permits only primitive data types, collections,
     and numpy arrays (for scientific coordinates and RFdiffusion metadata),
     strictly blocking arbitrary Python object instantiation and code execution.
+    PyMOL session GUI/internal classes are mapped to inert DummySessionClass stubs.
     """
     SAFE_CLASSES = {
         # Python 3 builtins
@@ -36,11 +68,13 @@ class SafeSessionUnpickler(pickle.Unpickler):
         ("builtins", "set"), ("builtins", "frozenset"), ("builtins", "int"),
         ("builtins", "float"), ("builtins", "str"), ("builtins", "bytes"),
         ("builtins", "bool"), ("builtins", "bytearray"), ("builtins", "complex"),
+        ("builtins", "slice"), ("builtins", "getattr"), ("builtins", "range"),
         # Python 2 builtins
         ("__builtin__", "dict"), ("__builtin__", "list"), ("__builtin__", "tuple"),
         ("__builtin__", "set"), ("__builtin__", "frozenset"), ("__builtin__", "int"),
         ("__builtin__", "float"), ("__builtin__", "str"), ("__builtin__", "unicode"),
-        ("__builtin__", "long"), ("__builtin__", "bool"),
+        ("__builtin__", "long"), ("__builtin__", "bool"), ("__builtin__", "slice"),
+        ("__builtin__", "xrange"),
         # Collections
         ("collections", "OrderedDict"), ("collections", "defaultdict"),
         # Codecs / reconstruction
@@ -57,22 +91,34 @@ class SafeSessionUnpickler(pickle.Unpickler):
 
     def find_class(self, module: str, name: str):
         # Safely stub PyMOL internal session classes so sessions can be unpickled without pymol installed
-        if module == "pymol" or module.startswith("pymol.") or module.startswith("chempy."):
-            class DummySessionClass:
-                def __init__(self, *args, **kwargs):
-                    pass
-
-                def __setstate__(self, state):
-                    if isinstance(state, dict):
-                        self.__dict__.update(state)
+        if (
+            module == "pymol"
+            or module.startswith("pymol.")
+            or module == "chempy"
+            or module.startswith("chempy.")
+            or module.startswith("pmg")
+            or module.startswith("Pmw")
+            or module.startswith("epymol")
+            or module.startswith("tkinter")
+            or module in ("tkinter", "tk", "ttk")
+        ):
             return DummySessionClass
+
         if (module, name) in self.SAFE_CLASSES:
+            if module == "numpy" or module.startswith("numpy."):
+                try:
+                    return super().find_class(module, name)
+                except (ImportError, AttributeError):
+                    return DummySessionClass
             return super().find_class(module, name)
+
         if module in ("builtins", "__builtin__") and name in (
             "dict", "list", "tuple", "set", "frozenset", "int", "float",
-            "str", "unicode", "long", "bytes", "bool", "bytearray"
+            "str", "unicode", "long", "bytes", "bool", "bytearray", "slice",
+            "complex", "getattr", "range", "xrange"
         ):
             return super().find_class(module, name)
+
         raise pickle.UnpicklingError(
             f"Security Error: Deserialization of '{module}.{name}' is prohibited to prevent arbitrary code execution."
         )
@@ -360,6 +406,8 @@ def try_extract_pse_with_pymol(pse_path: str, out_dir: Optional[str] = None) -> 
         cmd.reinitialize()
         cmd.load(pse_path)
         obj_names = cmd.get_names("objects")
+        if not obj_names:
+            return None
 
         objects_data = {}
         extracted_files = {}
@@ -382,6 +430,9 @@ def try_extract_pse_with_pymol(pse_path: str, out_dir: Optional[str] = None) -> 
                 cmd.save(out_path, obj)
                 extracted_files[obj] = out_path
 
+        if not objects_data:
+            return None
+
         return {
             "file_type": "pse",
             "file_path": pse_path,
@@ -391,6 +442,113 @@ def try_extract_pse_with_pymol(pse_path: str, out_dir: Optional[str] = None) -> 
         }
     except Exception:
         return None
+
+
+def try_extract_pse_with_pymol_cli(pse_path: str, out_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Attempts to extract objects from a .pse file using the headless PyMOL CLI binary
+    if PyMOL is not available as a Python module in the active environment.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    pymol_bin = shutil.which("pymol")
+    if not pymol_bin:
+        for cand in [
+            os.path.expanduser("~/.local/bin/pymol"),
+            os.path.expanduser("~/miniconda3/bin/pymol"),
+            os.path.expanduser("~/miniforge3/bin/pymol"),
+            os.path.expanduser("~/micromamba/envs/colabfold/bin/pymol"),
+            os.path.expanduser("~/micromamba/envs/pymol/bin/pymol"),
+            "/usr/bin/pymol",
+            "/usr/local/bin/pymol"
+        ]:
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                pymol_bin = cand
+                break
+
+    if not pymol_bin:
+        return None
+
+    validate_pse_safety(pse_path)
+
+    temp_script = None
+    temp_json = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as jf:
+            temp_json = jf.name
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as sf:
+            temp_script = sf.name
+            sf.write(f"""import json, sys
+from pymol import cmd
+
+cmd.load({repr(os.path.abspath(pse_path))})
+objs = cmd.get_names("objects")
+res = {{}}
+for o in objs:
+    pdb = cmd.get_pdbstr(o)
+    if pdb and pdb.strip():
+        res[o] = pdb
+
+with open({repr(temp_json)}, "w", encoding="utf-8") as f:
+    json.dump(res, f)
+""")
+
+        proc = subprocess.run(
+            [pymol_bin, "-cq", temp_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30
+        )
+        if proc.returncode != 0 or not os.path.exists(temp_json) or os.path.getsize(temp_json) == 0:
+            return None
+
+        with open(temp_json, "r", encoding="utf-8") as f:
+            raw_pdbs = json.load(f)
+
+        if not raw_pdbs:
+            return None
+
+        if out_dir:
+            out_dir = validate_output_dir(out_dir)
+            os.makedirs(out_dir, exist_ok=True)
+
+        objects_data = {}
+        extracted_files = {}
+
+        for obj_name, pdb_str in raw_pdbs.items():
+            parsed = _parse_pdb_string(pdb_str, name=obj_name, source=pse_path)
+            objects_data[obj_name] = parsed
+            if out_dir:
+                safe_obj = _RE_SANITIZE_IDENT.sub('_', str(obj_name).strip()) or "obj"
+                out_path = safe_join_path(out_dir, f"{safe_obj}.pdb")
+                with open(out_path, "w", encoding="utf-8") as pf:
+                    pf.write(pdb_str)
+                extracted_files[obj_name] = out_path
+
+        return {
+            "file_type": "pse",
+            "file_path": pse_path,
+            "engine": "pymol_cli",
+            "objects": objects_data,
+            "extracted_files": extracted_files
+        }
+    except Exception:
+        return None
+    finally:
+        if temp_script and os.path.exists(temp_script):
+            try:
+                os.unlink(temp_script)
+            except OSError:
+                pass
+        if temp_json and os.path.exists(temp_json):
+            try:
+                os.unlink(temp_json)
+            except OSError:
+                pass
 
 
 def _parse_pdb_string(pdb_str: str, name: str, source: str) -> Dict[str, Any]:
@@ -508,12 +666,17 @@ def parse_pse_standalone(pse_path: str) -> Dict[str, Any]:
     session_dict = {}
     if isinstance(session_data, dict):
         session_dict = session_data
+    elif hasattr(session_data, "__dict__") and isinstance(session_data.__dict__, dict):
+        session_dict = session_data.__dict__
     elif isinstance(session_data, list) and len(session_data) > 0 and isinstance(session_data[0], dict):
         session_dict = session_data[0]
     elif isinstance(session_data, (list, tuple)):
         for item in session_data:
             if isinstance(item, dict) and "names" in item:
                 session_dict = item
+                break
+            elif hasattr(item, "__dict__") and "names" in item.__dict__:
+                session_dict = item.__dict__
                 break
 
     objects_dict = {}
@@ -524,7 +687,7 @@ def parse_pse_standalone(pse_path: str) -> Dict[str, Any]:
     if names_entry is None:
         # Search recursively for 'names' key
         def find_names(obj, depth=0):
-            if depth > 4:
+            if depth > 5:
                 return None
             if isinstance(obj, dict):
                 if "names" in obj and isinstance(obj["names"], (list, dict)):
@@ -533,13 +696,17 @@ def parse_pse_standalone(pse_path: str) -> Dict[str, Any]:
                     found = find_names(v, depth + 1)
                     if found is not None:
                         return found
-            elif isinstance(obj, list):
+            elif hasattr(obj, "__dict__") and isinstance(obj.__dict__, dict):
+                if "names" in obj.__dict__:
+                    return obj.__dict__["names"]
+                return find_names(obj.__dict__, depth + 1)
+            elif isinstance(obj, (list, tuple)):
                 for item in obj:
                     found = find_names(item, depth + 1)
                     if found is not None:
                         return found
             return None
-        names_entry = find_names(session_dict)
+        names_entry = find_names(session_data)
 
     if names_entry is not None:
         items = names_entry.items() if isinstance(names_entry, dict) else enumerate(names_entry)
@@ -547,14 +714,21 @@ def parse_pse_standalone(pse_path: str) -> Dict[str, Any]:
         selections = {}
 
         for _, obj_record in items:
-            if not isinstance(obj_record, (list, tuple)) or len(obj_record) < 6:
-                continue
+            obj_name = ""
+            mol_data = None
+            if isinstance(obj_record, dict):
+                obj_name = str(obj_record.get("name", "")).strip()
+                mol_data = obj_record.get("mol", obj_record.get("model", None))
+            elif hasattr(obj_record, "__dict__"):
+                obj_name = str(getattr(obj_record, "name", "")).strip()
+                mol_data = getattr(obj_record, "mol", getattr(obj_record, "model", None))
+            elif isinstance(obj_record, (list, tuple)) and len(obj_record) >= 6:
+                obj_name = str(obj_record[0]).strip()
+                mol_data = obj_record[5]
 
-            obj_name = str(obj_record[0]).strip()
             if not obj_name or obj_name.lower() in ("none", "null"):
                 continue
 
-            mol_data = obj_record[5]
             if not isinstance(mol_data, (list, tuple)):
                 continue
 
@@ -578,7 +752,7 @@ def parse_pse_standalone(pse_path: str) -> Dict[str, Any]:
                     cs0 = mol[c_idx][0]
                     if isinstance(cs0, (list, tuple)) and len(cs0) >= 3:
                         for sub in cs0:
-                            if isinstance(sub, (list, tuple)) and len(sub) > 10 and isinstance(sub[0], (int, float)):
+                            if isinstance(sub, (list, tuple)) and len(sub) >= 3 and isinstance(sub[0], (int, float)):
                                 flat_coords = sub
                                 break
                         if len(cs0) > 4 and isinstance(cs0[4], (list, tuple)) and len(cs0[4]) == len(atom_list):
@@ -702,6 +876,26 @@ def parse_pse_standalone(pse_path: str) -> Dict[str, Any]:
             "_atoms": atoms
         }
 
+    if not objects_dict:
+        try:
+            text_stream = decompressed_data.decode("latin-1")
+            pdb_lines = [
+                line for line in text_stream.splitlines()
+                if line.startswith("ATOM  ") or line.startswith("HETATM")
+            ]
+            if pdb_lines:
+                parsed_mem = _parse_pdb_string("\n".join(pdb_lines), name="pse_model", source=pse_path)
+                if parsed_mem.get("length", 0) > 0:
+                    objects_dict["pse_model"] = parsed_mem
+                    return {
+                        "file_type": "pse",
+                        "file_path": pse_path,
+                        "engine": "standalone_pdb_stream_fallback",
+                        "objects": objects_dict
+                    }
+        except Exception:
+            pass
+
     return {
         "file_type": "pse",
         "file_path": pse_path,
@@ -732,17 +926,22 @@ def write_atoms_to_pdb(atoms: List[Dict[str, Any]], out_path: str, buffer_size: 
 def extract_pse_objects(pse_path: str, out_dir: str) -> Dict[str, str]:
     """
     Extracts each object in the PSE file to an individual PDB file.
-    Tries headless PyMOL first, falls back to standalone pickle parser.
+    Tries headless PyMOL module, then PyMOL CLI binary, falls back to standalone pickle parser.
     """
     out_dir = validate_output_dir(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Try headless PyMOL
+    # 1. Try headless PyMOL module
     result = try_extract_pse_with_pymol(pse_path, out_dir)
     if result and result.get("extracted_files"):
         return result["extracted_files"]
 
-    # Fallback to standalone parser
+    # 2. Try headless PyMOL CLI binary
+    result = try_extract_pse_with_pymol_cli(pse_path, out_dir)
+    if result and result.get("extracted_files"):
+        return result["extracted_files"]
+
+    # 3. Fallback to standalone parser
     parsed = parse_pse_standalone(pse_path)
     extracted_files = {}
     for obj_name, obj_meta in parsed["objects"].items():
@@ -1042,10 +1241,16 @@ def inspect_file(input_path: str) -> Dict[str, Any]:
 
     ext = os.path.splitext(input_path)[1].lower()
     if ext == ".pse":
-        # Try PyMOL first
+        # 1. Try PyMOL Python module
         result = try_extract_pse_with_pymol(input_path)
+        # 2. Try PyMOL CLI binary
+        if not result or not result.get("objects"):
+            result = try_extract_pse_with_pymol_cli(input_path)
+        # 3. Try standalone fallback parser
         if not result or not result.get("objects"):
             result = parse_pse_standalone(input_path)
+        if not result or not result.get("objects"):
+            raise ValueError(f"No structural objects or molecules could be extracted from PyMOL session '{input_path}'.")
         # Clean private fields like _atoms before returning
         clean_objs = {}
         for k, v in result["objects"].items():
@@ -1097,7 +1302,12 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "inspect":
-        info = inspect_file(args.input)
+        try:
+            info = inspect_file(args.input)
+        except Exception as e:
+            import sys
+            sys.stderr.write(f"[ERROR] Failed to inspect structural units in '{args.input}': {e}\n")
+            sys.exit(1)
         json_output = json.dumps(info, indent=2)
         if args.out_json:
             out_json_path = os.path.realpath(os.path.abspath(args.out_json))
@@ -1112,14 +1322,19 @@ def main() -> None:
         print(json_output)
 
     elif args.command == "extract":
-        out_dir = validate_output_dir(args.out_dir)
-        os.makedirs(out_dir, exist_ok=True)
-        if args.target_ids:
-            merge_res = extract_and_merge_objects(args.input, args.target_ids, out_dir, prefix=args.prefix)
-            print(json.dumps(merge_res, indent=2))
-        else:
-            extracted = extract_file(args.input, out_dir)
-            print(json.dumps({"status": "SUCCESS", "extracted_files": extracted}, indent=2))
+        try:
+            out_dir = validate_output_dir(args.out_dir)
+            os.makedirs(out_dir, exist_ok=True)
+            if args.target_ids:
+                merge_res = extract_and_merge_objects(args.input, args.target_ids, out_dir, prefix=args.prefix)
+                print(json.dumps(merge_res, indent=2))
+            else:
+                extracted = extract_file(args.input, out_dir)
+                print(json.dumps({"status": "SUCCESS", "extracted_files": extracted}, indent=2))
+        except Exception as e:
+            import sys
+            sys.stderr.write(f"[ERROR] Extraction failed for '{args.input}': {e}\n")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
