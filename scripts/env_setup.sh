@@ -374,7 +374,7 @@ _CACHED_CONDA_ENVS_INFO=""
 discover_conda_python() {
     local target_env="$1"
     local req_module="${2:-}"
-    local enable_deep="${3:-0}"
+    local enable_deep="${3:-1}"
     local candidate=""
 
     [ -z "$target_env" ] && return 1
@@ -467,13 +467,39 @@ discover_conda_python() {
         fi
     done
 
-    # 4. Check known base conda and micromamba installations
+    # 4. Discover candidate scan roots with parent partition inference
+    local -a _SCAN_ROOTS=()
+    [ -n "${LOCAL_ENVS_DIR:-}" ] && _SCAN_ROOTS+=("$LOCAL_ENVS_DIR")
+
+    if [ -n "${CONDA_PREFIX:-}" ]; then
+        local prefix_parent
+        prefix_parent="$(dirname "$CONDA_PREFIX")"
+        if [ "$(basename "$prefix_parent")" = "envs" ]; then
+            _SCAN_ROOTS+=("$prefix_parent")
+        elif [ -d "$CONDA_PREFIX/envs" ]; then
+            _SCAN_ROOTS+=("$CONDA_PREFIX/envs")
+        fi
+    fi
+
+    if [ -n "${PYTHON_BIN:-}" ] && [ -x "$PYTHON_BIN" ]; then
+        local bin_dir env_dir envs_dir
+        bin_dir="$(dirname "$PYTHON_BIN")"
+        env_dir="$(dirname "$bin_dir")"
+        envs_dir="$(dirname "$env_dir")"
+        if [ "$(basename "$envs_dir")" = "envs" ]; then
+            _SCAN_ROOTS+=("$envs_dir")
+        fi
+    fi
+
+    if [ -n "${MAMBA_ROOT_PREFIX:-}" ]; then
+        _SCAN_ROOTS+=("$MAMBA_ROOT_PREFIX/envs")
+        _SCAN_ROOTS+=("$MAMBA_ROOT_PREFIX")
+    fi
+
     for base_dir in \
-        "$MAMBA_ROOT_PREFIX" \
         "$HOME/.micromamba" \
         "$HOME/micromamba" \
         "$HOME/.local/share/mamba" \
-        "$CONDA_PREFIX/.." \
         "$HOME/miniconda3" \
         "$HOME/miniforge3" \
         "$HOME/mambaforge" \
@@ -481,9 +507,31 @@ discover_conda_python() {
         "$HOME/.conda" \
         "/opt/conda" \
         "/usr/local/miniconda3" \
-        "/usr/local/anaconda3"; do
-        if [ -d "$base_dir/envs/$target_env" ]; then
-            for cand in "$base_dir/envs/$target_env/bin/python" "$base_dir/envs/$target_env/python.exe" "$base_dir/envs/$target_env/python"; do
+        "/usr/local/anaconda3" \
+        "/data1/micromamba" \
+        "/data1/miniconda3" \
+        "/data1/mgs/micromamba" \
+        "/data1" \
+        "/data2" \
+        "/data" \
+        "/scratch" \
+        "/mnt"; do
+        if [ -d "$base_dir/envs" ]; then
+            _SCAN_ROOTS+=("$base_dir/envs")
+        fi
+        if [ -d "$base_dir" ] && [ "$(basename "$base_dir")" != "envs" ]; then
+            _SCAN_ROOTS+=("$base_dir")
+        fi
+    done
+
+    # Check candidate scan roots for target environment
+    for r in "${_SCAN_ROOTS[@]}"; do
+        [ ! -d "$r" ] && continue
+        if _is_unsafe_path "$r"; then
+            continue
+        fi
+        if [ -d "$r/$target_env" ]; then
+            for cand in "$r/$target_env/bin/python" "$r/$target_env/python.exe" "$r/$target_env/python"; do
                 if _verify_python "$cand"; then
                     printf -v "$_cache_key" "%s" "$cand"
                     echo "$cand"
@@ -493,15 +541,21 @@ discover_conda_python() {
         fi
     done
 
-    # 5. Fallback: Query conda info directly only if deep search is enabled or cache is already warm
+    # 5. Query micromamba and conda package manager manifests
     if [ "$enable_deep" -eq 1 ] || [ -n "$_CACHED_CONDA_ENVS_INFO" ]; then
         if [ -z "$_CACHED_CONDA_ENVS_INFO" ]; then
-            local conda_bin
-            conda_bin="$(find_conda_bin 2>/dev/null || true)"
-            if [ -n "$conda_bin" ] && [ -x "$conda_bin" ]; then
-                _CACHED_CONDA_ENVS_INFO="$("$conda_bin" info --envs 2>/dev/null || echo "")"
+            if command -v micromamba >/dev/null 2>&1; then
+                _CACHED_CONDA_ENVS_INFO="$(micromamba env list 2>/dev/null || echo "")"
+            elif command -v conda >/dev/null 2>&1; then
+                _CACHED_CONDA_ENVS_INFO="$(conda info --envs 2>/dev/null || echo "")"
             else
-                _CACHED_CONDA_ENVS_INFO="__NONE__"
+                local conda_bin
+                conda_bin="$(find_conda_bin 2>/dev/null || true)"
+                if [ -n "$conda_bin" ] && [ -x "$conda_bin" ]; then
+                    _CACHED_CONDA_ENVS_INFO="$("$conda_bin" info --envs 2>/dev/null || echo "")"
+                else
+                    _CACHED_CONDA_ENVS_INFO="__NONE__"
+                fi
             fi
         fi
         if [ "$_CACHED_CONDA_ENVS_INFO" != "__NONE__" ]; then
@@ -516,6 +570,52 @@ discover_conda_python() {
                     fi
                 done
             fi
+        fi
+    fi
+
+    # 6. Capability Fallback: If target_env wasn't found by name, scan known environments for req_module
+    if [ "$enable_deep" -eq 1 ] && [ -n "$req_module" ]; then
+        for r in "${_SCAN_ROOTS[@]}"; do
+            [ ! -d "$r" ] && continue
+            if _is_unsafe_path "$r"; then
+                continue
+            fi
+            for sub in "$r"/*; do
+                [ ! -d "$sub" ] && continue
+                if _is_unsafe_path "$sub"; then
+                    continue
+                fi
+                local sub_name
+                sub_name="$(basename "$sub")"
+                [ "$sub_name" = "$target_env" ] && continue
+                for cand in "$sub/bin/python" "$sub/python.exe" "$sub/python"; do
+                    if _verify_python "$cand"; then
+                        printf -v "$_cache_key" "%s" "$cand"
+                        echo "$cand"
+                        return 0
+                    fi
+                done
+            done
+        done
+
+        if [ -n "$_CACHED_CONDA_ENVS_INFO" ] && [ "$_CACHED_CONDA_ENVS_INFO" != "__NONE__" ]; then
+            while read -r line; do
+                [ -z "$line" ] && continue
+                [[ "$line" =~ ^# ]] && continue
+                local ep
+                ep="$(echo "$line" | awk '{print $NF}')"
+                [ ! -d "$ep" ] && continue
+                if _is_unsafe_path "$ep"; then
+                    continue
+                fi
+                for cand in "$ep/bin/python" "$ep/python.exe" "$ep/python"; do
+                    if _verify_python "$cand"; then
+                        printf -v "$_cache_key" "%s" "$cand"
+                        echo "$cand"
+                        return 0
+                    fi
+                done
+            done <<< "$_CACHED_CONDA_ENVS_INFO"
         fi
     fi
 

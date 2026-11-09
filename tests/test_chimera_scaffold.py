@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import os
 import sys
 import json
@@ -661,12 +661,23 @@ class TestChimeraScaffoldingPipeline(unittest.TestCase):
         self.assertTrue(os.path.isfile(launcher), f"Launcher script not found: {launcher}")
 
         # Run launcher help via bash from repository root and from an external working directory
-        res = subprocess.run(["bash", launcher, "help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        res = subprocess.run(
+            ["bash", launcher, "help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
         self.assertEqual(res.returncode, 0)
         self.assertIn("AutoScaffold Master Suite CLI", res.stdout)
 
         # Run from an external temporary directory to verify cwd-independence
-        res_external = subprocess.run(["bash", launcher, "help"], cwd=self.test_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        res_external = subprocess.run(
+            ["bash", launcher, "help"],
+            cwd=self.test_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
         self.assertEqual(res_external.returncode, 0)
         self.assertIn("AutoScaffold Master Suite CLI", res_external.stdout)
 
@@ -1212,7 +1223,6 @@ class TestSecurityHardening(unittest.TestCase):
 
     def test_safe_session_unpickler_permits_pymol_dummy_classes(self):
         """Verify SafeSessionUnpickler permits PyMOL and GUI classes as safe inert dummy stubs."""
-        import pickle
         from scripts.pse_pdb_extractor import safe_pickle_loads
 
         # Construct pickle bytecode referencing PyMOL/GUI internal classes
@@ -1990,6 +2000,280 @@ class TestPerformanceOptimizations(unittest.TestCase):
         # Test extract_native_motif_sequence
         native_seq = extract_native_motif_sequence(mock_bb, "A", [1, 2])
         self.assertEqual(native_seq, "WE")
+
+
+class TestNeuralEnvDiscoveryAndAutoheal(unittest.TestCase):
+    """Unit tests for universal environment root discovery, deep capability scanning, and autohealing."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.donor_pdb = os.path.join(self.test_dir, "donor.pdb")
+        with open(self.donor_pdb, "w") as f:
+            f.write("ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\n")
+        self.vessel_pdb = os.path.join(self.test_dir, "vessel.pdb")
+        with open(self.vessel_pdb, "w") as f:
+            f.write("ATOM      1  CA  ALA B   1       0.000   0.000   0.000  1.00 20.00           C\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_get_all_environment_roots_discovers_custom_partition_and_manifest(self):
+        """Verify get_all_environment_roots discovers roots from custom partitions and manifests."""
+        from scripts.chimera_stages.stage4_runners import get_all_environment_roots, clear_environment_cache
+
+        clear_environment_cache()
+        with patch.dict(os.environ, {"CONDA_PREFIX": "/data1/mgs/micromamba/envs/ambertools"}):
+            with patch("os.path.realpath", side_effect=lambda p: p.replace("\\", "/")), \
+                 patch("os.path.isdir") as mock_isdir:
+                mock_isdir.side_effect = lambda p: p.replace("\\", "/") in [
+                    "/data1/mgs/micromamba/envs",
+                    "/data1/mgs/micromamba/envs/ambertools",
+                ]
+                roots = get_all_environment_roots(use_cache=False)
+                # Verify that /data1/mgs/micromamba/envs is detected as a valid root
+                self.assertIn("/data1/mgs/micromamba/envs", roots)
+                # Ensure no invalid ".../envs/envs" paths are produced
+                self.assertNotIn("/data1/mgs/micromamba/envs/envs", roots)
+
+    def test_resolve_execution_runner_deep_capability_scan(self):
+        """Verify resolve_execution_runner rescues missing SE3nv by discovering alternative torch+hydra env."""
+        from scripts.chimera_stages.stage4_runners import resolve_execution_runner, clear_probe_cache
+
+        clear_probe_cache()
+        roots = ["/data1/mgs/micromamba/envs"]
+
+        def mock_probe(runner_or_bin, required_modules=None, **kwargs):
+            s = str(runner_or_bin)
+            if "prot_foundry" in s:
+                return {"missing_modules": [], "cuda_available": True, "torch_version": "2.2.0"}
+            return {"missing_modules": required_modules or ["torch", "hydra"], "cuda_available": False}
+
+        with patch("scripts.chimera_scaffold.get_all_environment_roots", return_value=roots), \
+             patch("os.scandir") as mock_scandir, \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.path.isdir", return_value=True), \
+             patch("scripts.chimera_scaffold.probe_python_environment", side_effect=mock_probe):
+
+            entry = MagicMock()
+            entry.is_dir.return_value = True
+            entry.name = "prot_foundry"
+            entry.path = "/data1/mgs/micromamba/envs/prot_foundry"
+            mock_scandir.return_value.__enter__.return_value = [entry]
+
+            runner = resolve_execution_runner(
+                explicit_target=None,
+                env_var_keys=[],
+                target_env_names=["SE3nv"],
+                required_modules=["torch", "hydra"],
+                tool_label="RFdiffusion",
+                strict=False,
+            )
+            self.assertTrue(runner.is_valid)
+            self.assertTrue(runner.cuda_available)
+            self.assertIn("prot_foundry", runner.display_label())
+
+    def test_resolve_execution_runner_strict_mode_bypasses_deep_scan(self):
+        """Verify resolve_execution_runner skips deep capability scan when strict=True."""
+        from scripts.chimera_stages.stage4_runners import resolve_execution_runner
+
+        roots = ["/data1/mgs/micromamba/envs"]
+        with patch("scripts.chimera_scaffold.get_all_environment_roots", return_value=roots), \
+             patch("os.scandir") as mock_scandir, \
+             patch("scripts.chimera_scaffold.probe_python_environment", return_value={"missing_modules": ["torch"]}):
+
+            runner = resolve_execution_runner(
+                explicit_target=None,
+                env_var_keys=[],
+                target_env_names=["SE3nv"],
+                required_modules=["torch", "hydra"],
+                tool_label="RFdiffusion",
+                strict=True,
+            )
+            self.assertFalse(runner.is_valid)
+            mock_scandir.assert_not_called()
+
+    def test_main_cli_environment_error_handling_no_traceback(self):
+        """Verify scripts/chimera_scaffold.py main() catches EnvironmentError and exits with code 1."""
+        from scripts.chimera_scaffold import main
+        import sys
+
+        test_args = [
+            "chimera_scaffold.py",
+            "--donor_pdb", self.donor_pdb,
+            "--vessel_pdb", self.vessel_pdb,
+            "--motif_residues", "1-1",
+        ]
+        err_env = EnvironmentError("Missing torch, hydra")
+        with patch.object(sys, "argv", test_args), \
+             patch("scripts.chimera_scaffold.ChimeraScaffolder.run_pipeline", side_effect=err_env), \
+             patch("sys.stderr.write") as mock_stderr, \
+             self.assertRaises(SystemExit) as exit_ctx:
+            main()
+
+        self.assertEqual(exit_ctx.exception.code, 1)
+        err_output = "".join([call[0][0] for call in mock_stderr.call_args_list])
+        self.assertIn("[ERROR] Environment validation failed", err_output)
+        self.assertIn("[REMEDY]", err_output)
+
+    def test_query_package_manager_manifest_envs(self):
+        """Verify query_package_manager_manifest_envs parses JSON and tabular output correctly."""
+        from scripts.chimera_stages.stage4_runners import query_package_manager_manifest_envs
+
+        fake_managers = {"micromamba": "/usr/bin/micromamba", "conda": "/usr/bin/conda"}
+        fake_mamba_json = json.dumps({"envs": ["/data1/envs/env1", "/data2/envs/env2"]})
+
+        with patch("subprocess.run") as mock_run, \
+             patch("os.path.isdir", return_value=True):
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = fake_mamba_json
+            envs = query_package_manager_manifest_envs(fake_managers)
+            self.assertTrue(any("env1" in e for e in envs))
+            self.assertTrue(any("env2" in e for e in envs))
+
+    def test_query_package_manager_manifest_envs_rejects_injections(self):
+        """Verify query_package_manager_manifest_envs rejects paths containing shell injection metacharacters."""
+        from scripts.chimera_stages.stage4_runners import query_package_manager_manifest_envs
+
+        fake_managers = {"micromamba": "/usr/bin/micromamba"}
+        fake_mamba_json = json.dumps({"envs": ["/data1/envs/safe_env", "/data1/envs/vuln; rm -rf /"]})
+
+        with patch("subprocess.run") as mock_run, \
+             patch("os.path.isdir", return_value=True):
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = fake_mamba_json
+            envs = query_package_manager_manifest_envs(fake_managers)
+            self.assertTrue(any("safe_env" in e for e in envs))
+            self.assertFalse(any("rm -rf" in e for e in envs))
+
+    def test_query_package_manager_manifest_envs_session_caching(self):
+        """Verify query_package_manager_manifest_envs caches results and avoids duplicate subprocess calls."""
+        from scripts.chimera_stages.stage4_runners import (
+            query_package_manager_manifest_envs,
+            clear_environment_cache,
+        )
+
+        clear_environment_cache()
+        fake_managers = {"micromamba": "/usr/bin/micromamba"}
+        fake_mamba_json = json.dumps({"envs": ["/data1/envs/cached_env1"]})
+
+        with patch("scripts.chimera_stages.stage4_runners.find_environment_managers", return_value=fake_managers), \
+             patch("subprocess.run") as mock_run, \
+             patch("os.path.isdir", return_value=True):
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = fake_mamba_json
+
+            # First call (cold) invokes subprocess.run
+            res1 = query_package_manager_manifest_envs(managers=None, use_cache=True)
+            self.assertEqual(mock_run.call_count, 1)
+            self.assertTrue(any("cached_env1" in e for e in res1))
+
+            # Second call (warm) should return cached list without invoking subprocess.run
+            res2 = query_package_manager_manifest_envs(managers=None, use_cache=True)
+            self.assertEqual(mock_run.call_count, 1)
+            self.assertEqual(res1, res2)
+
+    def test_tier4b_deep_scan_short_circuits_on_first_valid_candidate(self):
+        """Verify Tier 4b deep capability scanning stops immediately upon finding the first valid candidate."""
+        from scripts.chimera_stages.stage4_runners import (
+            resolve_execution_runner,
+            clear_probe_cache,
+            clear_environment_cache,
+        )
+
+        clear_probe_cache()
+        clear_environment_cache()
+
+        roots = ["/data1/envs"]
+        probed_envs = []
+
+        def mock_probe(runner_or_bin, required_modules=None, **kwargs):
+            s = str(runner_or_bin)
+            probed_envs.append(s)
+            if "valid_env_1" in s:
+                return {"missing_modules": [], "cuda_available": False, "torch_version": "2.2.0"}
+            if "valid_env_2" in s:
+                return {"missing_modules": [], "cuda_available": False, "torch_version": "2.2.0"}
+            return {"missing_modules": required_modules or ["torch"], "cuda_available": False}
+
+        entry1 = MagicMock()
+        entry1.is_dir.return_value = True
+        entry1.name = "valid_env_1"
+        entry1.path = "/data1/envs/valid_env_1"
+
+        entry2 = MagicMock()
+        entry2.is_dir.return_value = True
+        entry2.name = "valid_env_2"
+        entry2.path = "/data1/envs/valid_env_2"
+
+        entry3 = MagicMock()
+        entry3.is_dir.return_value = True
+        entry3.name = "valid_env_3"
+        entry3.path = "/data1/envs/valid_env_3"
+
+        with patch("scripts.chimera_scaffold.get_all_environment_roots", return_value=roots), \
+             patch("scripts.chimera_stages.stage4_runners.get_manifest_environments", return_value=[]), \
+             patch("os.scandir") as mock_scandir, \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.path.isdir", return_value=True), \
+             patch("scripts.chimera_scaffold.probe_python_environment", side_effect=mock_probe):
+
+            mock_scandir.return_value.__enter__.return_value = [entry1, entry2, entry3]
+
+            runner = resolve_execution_runner(
+                explicit_target=None,
+                env_var_keys=[],
+                target_env_names=["SE3nv"],
+                required_modules=["torch"],
+                tool_label="RFdiffusion",
+                strict=False,
+            )
+            self.assertTrue(runner.is_valid)
+            self.assertIn("valid_env_1", runner.display_label())
+            # Verify short-circuiting: entry2 and entry3 were never probed
+            self.assertTrue(any("valid_env_1" in p for p in probed_envs))
+            self.assertFalse(any("valid_env_2" in p for p in probed_envs))
+            self.assertFalse(any("valid_env_3" in p for p in probed_envs))
+
+    def test_cache_memory_footprint_bounded(self):
+        """Verify session caches have bounded O(N) memory consumption well below 50KB."""
+        from scripts.chimera_stages.stage4_runners import (
+            _PROBE_CACHE,
+            _CACHED_MANAGERS,
+            _CACHED_ROOTS,
+            _CACHED_MANIFEST_ENVS,
+            find_environment_managers,
+            query_package_manager_manifest_envs,
+            get_all_environment_roots,
+            probe_python_environment,
+        )
+
+        find_environment_managers(use_cache=True)
+        query_package_manager_manifest_envs(use_cache=True)
+        get_all_environment_roots(use_cache=True)
+        probe_python_environment(sys.executable, ["json", "sys"])
+
+        def get_deep_size(o, seen=None):
+            if seen is None:
+                seen = set()
+            pid = id(o)
+            if pid in seen:
+                return 0
+            seen.add(pid)
+            size = sys.getsizeof(o)
+            if isinstance(o, dict):
+                size += sum(get_deep_size(k, seen) + get_deep_size(v, seen) for k, v in o.items())
+            elif isinstance(o, (list, tuple, set)):
+                size += sum(get_deep_size(i, seen) for i in o)
+            return size
+
+        total_bytes = (
+            get_deep_size(_PROBE_CACHE)
+            + get_deep_size(_CACHED_MANAGERS)
+            + get_deep_size(_CACHED_ROOTS)
+            + get_deep_size(_CACHED_MANIFEST_ENVS)
+        )
+        # Bounded < 50KB (51,200 bytes)
+        self.assertLess(total_bytes, 50 * 1024)
 
 
 if __name__ == "__main__":

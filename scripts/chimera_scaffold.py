@@ -125,6 +125,8 @@ from chimera_stages.stage4_runners import (  # noqa: E402, F401
     clear_environment_cache,
     find_environment_managers,
     get_all_environment_roots,
+    query_package_manager_manifest_envs,
+    get_manifest_environments,
     build_ephemeral_runner_cmd,
     format_runner_display,
     display_dependency_alert,
@@ -137,6 +139,7 @@ from chimera_stages.stage4_runners import (  # noqa: E402, F401
     _PROBE_CACHE,
     _CACHED_MANAGERS,
     _CACHED_ROOTS,
+    _CACHED_MANIFEST_ENVS,
 )
 
 # 5. Stage 5 Imports & Re-exports
@@ -165,9 +168,9 @@ except ImportError:
     from format_complex_fasta import make_fixed_positions_dict  # noqa: E402
 
 
-# Dynamic module attribute lookup for Trap 2 (_CACHED_MANAGERS, _CACHED_ROOTS)
+# Dynamic module attribute lookup for Trap 2 (_CACHED_MANAGERS, _CACHED_ROOTS, _CACHED_MANIFEST_ENVS)
 def __getattr__(name: str) -> Any:
-    if name in ("_CACHED_MANAGERS", "_CACHED_ROOTS"):
+    if name in ("_CACHED_MANAGERS", "_CACHED_ROOTS", "_CACHED_MANIFEST_ENVS"):
         import chimera_stages.stage4_runners as s4
         return getattr(s4, name)
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
@@ -862,6 +865,78 @@ class ChimeraScaffolder:
         return summary_data
 
 
+def scan_environments_cli() -> int:
+    """CLI utility to scan, probe, and report all discovered Python environments with neural capabilities."""
+    print("\n\033[1;36m[+] Scanning system for neural Python environments (PyTorch & Hydra)...\033[0m")
+    roots = get_all_environment_roots(use_cache=False)
+    manifest_envs = get_manifest_environments(use_cache=False)
+
+    candidates = []
+    seen = set()
+
+    for m_env in manifest_envs:
+        for rel in ["bin/python", "python.exe", "Scripts/python.exe"]:
+            cand = os.path.join(m_env, rel)
+            if os.path.isfile(cand) and cand not in seen:
+                seen.add(cand)
+                candidates.append((os.path.basename(m_env), cand))
+
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            with os.scandir(root) as it:
+                for entry in it:
+                    if entry.is_dir() and not entry.name.startswith("."):
+                        for rel in ["bin/python", "python.exe", "Scripts/python.exe"]:
+                            cand = os.path.join(entry.path, rel)
+                            if os.path.isfile(cand) and cand not in seen:
+                                seen.add(cand)
+                                candidates.append((entry.name, cand))
+        except (PermissionError, OSError):
+            continue
+
+    active_py = sys.executable
+    if active_py and active_py not in seen:
+        seen.add(active_py)
+        candidates.append(("active_python", active_py))
+
+    valid_candidates = []
+    for env_name, py_bin in candidates:
+        res = probe_python_environment(
+            py_bin, required_modules=["torch", "hydra"], check_cuda=True, raise_on_error=False
+        )
+        if len(res.get("missing_modules", [])) == 0:
+            valid_candidates.append({
+                "env_name": env_name,
+                "python_bin": py_bin,
+                "cuda": res.get("cuda_available", False),
+                "torch_version": res.get("torch_version", "unknown"),
+                "device": res.get("cuda_device_name", ""),
+            })
+
+    if not valid_candidates:
+        print("\033[0;31m[-] No Python environments with PyTorch and Hydra found.\033[0m")
+        return 1
+
+    print(f"\n\033[1;32m[✓] Found {len(valid_candidates)} compatible environment(s):\033[0m")
+    for idx, c in enumerate(valid_candidates, 1):
+        cuda_str = f"CUDA (GPU: {c['device']})" if c['cuda'] else "CPU only"
+        print(f"  [{idx}] {c['env_name']} -> {c['python_bin']}")
+        print(f"      (PyTorch {c['torch_version']}, {cuda_str})")
+
+    if sys.stdin.isatty():
+        try:
+            choice = input(f"\nSelect environment [1-{len(valid_candidates)}, or Enter to skip]: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(valid_candidates):
+                selected = valid_candidates[int(choice) - 1]["python_bin"]
+                print(f"SELECTED:{selected}")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            pass
+    return 0
+
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "measure_junctions":
         meas_parser = argparse.ArgumentParser(description="Measure 3D junction distances and recommend linker bounds.")
@@ -920,6 +995,9 @@ def main() -> None:
         except ImportError:
             from system_doctor import main as doctor_main
         sys.exit(doctor_main())
+
+    if "--scan_environments" in sys.argv or "scan_environments" in sys.argv:
+        sys.exit(scan_environments_cli())
 
     parser = argparse.ArgumentParser(
         description="Chimera Scaffolding: Graft active motifs into host scaffold proteins."
@@ -1048,40 +1126,53 @@ def main() -> None:
         parser.error("One of --motifs, --motif_residues, or --donor_range is required.")
     donor_id_val = args.donor_chain or args.donor_id
 
-    scaffolder = ChimeraScaffolder(
-        input_file=args.input_file,
-        donor_pdb=args.donor_pdb,
-        vessel_pdb=args.vessel_pdb,
-        donor_id=donor_id_val,
-        vessel_id=args.vessel_id,
-        motif_residues=motif_val,
-        motifs=args.motifs,
-        chimera_mode=args.chimera_mode,
-        vessel_replace_range=args.vessel_replace_range,
-        vessel_split_after=args.vessel_split_after,
-        linker_n=args.linker_n,
-        linker_c=args.linker_c,
-        lock_vessel=args.lock_vessel,
-        vessel_redesign_mode=args.vessel_redesign_mode,
-        clamp_linkers=args.clamp_linkers,
-        num_designs=args.num_designs,
-        mpnn_seqs_per_bb=args.mpnn_seqs_per_bb,
-        mpnn_temp=args.mpnn_temp,
-        mpnn_batch_size=args.mpnn_batch_size,
-        rmsd_threshold=args.rmsd_threshold,
-        plddt_threshold=args.plddt_threshold,
-        rfdiff_script=args.rfdiff_script,
-        mpnn_script=args.mpnn_script,
-        python_rfdiff=args.python_rfdiff,
-        python_mpnn=args.python_mpnn,
-        python_colabfold=args.python_colabfold,
-        strict_python=args.strict_python,
-        out_dir=args.out_dir,
-        dry_run=args.dry_run,
-    )
+    try:
+        scaffolder = ChimeraScaffolder(
+            input_file=args.input_file,
+            donor_pdb=args.donor_pdb,
+            vessel_pdb=args.vessel_pdb,
+            donor_id=donor_id_val,
+            vessel_id=args.vessel_id,
+            motif_residues=motif_val,
+            motifs=args.motifs,
+            chimera_mode=args.chimera_mode,
+            vessel_replace_range=args.vessel_replace_range,
+            vessel_split_after=args.vessel_split_after,
+            linker_n=args.linker_n,
+            linker_c=args.linker_c,
+            lock_vessel=args.lock_vessel,
+            vessel_redesign_mode=args.vessel_redesign_mode,
+            clamp_linkers=args.clamp_linkers,
+            num_designs=args.num_designs,
+            mpnn_seqs_per_bb=args.mpnn_seqs_per_bb,
+            mpnn_temp=args.mpnn_temp,
+            mpnn_batch_size=args.mpnn_batch_size,
+            rmsd_threshold=args.rmsd_threshold,
+            plddt_threshold=args.plddt_threshold,
+            rfdiff_script=args.rfdiff_script,
+            mpnn_script=args.mpnn_script,
+            python_rfdiff=args.python_rfdiff,
+            python_mpnn=args.python_mpnn,
+            python_colabfold=args.python_colabfold,
+            strict_python=args.strict_python,
+            out_dir=args.out_dir,
+            dry_run=args.dry_run,
+        )
 
-    res = scaffolder.run_pipeline()
-    print(json.dumps(res, indent=2))
+        res = scaffolder.run_pipeline()
+        print(json.dumps(res, indent=2))
+        sys.exit(0)
+    except (EnvironmentError, OSError) as env_err:
+        sys.stderr.write(f"\n\033[0;31m[ERROR] Environment validation failed:\033[0m {env_err}\n")
+        sys.stderr.write("\033[1;33m[REMEDY]\033[0m To resolve this issue, you can:\n")
+        sys.stderr.write("  1. Specify a valid interpreter with --python_rfdiff /path/to/SE3nv/bin/python\n")
+        sys.stderr.write("  2. Export PYTHON_RFDIFF=/path/to/valid/python in your shell or config.env\n")
+        sys.stderr.write("  3. Run 'bash install.sh' to automatically configure the SE3nv environment\n")
+        sys.stderr.write("  4. Run with --dry_run to prepare seed structures without neural execution\n\n")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.stderr.write("\n\033[1;33m[!] Pipeline execution cancelled by user.\033[0m\n")
+        sys.exit(130)
 
 
 if __name__ == "__main__":

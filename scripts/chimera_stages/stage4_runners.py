@@ -56,6 +56,7 @@ _PROBE_CACHE: Dict[Any, Dict[str, Any]] = {}
 # In-memory session cache for environment managers and roots:
 _CACHED_MANAGERS: Optional[Dict[str, str]] = None
 _CACHED_ROOTS: Optional[List[str]] = None
+_CACHED_MANIFEST_ENVS: Optional[List[str]] = None
 
 
 def _sync_caches_to_facade() -> None:
@@ -65,6 +66,7 @@ def _sync_caches_to_facade() -> None:
         if cs is not None:
             cs._CACHED_MANAGERS = _CACHED_MANAGERS
             cs._CACHED_ROOTS = _CACHED_ROOTS
+            cs._CACHED_MANIFEST_ENVS = _CACHED_MANIFEST_ENVS
 
 
 def _get_active_probe_fn():
@@ -111,9 +113,10 @@ def clear_probe_cache() -> None:
 
 def clear_environment_cache() -> None:
     """Clears the in-memory cached environment managers and roots."""
-    global _CACHED_MANAGERS, _CACHED_ROOTS
+    global _CACHED_MANAGERS, _CACHED_ROOTS, _CACHED_MANIFEST_ENVS
     _CACHED_MANAGERS = None
     _CACHED_ROOTS = None
+    _CACHED_MANIFEST_ENVS = None
     _sync_caches_to_facade()
 
 
@@ -510,6 +513,110 @@ def find_environment_managers(use_cache: bool = True) -> Dict[str, str]:
     return dict(managers)
 
 
+def query_package_manager_manifest_envs(
+    managers: Optional[Dict[str, str]] = None,
+    use_cache: bool = True,
+) -> List[str]:
+    """
+    Queries micromamba and conda registries for registered environment paths.
+    Uses --json where supported with tabular stdout parsing fallback.
+    Caches results in module-level _CACHED_MANIFEST_ENVS when default managers are used.
+    """
+    global _CACHED_MANIFEST_ENVS
+    if use_cache and managers is None and _CACHED_MANIFEST_ENVS is not None:
+        return list(_CACHED_MANIFEST_ENVS)
+
+    orig_managers_is_none = managers is None
+    if managers is None:
+        managers = find_environment_managers(use_cache=use_cache)
+
+    found_envs: List[str] = []
+    seen = set()
+
+    def _add_env(path_str: Any) -> None:
+        if not path_str or _RE_SHELL_INJECTION.search(str(path_str)):
+            return
+        clean_p = os.path.realpath(os.path.expanduser(os.path.expandvars(str(path_str).strip())))
+        p_drive, p_rest = os.path.splitdrive(clean_p)
+        is_root = (
+            (not p_drive and clean_p.rstrip("/\\") == "")
+            or (p_drive and p_rest in ("/", "\\", ""))
+            or clean_p in ("/", "\\", "//", "\\\\")
+        )
+        if is_root:
+            return
+        if clean_p not in seen and os.path.isdir(clean_p):
+            seen.add(clean_p)
+            found_envs.append(clean_p)
+
+    # 1. Micromamba env list --json
+    if "micromamba" in managers:
+        mm_bin = managers["micromamba"]
+        try:
+            res = subprocess.run(
+                [mm_bin, "env", "list", "--json"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=2.0,
+                shell=False,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                try:
+                    data = json.loads(res.stdout)
+                    envs = data.get("envs", [])
+                    for ep in envs:
+                        _add_env(ep)
+                except Exception:
+                    for line in res.stdout.splitlines():
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            parts = line.split()
+                            if parts:
+                                _add_env(parts[-1])
+        except Exception:
+            pass
+
+    # 2. Conda / Mamba env list --json or info --envs --json
+    for mgr_key in ("conda", "mamba"):
+        if mgr_key in managers:
+            c_bin = managers[mgr_key]
+            try:
+                res = subprocess.run(
+                    [c_bin, "info", "--envs", "--json"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=2.0,
+                    shell=False,
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    try:
+                        data = json.loads(res.stdout)
+                        envs = data.get("envs", [])
+                        for ep in envs:
+                            _add_env(ep)
+                    except Exception:
+                        for line in res.stdout.splitlines():
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                parts = line.split()
+                                if parts:
+                                    _add_env(parts[-1])
+            except Exception:
+                pass
+
+    if use_cache and orig_managers_is_none:
+        _CACHED_MANIFEST_ENVS = list(found_envs)
+        _sync_caches_to_facade()
+    return list(found_envs)
+
+
+def get_manifest_environments(use_cache: bool = True) -> List[str]:
+    """Returns cached or freshly queried package manager manifest environments."""
+    return query_package_manager_manifest_envs(use_cache=use_cache)
+
+
 def get_all_environment_roots(use_cache: bool = True) -> List[str]:
     """
     Returns ordered list of root directories where conda and micromamba environments reside.
@@ -525,14 +632,44 @@ def get_all_environment_roots(use_cache: bool = True) -> List[str]:
     conda_prefix = os.environ.get("CONDA_PREFIX", "")
     mamba_root = os.environ.get("MAMBA_ROOT_PREFIX", "")
 
-    roots: List[str] = [
-        local_envs_dir,
-    ]
+    roots: List[str] = []
+
+    # 1. Local and explicit environment directories
+    if local_envs_dir:
+        roots.append(local_envs_dir)
+        l_parent = os.path.dirname(local_envs_dir)
+        if os.path.basename(l_parent) == "envs":
+            roots.append(l_parent)
+
+    # 2. MAMBA_ROOT_PREFIX parent inference
     if mamba_root:
         roots.append(os.path.join(mamba_root, "envs"))
         roots.append(mamba_root)
+        m_parent = os.path.dirname(mamba_root)
+        if os.path.basename(m_parent) == "envs":
+            roots.append(m_parent)
 
-    # Micromamba roots
+    # 3. Active CONDA_PREFIX parent inference (Fixed: avoids .../envs/envs concatenation)
+    if conda_prefix:
+        p = conda_prefix
+        parent = os.path.dirname(p)
+        if os.path.basename(parent) == "envs":
+            roots.append(parent)
+        else:
+            roots.append(os.path.join(parent, "envs"))
+        roots.append(os.path.join(p, "envs"))
+
+    # 4. sys.executable parent inference
+    try:
+        py_dir = os.path.dirname(os.path.abspath(sys.executable))
+        env_dir = os.path.dirname(py_dir) if os.path.basename(py_dir).lower() in ("bin", "scripts") else py_dir
+        envs_dir = os.path.dirname(env_dir)
+        if os.path.basename(envs_dir) == "envs":
+            roots.append(envs_dir)
+    except Exception:
+        pass
+
+    # 5. Standard Micromamba roots
     roots.extend(
         [
             os.path.join(home_dir, ".micromamba", "envs"),
@@ -541,11 +678,7 @@ def get_all_environment_roots(use_cache: bool = True) -> List[str]:
         ]
     )
 
-    # Conda roots
-    if conda_prefix:
-        roots.append(os.path.join(conda_prefix, "envs"))
-        roots.append(os.path.join(conda_prefix, "..", "envs"))
-
+    # 6. Standard Conda roots
     roots.extend(
         [
             os.path.join(home_dir, "miniconda3", "envs"),
@@ -560,8 +693,42 @@ def get_all_environment_roots(use_cache: bool = True) -> List[str]:
             r"C:\anaconda3\envs",
             r"C:\ProgramData\miniconda3\envs",
             r"C:\ProgramData\anaconda3\envs",
+            r"D:\miniconda3\envs",
+            r"D:\anaconda3\envs",
+            r"E:\miniconda3\envs",
+            r"E:\anaconda3\envs",
         ]
     )
+
+    # 7. Common partition heuristics (/data1, /data2, /scratch, /mnt, etc.)
+    common_partitions = [
+        "/data1", "/data2", "/data3", "/data", "/scratch", "/mnt", "/export", "/home"
+    ]
+    for part in common_partitions:
+        for sub in [
+            "micromamba/envs",
+            "miniconda3/envs",
+            "anaconda3/envs",
+            "mambaforge/envs",
+            "miniforge3/envs",
+            ".conda/envs",
+            "conda/envs",
+            "envs",
+        ]:
+            roots.append(os.path.join(part, sub))
+
+    # 8. Roots derived from package manager manifests
+    try:
+        manifest_envs = get_manifest_environments(use_cache=use_cache)
+        for menv in manifest_envs:
+            m_parent = os.path.dirname(menv)
+            if os.path.basename(m_parent) == "envs":
+                roots.append(m_parent)
+            m_sub_envs = os.path.join(menv, "envs")
+            if os.path.isdir(m_sub_envs):
+                roots.append(m_sub_envs)
+    except Exception:
+        pass
 
     valid_roots = []
     seen = set()
@@ -575,7 +742,7 @@ def get_all_environment_roots(use_cache: bool = True) -> List[str]:
             or (p_drive and p_rest in ("/", "\\", ""))
             or clean_r in ("/", "\\", "//", "\\\\")
         )
-        if is_root:
+        if is_root or clean_r == home_dir:
             continue
         if clean_r not in seen and os.path.isdir(clean_r):
             seen.add(clean_r)
@@ -846,6 +1013,68 @@ def resolve_execution_runner(
                         return spec
                     cpu_fallback_runners.append(spec)
                     break
+
+    # Tier 4b: Deep Capability-Based Environment Scan (when strict=False)
+    if not strict:
+        candidate_env_dirs: List[Tuple[str, str]] = []
+
+        # 1. Collect child directories from all discovered roots
+        for root in all_roots:
+            if not os.path.isdir(root):
+                continue
+            try:
+                with os.scandir(root) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_dir() and not entry.name.startswith("."):
+                                candidate_env_dirs.append((entry.name, entry.path))
+                        except (PermissionError, OSError):
+                            continue
+            except (PermissionError, OSError):
+                continue
+
+        # 2. Collect environments from package manager manifest cache
+        try:
+            for manifest_env in get_manifest_environments():
+                m_name = os.path.basename(manifest_env)
+                if (m_name, manifest_env) not in candidate_env_dirs:
+                    candidate_env_dirs.append((m_name, manifest_env))
+        except Exception:
+            pass
+
+        # 3. Capability-probe candidate interpreters (stops on first GPU candidate or first valid candidate)
+        found_candidate_in_4b = False
+        for env_name, env_dir in candidate_env_dirs:
+            if env_name in (target_env_names or []):
+                continue
+            for rel in ["bin/python", "python.exe", "Scripts/python.exe"]:
+                cand = os.path.join(env_dir, rel)
+                if not os.path.isfile(cand):
+                    continue
+                spec = test_candidate(cand_bin=cand, env_name=env_name, env_prefix=env_dir)
+                if spec:
+                    if spec.cuda_available:
+                        return spec
+                    cpu_fallback_runners.append(spec)
+                    found_candidate_in_4b = True
+                    break
+            if found_candidate_in_4b:
+                break
+
+    # If strict mode is requested, skip Tier 5 host fallback and return valid match or failure
+    if strict:
+        if cpu_fallback_runners:
+            return cpu_fallback_runners[0]
+        if first_invalid_spec:
+            return first_invalid_spec
+        clean_host = os.path.realpath(sys.executable)
+        return RunnerSpec(
+            runner_type="direct",
+            command_prefix=[clean_host],
+            python_binary=clean_host,
+            is_valid=False,
+            missing_modules=req_mods,
+        )
 
     # Tier 5: Host interpreter fallback
     spec = test_candidate(cand_bin=sys.executable)

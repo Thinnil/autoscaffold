@@ -665,6 +665,172 @@ if [ -z "$PYTHON_MPNN" ] || [ ! -x "$PYTHON_MPNN" ] || ! "$PYTHON_MPNN" -c "impo
 fi
 
 # ------------------------------------------------------------------------------
+# 3.4 Pre-Flight Neural Environment Resolution & Self-Healing Wizard
+# ------------------------------------------------------------------------------
+interactive_environment_healing_menu() {
+    local active_pfx="${CONDA_PREFIX:-None}"
+    local pfx_note=""
+    if [ -n "${CONDA_PREFIX:-}" ]; then
+        pfx_note="(Lacks torch, hydra)"
+    fi
+
+    while true; do
+        echo -e "\n${YELLOW}================================================================================${NC}"
+        echo -e " ${YELLOW}⚠️  [AUTOSCAFFOLD PRE-FLIGHT] NEURAL ENVIRONMENT RESOLUTION ALERT${NC}"
+        echo -e "${YELLOW}================================================================================${NC}"
+        echo -e " Target Tool:       ${BOLD}RFdiffusion${NC}"
+        echo -e " Required Modules:  ${BOLD}torch, hydra${NC}"
+        echo -e " Current Status:    No verified Python interpreter found for '${CONDA_ENV_RFDIFF:-SE3nv}'."
+        echo -e " Current Prefix:    ${active_pfx} ${pfx_note}"
+        echo -e "--------------------------------------------------------------------------------"
+        echo -e " AutoScaffold cannot run neural backbone generation without PyTorch & Hydra."
+        echo -e " Please choose an action:"
+        echo ""
+        echo -e "   ${BOLD}[1]${NC} ⚡ Build/Install 'SE3nv' environment now (runs install.sh)"
+        echo -e "   ${BOLD}[2]${NC} 🔍 Deep Scan system for any Python interpreter providing PyTorch & Hydra"
+        echo -e "   ${BOLD}[3]${NC} ✏️  Specify custom Python interpreter path"
+        echo -e "   ${BOLD}[4]${NC} 🧪 Run in Dry-Run mode (--dry_run)"
+        echo -e "   ${BOLD}[0]${NC} 🚪 Cancel cleanly and exit"
+        echo -e "--------------------------------------------------------------------------------"
+        read -r -p " Choice [1-4, 0]: " menu_choice
+
+        case "$menu_choice" in
+            1)
+                echo -e "\n${CYAN}[*] Launching AutoScaffold environment installer...${NC}"
+                if [ -f "$SCRIPT_DIR/install.sh" ]; then
+                    bash "$SCRIPT_DIR/install.sh" --env "${CONDA_ENV_RFDIFF:-SE3nv}" || true
+                elif [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ]; then
+                    bash "$SCRIPT_DIR/scripts/install_dependencies.sh" || true
+                fi
+                local recheck_py
+                recheck_py="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 1 2>/dev/null || true)"
+                if [ -n "$recheck_py" ] && [ -x "$recheck_py" ] && "$recheck_py" -c "import torch, hydra" >/dev/null 2>&1; then
+                    echo -e "${GREEN}[✓] Verified environment '${CONDA_ENV_RFDIFF:-SE3nv}': $recheck_py${NC}"
+                    export PYTHON_RFDIFF="$recheck_py"
+                    return 0
+                else
+                    echo -e "${RED}[!] Installation completed but verified interpreter with torch & hydra was not detected.${NC}"
+                fi
+                ;;
+            2)
+                echo -e "\n${CYAN}[*] Performing deep capability scan across all disks and manifests...${NC}"
+                local scan_out
+                scan_out="$("$PYTHON_BIN" "$SCRIPT_DIR/scripts/chimera_scaffold.py" scan_environments 2>&1 || true)"
+                echo "$scan_out"
+                local sel_line
+                sel_line="$(echo "$scan_out" | grep '^SELECTED:' | tail -n 1)"
+                if [ -n "$sel_line" ]; then
+                    local sel_path="${sel_line#SELECTED:}"
+                    sel_path="$(echo "$sel_path" | tr -d '\r\n ')"
+                    if [ -n "$sel_path" ] && [ -f "$sel_path" ] && [ -x "$sel_path" ] && ! _is_unsafe_path "$sel_path"; then
+                        export PYTHON_RFDIFF="$sel_path"
+                        echo -e "${GREEN}[✓] Selected neural interpreter: $PYTHON_RFDIFF${NC}"
+                        read -r -p "▶ Persist this interpreter to config.env? [y/N]: " save_cfg
+                        if [[ "$save_cfg" =~ ^[Yy]$ ]]; then
+                            echo "PYTHON_RFDIFF=\"$PYTHON_RFDIFF\"" >> "$SCRIPT_DIR/config.env"
+                            echo -e "${GREEN}[✓] Saved PYTHON_RFDIFF to config.env${NC}"
+                        fi
+                        return 0
+                    fi
+                fi
+                ;;
+            3)
+                read -r -p "Enter absolute path to Python binary: " custom_py
+                custom_py="$(echo "$custom_py" | tr -d '\"'\''')"
+                custom_py="$(echo "$custom_py" | xargs)"
+                if [ -z "$custom_py" ] || _is_unsafe_path "$custom_py"; then
+                    echo -e "${RED}[!] Security error: Path contains forbidden characters (; & | \` > < $ ..) or is empty.${NC}"
+                    continue
+                fi
+                if [ -f "$custom_py" ] && [ -x "$custom_py" ]; then
+                    local base_py
+                    base_py="$(basename "$custom_py")"
+                    if [[ ! "$base_py" =~ ^[pP][yY][tT][hH][oO][nN]([0-9]+(\.[0-9]+)?)?(\.[eE][xX][eE])?$ ]]; then
+                        echo -e "${RED}[!] Provided file is not a legitimate Python executable: '$custom_py'${NC}"
+                        continue
+                    fi
+                    if "$custom_py" -c "import torch, hydra" >/dev/null 2>&1; then
+                        export PYTHON_RFDIFF="$custom_py"
+                        echo -e "${GREEN}[✓] Verified interpreter: $PYTHON_RFDIFF${NC}"
+                        read -r -p "▶ Persist this interpreter to config.env? [y/N]: " save_cfg
+                        if [[ "$save_cfg" =~ ^[Yy]$ ]]; then
+                            echo "PYTHON_RFDIFF=\"$PYTHON_RFDIFF\"" >> "$SCRIPT_DIR/config.env"
+                            echo -e "${GREEN}[✓] Saved PYTHON_RFDIFF to config.env${NC}"
+                        fi
+                        return 0
+                    else
+                        echo -e "${RED}[!] Provided Python binary lacks required modules (torch, hydra).${NC}"
+                    fi
+                else
+                    echo -e "${RED}[!] File does not exist, is not a regular file, or is not executable: '$custom_py'${NC}"
+                fi
+                ;;
+            4)
+                echo -e "${YELLOW}[!] Proceeding in Dry-Run mode. Backbone generation will be simulated.${NC}"
+                DRY_RUN="--dry_run"
+                return 0
+                ;;
+            0|"")
+                echo -e "${YELLOW}[!] Operation aborted by user.${NC}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}[!] Invalid choice: '$menu_choice'. Please enter 1, 2, 3, 4, or 0.${NC}"
+                ;;
+        esac
+    done
+}
+
+preflight_neural_environment_check() {
+    # If dry-run requested, bypass neural check
+    if [ "${DRY_RUN:-0}" -eq 1 ] || [ -n "$DRY_RUN" ] || [[ " ${ORIG_ARGS[*]} " =~ " --dry_run " ]]; then
+        return 0
+    fi
+
+    # Check if PYTHON_RFDIFF is set and operational with torch and hydra
+    if [ -n "${PYTHON_RFDIFF:-}" ] && [ -f "$PYTHON_RFDIFF" ] && [ -x "$PYTHON_RFDIFF" ] && ! _is_unsafe_path "$PYTHON_RFDIFF"; then
+        if "$PYTHON_RFDIFF" -c "import torch, hydra" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    # Check if active environment possesses required modules
+    if [ -n "${CONDA_PREFIX:-}" ]; then
+        for cand in "$CONDA_PREFIX/bin/python" "$CONDA_PREFIX/python.exe"; do
+            if [ -f "$cand" ] && [ -x "$cand" ] && ! _is_unsafe_path "$cand"; then
+                if "$cand" -c "import torch, hydra" >/dev/null 2>&1; then
+                    export PYTHON_RFDIFF="$cand"
+                    return 0
+                fi
+            fi
+        done
+    fi
+
+    # Check if discover_conda_python can resolve a candidate with torch and hydra
+    local disc_py
+    disc_py="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 1 2>/dev/null || true)"
+    if [ -n "$disc_py" ] && [ -f "$disc_py" ] && [ -x "$disc_py" ] && ! _is_unsafe_path "$disc_py" && "$disc_py" -c "import torch, hydra" >/dev/null 2>&1; then
+        export PYTHON_RFDIFF="$disc_py"
+        return 0
+    fi
+    disc_py="$(discover_conda_python "rfdiffusion" "torch" 1 2>/dev/null || true)"
+    if [ -n "$disc_py" ] && [ -f "$disc_py" ] && [ -x "$disc_py" ] && ! _is_unsafe_path "$disc_py" && "$disc_py" -c "import torch, hydra" >/dev/null 2>&1; then
+        export PYTHON_RFDIFF="$disc_py"
+        return 0
+    fi
+
+    # If missing or invalid and interactive session:
+    if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ] && [ -z "$DRY_RUN" ] && [ "${NON_INTERACTIVE:-0}" -ne 1 ]; then
+        interactive_environment_healing_menu
+        return $?
+    fi
+
+    return 0
+}
+
+preflight_neural_environment_check
+
+# ------------------------------------------------------------------------------
 # 3.5 Background Execution Option
 # ------------------------------------------------------------------------------
 if [ -t 0 ] && [ "$BACKGROUND_MODE" = false ]; then
