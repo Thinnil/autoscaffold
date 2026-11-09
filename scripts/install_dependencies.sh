@@ -106,15 +106,27 @@ read -p "Build environments? (y/N): " BUILD_ENVS
 if [[ "$BUILD_ENVS" =~ ^[Yy]$ ]]; then
     # Create or update RFdiffusion env
     echo -e "\nConfiguring RFdiffusion environment ($CONDA_ENV_RFDIFF)..."
+    local se3_built=false
     if [ -f "$LOCAL_TOOLS_DIR/RFdiffusion/env/SE3nv.yml" ]; then
-        "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_RFDIFF" -f "$LOCAL_TOOLS_DIR/RFdiffusion/env/SE3nv.yml" || true
-    else
-        "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_RFDIFF" python=3.9 pytorch=1.12.1 cudatoolkit=11.3 -c pytorch -c conda-forge || true
+        if "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_RFDIFF" -f "$LOCAL_TOOLS_DIR/RFdiffusion/env/SE3nv.yml" 2>/dev/null; then
+            se3_built=true
+        fi
+    fi
+    if [ "$se3_built" = false ]; then
+        "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_RFDIFF" python=3.9 pytorch=1.12.1 cudatoolkit=11.3 -c pytorch -c conda-forge 2>/dev/null || \
+        "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_RFDIFF" python=3.9 pytorch=1.12.1 -c pytorch -c conda-forge || true
+    fi
+
+    # Guarantee neural dependencies in RFdiffusion env
+    echo -e "Verifying neural dependencies (torch, hydra-core) in $CONDA_ENV_RFDIFF..."
+    "$MICROMAMBA_BIN" run -n "$CONDA_ENV_RFDIFF" pip install --no-warn-conflicts hydra-core omegaconf 2>/dev/null || true
+    if [ -d "$LOCAL_TOOLS_DIR/RFdiffusion" ]; then
+        "$MICROMAMBA_BIN" run -n "$CONDA_ENV_RFDIFF" pip install --no-warn-conflicts -e "$LOCAL_TOOLS_DIR/RFdiffusion" 2>/dev/null || true
     fi
 
     # Create ProteinMPNN env
     echo -e "\nConfiguring ProteinMPNN environment ($CONDA_ENV_MPNN)..."
-    "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_MPNN" python=3.9 pytorch=1.12.1 -c pytorch -c conda-forge || true
+    "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_MPNN" python=3.9 pytorch=1.12.1 numpy -c pytorch -c conda-forge || true
 
     # Create ColabFold env
     echo -e "\nConfiguring ColabFold environment ($CONDA_ENV_COLABFOLD)..."
@@ -126,6 +138,14 @@ if [[ "$BUILD_ENVS" =~ ^[Yy]$ ]]; then
     "$MICROMAMBA_BIN" run -n "$CONDA_ENV_COLABFOLD" pip install --no-warn-conflicts colabfold 2>/dev/null || true
 
     echo -e "\n${GREEN}[✓] Environments configured successfully!${NC}"
+fi
+
+# Detect resolved paths for config.env
+RESOLVED_SE3_PY=""
+RESOLVED_MPNN_PY=""
+if [ -n "$MICROMAMBA_BIN" ]; then
+    RESOLVED_SE3_PY="$("$MICROMAMBA_BIN" run -n "$CONDA_ENV_RFDIFF" which python 2>/dev/null || true)"
+    RESOLVED_MPNN_PY="$("$MICROMAMBA_BIN" run -n "$CONDA_ENV_MPNN" which python 2>/dev/null || true)"
 fi
 
 # Update config.env with local paths
@@ -141,6 +161,12 @@ CONDA_ENV_COLABFOLD="$CONDA_ENV_COLABFOLD"
 AUTOSCAFFOLD_REPO_URL="$AUTOSCAFFOLD_REPO_URL"
 AUTOSCAFFOLD_BRANCH="$AUTOSCAFFOLD_BRANCH"
 EOF
+if [ -n "$RESOLVED_SE3_PY" ] && [ -x "$RESOLVED_SE3_PY" ]; then
+    echo "PYTHON_RFDIFF=\"$RESOLVED_SE3_PY\"" >> "$SCRIPT_DIR/config.env"
+fi
+if [ -n "$RESOLVED_MPNN_PY" ] && [ -x "$RESOLVED_MPNN_PY" ]; then
+    echo "PYTHON_MPNN=\"$RESOLVED_MPNN_PY\"" >> "$SCRIPT_DIR/config.env"
+fi
 
 echo -e "\n${GREEN}Saved customized paths to $SCRIPT_DIR/config.env${NC}"
 

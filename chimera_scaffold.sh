@@ -702,8 +702,14 @@ interactive_environment_healing_menu() {
                 elif [ -f "$SCRIPT_DIR/scripts/install_dependencies.sh" ]; then
                     bash "$SCRIPT_DIR/scripts/install_dependencies.sh" || true
                 fi
-                local recheck_py
-                recheck_py="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 1 2>/dev/null || true)"
+                if [ -f "$SCRIPT_DIR/config.env" ]; then
+                    # shellcheck disable=SC1091
+                    source "$SCRIPT_DIR/config.env"
+                fi
+                local recheck_py="${PYTHON_RFDIFF:-}"
+                if [ -z "$recheck_py" ] || [ ! -x "$recheck_py" ] || ! "$recheck_py" -c "import torch, hydra" >/dev/null 2>&1; then
+                    recheck_py="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 1 2>/dev/null || true)"
+                fi
                 if [ -n "$recheck_py" ] && [ -x "$recheck_py" ] && "$recheck_py" -c "import torch, hydra" >/dev/null 2>&1; then
                     echo -e "${GREEN}[✓] Verified environment '${CONDA_ENV_RFDIFF:-SE3nv}': $recheck_py${NC}"
                     export PYTHON_RFDIFF="$recheck_py"

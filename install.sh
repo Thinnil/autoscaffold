@@ -267,6 +267,7 @@ download_weights() {
 # Task 6: Build Virtual Environments
 # ------------------------------------------------------------------------------
 build_environments() {
+    local target_scope="${1:-all}"
     echo -e "\n${CYAN}======================================================${NC}"
     echo -e "${CYAN}  🧬 BUILDING ISOLATED PYTHON ENVIRONMENTS            ${NC}"
     echo -e "${CYAN}======================================================${NC}"
@@ -278,25 +279,45 @@ build_environments() {
     fi
 
     # 1. RFdiffusion Env
-    echo -e "\nConfiguring RFdiffusion environment ($CONDA_ENV_RFDIFF)..."
-    if [ -f "$LOCAL_TOOLS_DIR/RFdiffusion/env/SE3nv.yml" ]; then
-        "$CONDA_BIN" create -y -n "$CONDA_ENV_RFDIFF" -f "$LOCAL_TOOLS_DIR/RFdiffusion/env/SE3nv.yml" || true
-    else
-        "$CONDA_BIN" create -y -n "$CONDA_ENV_RFDIFF" python=3.9 pytorch=1.12.1 cudatoolkit=11.3 -c pytorch -c conda-forge || true
+    if [ "$target_scope" = "all" ] || [ "$target_scope" = "$CONDA_ENV_RFDIFF" ] || [ "$target_scope" = "rfdiff" ] || [ "$target_scope" = "rfdiffusion" ]; then
+        echo -e "\nConfiguring RFdiffusion environment ($CONDA_ENV_RFDIFF)..."
+        local se3_built=false
+        if [ -f "$LOCAL_TOOLS_DIR/RFdiffusion/env/SE3nv.yml" ]; then
+            echo -e "Attempting build from $LOCAL_TOOLS_DIR/RFdiffusion/env/SE3nv.yml..."
+            if "$CONDA_BIN" create -y -n "$CONDA_ENV_RFDIFF" -f "$LOCAL_TOOLS_DIR/RFdiffusion/env/SE3nv.yml" 2>/dev/null; then
+                se3_built=true
+            fi
+        fi
+        if [ "$se3_built" = false ]; then
+            echo -e "Building RFdiffusion environment with PyTorch & Hydra core..."
+            "$CONDA_BIN" create -y -n "$CONDA_ENV_RFDIFF" python=3.9 pytorch=1.12.1 cudatoolkit=11.3 -c pytorch -c conda-forge 2>/dev/null || \
+            "$CONDA_BIN" create -y -n "$CONDA_ENV_RFDIFF" python=3.9 pytorch=1.12.1 -c pytorch -c conda-forge || true
+        fi
+
+        # Guarantee hydra-core and omegaconf are installed
+        echo -e "Verifying neural dependencies (torch, hydra-core) in $CONDA_ENV_RFDIFF..."
+        "$CONDA_BIN" run -n "$CONDA_ENV_RFDIFF" pip install --no-warn-conflicts hydra-core omegaconf 2>/dev/null || true
+        if [ -d "$LOCAL_TOOLS_DIR/RFdiffusion" ]; then
+            "$CONDA_BIN" run -n "$CONDA_ENV_RFDIFF" pip install --no-warn-conflicts -e "$LOCAL_TOOLS_DIR/RFdiffusion" 2>/dev/null || true
+        fi
     fi
 
     # 2. ProteinMPNN Env
-    echo -e "\nConfiguring ProteinMPNN environment ($CONDA_ENV_MPNN)..."
-    "$CONDA_BIN" create -y -n "$CONDA_ENV_MPNN" python=3.9 pytorch=1.12.1 numpy -c pytorch -c conda-forge || true
+    if [ "$target_scope" = "all" ] || [ "$target_scope" = "$CONDA_ENV_MPNN" ] || [ "$target_scope" = "mpnn" ] || [ "$target_scope" = "proteinmpnn" ]; then
+        echo -e "\nConfiguring ProteinMPNN environment ($CONDA_ENV_MPNN)..."
+        "$CONDA_BIN" create -y -n "$CONDA_ENV_MPNN" python=3.9 pytorch=1.12.1 numpy -c pytorch -c conda-forge || true
+    fi
 
     # 3. ColabFold Env
-    echo -e "\nConfiguring ColabFold validation environment ($CONDA_ENV_COLABFOLD)..."
-    "$CONDA_BIN" create -y -n "$CONDA_ENV_COLABFOLD" python=3.10 openmm pdbfixer kalign2 -c conda-forge -c bioconda || \
-    "$CONDA_BIN" create -y -n "$CONDA_ENV_COLABFOLD" python=3.10 openmm -c conda-forge || true
+    if [ "$target_scope" = "all" ] || [ "$target_scope" = "$CONDA_ENV_COLABFOLD" ] || [ "$target_scope" = "colabfold" ]; then
+        echo -e "\nConfiguring ColabFold validation environment ($CONDA_ENV_COLABFOLD)..."
+        "$CONDA_BIN" create -y -n "$CONDA_ENV_COLABFOLD" python=3.10 openmm pdbfixer kalign2 -c conda-forge -c bioconda || \
+        "$CONDA_BIN" create -y -n "$CONDA_ENV_COLABFOLD" python=3.10 openmm -c conda-forge || true
 
-    echo -e "Installing colabfold package into $CONDA_ENV_COLABFOLD via pip..."
-    "$CONDA_BIN" run -n "$CONDA_ENV_COLABFOLD" pip install --no-warn-conflicts "colabfold[alphafold-minus-jax]" 2>/dev/null || \
-    "$CONDA_BIN" run -n "$CONDA_ENV_COLABFOLD" pip install --no-warn-conflicts colabfold 2>/dev/null || true
+        echo -e "Installing colabfold package into $CONDA_ENV_COLABFOLD via pip..."
+        "$CONDA_BIN" run -n "$CONDA_ENV_COLABFOLD" pip install --no-warn-conflicts "colabfold[alphafold-minus-jax]" 2>/dev/null || \
+        "$CONDA_BIN" run -n "$CONDA_ENV_COLABFOLD" pip install --no-warn-conflicts colabfold 2>/dev/null || true
+    fi
 
     echo -e "\n${GREEN}[✓] Environments configured successfully!${NC}"
 }
@@ -305,6 +326,16 @@ build_environments() {
 # Task 7: Generate Portable config.env
 # ------------------------------------------------------------------------------
 write_config() {
+    CONDA_BIN=$(find_conda)
+    local resolved_rfdiff=""
+    local resolved_mpnn=""
+    local resolved_colabfold=""
+    if [ -n "$CONDA_BIN" ]; then
+        resolved_rfdiff="$("$CONDA_BIN" run -n "$CONDA_ENV_RFDIFF" which python 2>/dev/null || true)"
+        resolved_mpnn="$("$CONDA_BIN" run -n "$CONDA_ENV_MPNN" which python 2>/dev/null || true)"
+        resolved_colabfold="$("$CONDA_BIN" run -n "$CONDA_ENV_COLABFOLD" which colabfold_batch 2>/dev/null || true)"
+    fi
+
     cat << EOF > "$INSTALL_DIR/config.env"
 # Autogenerated by install.sh on $(date)
 RFDIFF_DIR="$LOCAL_TOOLS_DIR/RFdiffusion"
@@ -317,6 +348,16 @@ CONDA_ENV_COLABFOLD="$CONDA_ENV_COLABFOLD"
 AUTOSCAFFOLD_REPO_URL="$REPO_URL"
 AUTOSCAFFOLD_BRANCH="$BRANCH"
 EOF
+    if [ -n "$resolved_rfdiff" ] && [ -x "$resolved_rfdiff" ]; then
+        echo "PYTHON_RFDIFF=\"$resolved_rfdiff\"" >> "$INSTALL_DIR/config.env"
+    fi
+    if [ -n "$resolved_mpnn" ] && [ -x "$resolved_mpnn" ]; then
+        echo "PYTHON_MPNN=\"$resolved_mpnn\"" >> "$INSTALL_DIR/config.env"
+    fi
+    if [ -n "$resolved_colabfold" ] && [ -x "$resolved_colabfold" ]; then
+        echo "COLABFOLD_CMD=\"$resolved_colabfold\"" >> "$INSTALL_DIR/config.env"
+    fi
+
     echo -e "${GREEN}[✓] Saved portable configuration to $INSTALL_DIR/config.env${NC}"
 }
 
@@ -482,8 +523,8 @@ case "$1" in
         download_weights
         exit 0
         ;;
-    --envs|envs)
-        build_environments
+    --env|--envs|-e|envs)
+        build_environments "${2:-all}"
         write_config
         exit 0
         ;;
