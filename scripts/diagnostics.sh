@@ -129,5 +129,10 @@ check_env_exists "$CONDA_ENV_RFDIFF"
 check_env_exists "$CONDA_ENV_MPNN"
 check_env_exists "$CONDA_ENV_COLABFOLD"
 
+if [ -f "$SCRIPT_DIR/scripts/diagnose_environment.py" ]; then
+    echo -e "\n${CYAN}>>> Running Deep Connectivity & Dependency Import Probe <<<${NC}\n"
+    "${PYTHON_BIN:-python3}" "$SCRIPT_DIR/scripts/diagnose_environment.py"
+fi
+
 echo -e "\n${CYAN}======================================================${NC}"
 echo -e "${GREEN}Diagnostics check finished.${NC}\n"

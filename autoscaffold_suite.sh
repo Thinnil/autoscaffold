@@ -123,8 +123,10 @@ if [ ${#ARGS[@]} -gt 0 ]; then
             [ -f "$SCRIPT_DIR/chimera_scaffold.sh" ] || { echo -e "${RED}[ERROR] Script not found: $SCRIPT_DIR/chimera_scaffold.sh${NC}"; exit 1; }
             exec bash "$SCRIPT_DIR/chimera_scaffold.sh" "${CMD_REST[@]}"
             ;;
-        doctor|diagnostics|diag)
-            if [ -f "$SCRIPT_DIR/scripts/system_doctor.py" ] && command -v python3 >/dev/null 2>&1; then
+        doctor|diagnostics|diag|diagnose|probe|check)
+            if [ -f "$SCRIPT_DIR/diagnose_all.sh" ]; then
+                exec bash "$SCRIPT_DIR/diagnose_all.sh" "${CMD_REST[@]}"
+            elif [ -f "$SCRIPT_DIR/scripts/system_doctor.py" ] && command -v python3 >/dev/null 2>&1; then
                 exec python3 "$SCRIPT_DIR/scripts/system_doctor.py" "${CMD_REST[@]}"
             elif [ -f "$SCRIPT_DIR/scripts/system_doctor.py" ] && command -v python >/dev/null 2>&1; then
                 exec python "$SCRIPT_DIR/scripts/system_doctor.py" "${CMD_REST[@]}"
@@ -234,7 +236,9 @@ case "$WORKFLOW_CHOICE" in
         exec bash "$SCRIPT_DIR/chimera_scaffold.sh"
         ;;
     5)
-        if [ -f "$SCRIPT_DIR/scripts/system_doctor.py" ] && command -v python3 >/dev/null 2>&1; then
+        if [ -f "$SCRIPT_DIR/diagnose_all.sh" ]; then
+            exec bash "$SCRIPT_DIR/diagnose_all.sh"
+        elif [ -f "$SCRIPT_DIR/scripts/system_doctor.py" ] && command -v python3 >/dev/null 2>&1; then
             exec python3 "$SCRIPT_DIR/scripts/system_doctor.py"
         elif [ -f "$SCRIPT_DIR/scripts/system_doctor.py" ] && command -v python >/dev/null 2>&1; then
             exec python "$SCRIPT_DIR/scripts/system_doctor.py"
