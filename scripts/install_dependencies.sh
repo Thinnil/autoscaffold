@@ -143,4 +143,19 @@ AUTOSCAFFOLD_BRANCH="$AUTOSCAFFOLD_BRANCH"
 EOF
 
 echo -e "\n${GREEN}Saved customized paths to $SCRIPT_DIR/config.env${NC}"
+
+# Automatically establish global 'autoscaffold' command in user space
+if [ -f "$SCRIPT_DIR/install.sh" ]; then
+    bash "$SCRIPT_DIR/install.sh" launcher || true
+elif [ -f "$SCRIPT_DIR/autoscaffold" ]; then
+    TARGET_BIN="${HOME}/.local/bin"
+    mkdir -p "$TARGET_BIN" 2>/dev/null || true
+    if [ -d "$TARGET_BIN" ] && [ -w "$TARGET_BIN" ]; then
+        ln -sf "$SCRIPT_DIR/autoscaffold" "$TARGET_BIN/autoscaffold" 2>/dev/null || true
+        chmod 755 "$TARGET_BIN/autoscaffold" 2>/dev/null || true
+        [ -n "$HOME" ] && echo "$SCRIPT_DIR" > "$HOME/.autoscaffold_home" 2>/dev/null || true
+        echo -e "${GREEN}[✓] Global 'autoscaffold' command installed to $TARGET_BIN/autoscaffold${NC}"
+    fi
+fi
+
 echo -e "${GREEN}Installation process complete!${NC}\n"

@@ -68,6 +68,13 @@ fi
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/scripts/env_setup.sh"
 
+# Ensure global 'autoscaffold' command is active in user space
+if [ -n "$HOME" ] && [ -d "$HOME" ] && [ -w "$HOME" ] && [ ! -e "$HOME/.local/bin/autoscaffold" ]; then
+    if [ -f "$SCRIPT_DIR/install.sh" ]; then
+        bash "$SCRIPT_DIR/install.sh" launcher >/dev/null 2>&1 || true
+    fi
+fi
+
 # ------------------------------------------------------------------------------
 # CLI Subcommand Routing
 # ------------------------------------------------------------------------------

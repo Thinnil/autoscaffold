@@ -512,6 +512,21 @@ class SystemDoctor:
         self.envs_info = inspect_virtual_environments(use_cache=use_cache)
         self.weights_info = inspect_model_weights(use_cache=use_cache)
         self.git_status = get_git_sync_status(REPO_ROOT)
+        self.launcher_status = self._check_launcher_status()
+
+    def _check_launcher_status(self) -> Dict[str, Any]:
+        """Checks if the global 'autoscaffold' command is active in PATH and ~/.local/bin."""
+        home = os.path.expanduser("~")
+        local_bin = os.path.join(home, ".local", "bin", "autoscaffold")
+        sys_bin = "/usr/local/bin/autoscaffold"
+        in_path = shutil.which("autoscaffold") is not None
+        installed = os.path.exists(local_bin) or os.path.exists(sys_bin)
+        path = shutil.which("autoscaffold") or (local_bin if os.path.exists(local_bin) else None)
+        return {
+            "installed": installed or in_path,
+            "in_path": in_path,
+            "path": path,
+        }
 
     def evaluate_verdict(self) -> Tuple[str, List[str]]:
         """Computes system operational status and actionable remediation steps."""
@@ -563,6 +578,7 @@ class SystemDoctor:
         return {
             "autoscaffold_version": __version__,
             "git_sync_status": self.git_status,
+            "launcher_shortcut": self.launcher_status,
             "host_system": self.host_info,
             "accelerators": self.cuda_info,
             "package_managers": self.managers_info,
@@ -590,6 +606,13 @@ class SystemDoctor:
         )
         print(host_line)
         print(f"[+] Upstream Sync: {self.git_status}")
+
+        if self.launcher_status["in_path"]:
+            print(f"[+] CLI Shortcut: Active in PATH ({self.launcher_status['path']})")
+        elif self.launcher_status["installed"]:
+            print(f"[!] CLI Shortcut: Installed at {self.launcher_status['path']} (Add to PATH in ~/.bashrc)")
+        else:
+            print("[!] CLI Shortcut: Not installed. Run './install.sh launcher' for global 'autoscaffold' command.")
 
         if self.cuda_info["cuda_authorized"]:
             dev_name = self.cuda_info["torch_cuda_device_name"] or "NVIDIA GPU"

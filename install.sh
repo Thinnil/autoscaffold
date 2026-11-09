@@ -443,16 +443,9 @@ express_setup() {
     build_environments
     write_config
 
-    if [ -t 0 ]; then
-        echo ""
-        read -r -p "▶ Would you like to create a global 'autoscaffold' shortcut in ~/.local/bin? [Y/n]: " PROMPT_SHORTCUT
-        PROMPT_SHORTCUT=${PROMPT_SHORTCUT:-Y}
-        if [[ "$PROMPT_SHORTCUT" =~ ^[Yy]$ ]]; then
-            install_launcher
-        fi
-    else
-        install_launcher || true
-    fi
+    # Automatically install the global CLI shortcut (~/.local/bin/autoscaffold)
+    echo -e "\n${CYAN}Establishing global 'autoscaffold' command in user space...${NC}"
+    install_launcher || true
 
     echo -e "\n${GREEN}======================================================================${NC}"
     echo -e "${GREEN}  🎉 AUTOSCAFFOLD INSTALLATION & ENVIRONMENT SETUP COMPLETE! 🎉       ${NC}"
