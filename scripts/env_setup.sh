@@ -377,6 +377,8 @@ discover_conda_python() {
     local enable_deep="${3:-1}"
     local candidate=""
 
+    local force_refresh="${4:-0}"
+
     [ -z "$target_env" ] && return 1
 
     # Validate target_env format to prevent directory traversal and injection
@@ -389,9 +391,13 @@ discover_conda_python() {
         return 1
     fi
 
-    # Session caching: return instantly if already resolved for this session
+    # Session caching: return instantly if already resolved for this session unless force refresh requested
     local _cache_key="_CACHE_DISC_PY_${target_env}_${req_module}"
     _cache_key="${_cache_key//[^a-zA-Z0-9_]/_}"
+    if [ "$force_refresh" -eq 1 ]; then
+        unset "$_cache_key"
+        _CACHED_CONDA_ENVS_INFO=""
+    fi
     if [ -n "${!_cache_key:-}" ]; then
         if [ "${!_cache_key}" = "__NONE__" ]; then
             echo ""

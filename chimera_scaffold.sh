@@ -708,7 +708,20 @@ interactive_environment_healing_menu() {
                 fi
                 local recheck_py="${PYTHON_RFDIFF:-}"
                 if [ -z "$recheck_py" ] || [ ! -x "$recheck_py" ] || ! "$recheck_py" -c "import torch, hydra" >/dev/null 2>&1; then
-                    recheck_py="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 1 2>/dev/null || true)"
+                    recheck_py="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 1 1 2>/dev/null || true)"
+                fi
+                if [ -z "$recheck_py" ] || [ ! -x "$recheck_py" ] || ! "$recheck_py" -c "import torch, hydra" >/dev/null 2>&1; then
+                    for direct_cand in \
+                        "$MAMBA_ROOT_PREFIX/envs/${CONDA_ENV_RFDIFF:-SE3nv}/bin/python" \
+                        "$HOME/micromamba/envs/${CONDA_ENV_RFDIFF:-SE3nv}/bin/python" \
+                        "$HOME/.micromamba/envs/${CONDA_ENV_RFDIFF:-SE3nv}/bin/python" \
+                        "/data1/mgs/micromamba/envs/${CONDA_ENV_RFDIFF:-SE3nv}/bin/python" \
+                        "$LOCAL_ENVS_DIR/${CONDA_ENV_RFDIFF:-SE3nv}/bin/python"; do
+                        if [ -f "$direct_cand" ] && [ -x "$direct_cand" ] && "$direct_cand" -c "import torch, hydra" >/dev/null 2>&1; then
+                            recheck_py="$direct_cand"
+                            break
+                        fi
+                    done
                 fi
                 if [ -n "$recheck_py" ] && [ -x "$recheck_py" ] && "$recheck_py" -c "import torch, hydra" >/dev/null 2>&1; then
                     echo -e "${GREEN}[✓] Verified environment '${CONDA_ENV_RFDIFF:-SE3nv}': $recheck_py${NC}"
