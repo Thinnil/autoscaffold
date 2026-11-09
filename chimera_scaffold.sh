@@ -622,7 +622,8 @@ except Exception:
         3|vessel_interface) VESSEL_REDESIGN_MODE="vessel_interface" ;;
         *) VESSEL_REDESIGN_MODE="${VESSEL_REDESIGN_MODE:-linkers_only}" ;;
     esac
-    read -r -e -p "\n▶ 11. Output directory [Default: $OUT_DIR]: " INP_OD
+    echo -e ""
+    read -r -e -p "▶ 11. Output directory [Default: $OUT_DIR]: " INP_OD
     OUT_DIR=${INP_OD:-$OUT_DIR}
 fi
 
