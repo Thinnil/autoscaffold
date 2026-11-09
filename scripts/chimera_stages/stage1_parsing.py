@@ -13,7 +13,13 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+try:
+    from scripts.dataclass_compat import dataclass, field
+except ImportError:
+    try:
+        from .dataclass_compat import dataclass, field
+    except ImportError:
+        from dataclass_compat import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -35,7 +41,6 @@ try:
         safe_join_path,
         validate_output_dir,
         write_atoms_to_pdb,
-        SafeSessionUnpickler,
     )
 except ImportError:
     from pse_pdb_extractor import (
@@ -45,7 +50,6 @@ except ImportError:
         safe_join_path,
         validate_output_dir,
         write_atoms_to_pdb,
-        SafeSessionUnpickler,
     )
 
 ONE_TO_THREE = {

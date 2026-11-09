@@ -12,6 +12,14 @@ single-responsibility, decoupled stages:
 """
 
 try:
+    from scripts.dataclass_compat import dataclass, field, asdict, is_dataclass
+except ImportError:
+    try:
+        from .dataclass_compat import dataclass, field, asdict, is_dataclass
+    except ImportError:
+        from dataclass_compat import dataclass, field, asdict, is_dataclass
+
+try:
     from .stage1_parsing import (
         ONE_TO_THREE,
         _RE_SANITIZE_IDENT,
@@ -175,6 +183,11 @@ except (ImportError, ValueError):
     )
 
 __all__ = [
+    # Dataclass Compat
+    "dataclass",
+    "field",
+    "asdict",
+    "is_dataclass",
     # Stage 1
     "ONE_TO_THREE",
     "_RE_SANITIZE_IDENT",

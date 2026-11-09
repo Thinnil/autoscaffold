@@ -18,7 +18,13 @@ import shlex
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+try:
+    from scripts.dataclass_compat import dataclass, field
+except ImportError:
+    try:
+        from .dataclass_compat import dataclass, field
+    except ImportError:
+        from dataclass_compat import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Resolve scripts directory for helper modules

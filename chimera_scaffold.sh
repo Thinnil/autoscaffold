@@ -654,13 +654,13 @@ LOG_FILE="$ABS_OUT_DIR/run.log"
 
 # Resolve neural model Python binaries if not explicitly configured
 if [ -z "$PYTHON_RFDIFF" ] || [ ! -x "$PYTHON_RFDIFF" ] || ! "$PYTHON_RFDIFF" -c "import torch" >/dev/null 2>&1; then
-    PYTHON_RFDIFF="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 2>/dev/null || true)"
-    [ -z "$PYTHON_RFDIFF" ] && PYTHON_RFDIFF="$(discover_conda_python "rfdiffusion" "torch" 2>/dev/null || true)"
+    PYTHON_RFDIFF="$(discover_conda_python "${CONDA_ENV_RFDIFF:-SE3nv}" "torch" 1 2>/dev/null || true)"
+    [ -z "$PYTHON_RFDIFF" ] && PYTHON_RFDIFF="$(discover_conda_python "rfdiffusion" "torch" 1 2>/dev/null || true)"
 fi
 
 if [ -z "$PYTHON_MPNN" ] || [ ! -x "$PYTHON_MPNN" ] || ! "$PYTHON_MPNN" -c "import torch" >/dev/null 2>&1; then
-    PYTHON_MPNN="$(discover_conda_python "${CONDA_ENV_MPNN:-mlfold}" "torch" 2>/dev/null || true)"
-    [ -z "$PYTHON_MPNN" ] && PYTHON_MPNN="$(discover_conda_python "SE3nv" "torch" 2>/dev/null || true)"
+    PYTHON_MPNN="$(discover_conda_python "${CONDA_ENV_MPNN:-mlfold}" "torch" 1 2>/dev/null || true)"
+    [ -z "$PYTHON_MPNN" ] && PYTHON_MPNN="$(discover_conda_python "SE3nv" "torch" 1 2>/dev/null || true)"
     [ -z "$PYTHON_MPNN" ] && [ -n "$PYTHON_RFDIFF" ] && PYTHON_MPNN="$PYTHON_RFDIFF"
 fi
 
@@ -793,7 +793,44 @@ fi
 
 # Activate environment if configured
 if [ -n "$CONDA_ENV_RFDIFF" ]; then
-    activate_env "$CONDA_ENV_RFDIFF" 2>/dev/null || true
+    echo -e "${CYAN}[*] Attempting to activate environment: ${CONDA_ENV_RFDIFF}...${NC}"
+    if activate_env "$CONDA_ENV_RFDIFF" 2>/dev/null && [ -n "${CONDA_PREFIX:-}" ]; then
+        echo -e "${GREEN}[✓] Successfully activated environment: ${CONDA_ENV_RFDIFF}${NC}"
+        if [ -x "$CONDA_PREFIX/bin/python" ]; then
+            PYTHON_BIN="$CONDA_PREFIX/bin/python"
+            CMD_ARGS[0]="$PYTHON_BIN"
+        elif [ -x "$CONDA_PREFIX/python.exe" ]; then
+            PYTHON_BIN="$CONDA_PREFIX/python.exe"
+            CMD_ARGS[0]="$PYTHON_BIN"
+        fi
+    else
+        echo -e "${YELLOW}[!] Notice: Conda activation for '${CONDA_ENV_RFDIFF}' could not be completed. Falling back to direct interpreter resolution.${NC}"
+    fi
+fi
+
+# Pre-flight interpreter upgrade safeguard: Ensure CMD_ARGS[0] is modern (Python >= 3.8)
+_PY_VER=$("$PYTHON_BIN" -c "import sys; print(sys.version_info[0]*10 + sys.version_info[1])" 2>/dev/null || echo "36")
+
+if [ "$_PY_VER" -lt 38 ]; then
+    _TARGET_ENV="${CONDA_ENV_RFDIFF:-SE3nv}"
+    _DISCOVERED_PY=$(discover_conda_python "$_TARGET_ENV" "dataclasses" 2>/dev/null || true)
+    [ -z "$_DISCOVERED_PY" ] && _DISCOVERED_PY=$(discover_conda_python "${CONDA_ENV_MPNN:-mlfold}" "dataclasses" 2>/dev/null || true)
+
+    if [ -n "$_DISCOVERED_PY" ] && [ -f "$_DISCOVERED_PY" ] && [ -x "$_DISCOVERED_PY" ]; then
+        echo -e "${YELLOW}[!] Host Python is ${_PY_VER} (< 3.8). Auto-promoting PYTHON_BIN to discovered environment: ${_DISCOVERED_PY}${NC}"
+        PYTHON_BIN="$_DISCOVERED_PY"
+        CMD_ARGS[0]="$PYTHON_BIN"
+    elif [ -n "${PYTHON_RFDIFF:-}" ] && [ -f "$PYTHON_RFDIFF" ] && [ -x "$PYTHON_RFDIFF" ]; then
+        echo -e "${YELLOW}[!] Host Python is ${_PY_VER} (< 3.8). Auto-promoting PYTHON_BIN to PYTHON_RFDIFF: ${PYTHON_RFDIFF}${NC}"
+        PYTHON_BIN="$PYTHON_RFDIFF"
+        CMD_ARGS[0]="$PYTHON_BIN"
+    elif [ -n "${PYTHON_MPNN:-}" ] && [ -f "$PYTHON_MPNN" ] && [ -x "$PYTHON_MPNN" ]; then
+        echo -e "${YELLOW}[!] Host Python is ${_PY_VER} (< 3.8). Auto-promoting PYTHON_BIN to PYTHON_MPNN: ${PYTHON_MPNN}${NC}"
+        PYTHON_BIN="$PYTHON_MPNN"
+        CMD_ARGS[0]="$PYTHON_BIN"
+    else
+        echo -e "${YELLOW}[WARN] Executing on Python < 3.8 host interpreter with dataclass_compat shim.${NC}"
+    fi
 fi
 
 "${CMD_ARGS[@]}"

@@ -12,7 +12,13 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+try:
+    from scripts.dataclass_compat import dataclass, field
+except ImportError:
+    try:
+        from .dataclass_compat import dataclass, field
+    except ImportError:
+        from dataclass_compat import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Resolve scripts directory for imports

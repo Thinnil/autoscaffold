@@ -52,6 +52,15 @@ except ImportError:
         def get_version() -> str:
             return __version__
 
+# Dataclass Compatibility Layer
+try:
+    from scripts.dataclass_compat import dataclass, field, asdict, is_dataclass  # noqa: E402, F401
+except ImportError:
+    try:
+        from .dataclass_compat import dataclass, field, asdict, is_dataclass  # noqa: E402, F401
+    except ImportError:
+        from dataclass_compat import dataclass, field, asdict, is_dataclass  # noqa: E402, F401
+
 # 1. Stage 1 Imports & Re-exports
 from chimera_stages.stage1_parsing import (  # noqa: E402, F401
     ONE_TO_THREE,

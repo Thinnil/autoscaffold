@@ -15,6 +15,24 @@ if [ -n "$AUTOSCAFFOLD_HOME" ] && [ -f "$AUTOSCAFFOLD_HOME/scripts/env_setup.sh"
 elif [ -z "$SCRIPT_DIR" ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
+if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" = "/" ] || [ "$SCRIPT_DIR" = "\\" ] || [[ "$SCRIPT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
+    echo -e "\033[0;31m[ERROR] Dangerous or invalid SCRIPT_DIR in env_setup.sh: '$SCRIPT_DIR'\033[0m" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+# Security sanitization helper to reject shell injection and directory traversal
+_is_unsafe_path() {
+    local p="$1"
+    [ -z "$p" ] && return 0
+    case "$p" in
+        *[\;\&\|\`\>\<\$]*|*..*|*[$'\n'$'\r']*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
 # Load user configuration if present
 if [ -f "$SCRIPT_DIR/config.env" ]; then
@@ -26,24 +44,135 @@ elif [ -f "$SCRIPT_DIR/config.env.example" ]; then
 fi
 
 # Version Single Source of Truth
-AUTOSCAFFOLD_VERSION=$(python3 -c "import sys, os; sys.path.insert(0, os.path.join(sys.argv[1], 'scripts')); from version import __version__; print(__version__)" "$SCRIPT_DIR" 2>/dev/null || python -c "import sys, os; sys.path.insert(0, os.path.join(sys.argv[1], 'scripts')); from version import __version__; print(__version__)" "$SCRIPT_DIR" 2>/dev/null || echo "2.2.0")
-export AUTOSCAFFOLD_VERSION
+if [ -z "${AUTOSCAFFOLD_VERSION:-}" ]; then
+    AUTOSCAFFOLD_VERSION=$(sed -n 's/^__version__ = ["'\''\([0-9.]*\)["'\''].*$/\1/p' "$SCRIPT_DIR/scripts/version.py" 2>/dev/null || true)
+    [ -z "$AUTOSCAFFOLD_VERSION" ] && AUTOSCAFFOLD_VERSION=$(python3 -c "import sys, os; sys.path.insert(0, os.path.join(sys.argv[1], 'scripts')); from version import __version__; print(__version__)" "$SCRIPT_DIR" 2>/dev/null || python -c "import sys, os; sys.path.insert(0, os.path.join(sys.argv[1], 'scripts')); from version import __version__; print(__version__)" "$SCRIPT_DIR" 2>/dev/null || echo "2.2.0")
+    export AUTOSCAFFOLD_VERSION
+fi
 
-# Discover and export general Python interpreter (prioritizing python3 over unaliased python)
+# Discover and export general Python interpreter with capability-aware multi-tier resolution
 if [ -z "${PYTHON_BIN:-}" ] || [ ! -x "${PYTHON_BIN:-}" ]; then
-    if command -v python3 >/dev/null 2>&1; then
-        PYTHON_BIN="$(command -v python3)"
-    elif command -v python >/dev/null 2>&1; then
-        PYTHON_BIN="$(command -v python)"
-    elif [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
-        PYTHON_BIN="$CONDA_PREFIX/bin/python"
-    elif [ -n "${PYTHON_RFDIFF:-}" ] && [ -x "$PYTHON_RFDIFF" ]; then
-        PYTHON_BIN="$PYTHON_RFDIFF"
-    elif [ -n "${PYTHON_MPNN:-}" ] && [ -x "$PYTHON_MPNN" ]; then
-        PYTHON_BIN="$PYTHON_MPNN"
-    else
-        PYTHON_BIN="python"
+    _RESOLVED_PYTHON=""
+
+    _probe_py() {
+        local py="$1"
+        local req_np="${2:-0}"
+        if [ -z "$py" ] || [ ! -f "$py" ] || [ ! -x "$py" ]; then
+            return 1
+        fi
+        # Strictly reject paths containing shell injection characters or directory traversal
+        if _is_unsafe_path "$py"; then
+            return 1
+        fi
+        # Enforce that candidate executable is a legitimate Python binary
+        local base_py
+        base_py="$(basename "$py")"
+        if [[ ! "$base_py" =~ ^[pP][yY][tT][hH][oO][nN]([0-9]+(\.[0-9]+)?)?(\.[eE][xX][eE])?$ ]]; then
+            return 1
+        fi
+        if [ "$req_np" -eq 1 ]; then
+            "$py" -c "import sys, dataclasses, numpy; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >/dev/null 2>&1
+        else
+            "$py" -c "import sys, dataclasses; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >/dev/null 2>&1
+        fi
+    }
+
+    # Tier 1: Check active virtual environment
+    if [ -n "${CONDA_PREFIX:-}" ]; then
+        for cand in "$CONDA_PREFIX/bin/python" "$CONDA_PREFIX/python.exe" "$CONDA_PREFIX/python"; do
+            if _probe_py "$cand" 1; then
+                _RESOLVED_PYTHON="$cand"
+                break
+            fi
+        done
     fi
+
+    # Tier 2: Check system python3 / python (>= 3.8 with dataclasses and numpy)
+    if [ -z "$_RESOLVED_PYTHON" ]; then
+        for sys_cmd in python3 python; do
+            if command -v "$sys_cmd" >/dev/null 2>&1; then
+                _SYS_CAND="$(command -v "$sys_cmd")"
+                # Skip WindowsApps redirector stubs on Windows which lack scientific libraries
+                if [[ "$_SYS_CAND" == *"WindowsApps"* ]]; then
+                    continue
+                fi
+                if _probe_py "$_SYS_CAND" 1; then
+                    _RESOLVED_PYTHON="$_SYS_CAND"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    # Tier 2b: Fallback if neither has numpy, check if either has dataclasses and >= 3.8
+    if [ -z "$_RESOLVED_PYTHON" ]; then
+        for sys_cmd in python3 python; do
+            if command -v "$sys_cmd" >/dev/null 2>&1; then
+                _SYS_CAND="$(command -v "$sys_cmd")"
+                if _probe_py "$_SYS_CAND" 0; then
+                    _RESOLVED_PYTHON="$_SYS_CAND"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    # Tier 3: Scan standard Conda/Micromamba root directories for Python >= 3.8 with dataclasses and numpy
+    if [ -z "$_RESOLVED_PYTHON" ]; then
+        _SCAN_ROOTS=(
+            "${LOCAL_ENVS_DIR:-}"
+            "$HOME/.micromamba/envs"
+            "$HOME/micromamba/envs"
+            "$HOME/.local/share/mamba/envs"
+            "$HOME/miniconda3/envs"
+            "$HOME/miniforge3/envs"
+            "$HOME/mambaforge/envs"
+            "$HOME/anaconda3/envs"
+            "/opt/conda/envs"
+            "/usr/local/miniconda3/envs"
+        )
+        for s_root in "${_SCAN_ROOTS[@]}"; do
+            [ -z "$s_root" ] || [ ! -d "$s_root" ] && continue
+            if _is_unsafe_path "$s_root"; then
+                continue
+            fi
+            for env_dir in "$s_root"/*; do
+                [ -z "$env_dir" ] || [ ! -d "$env_dir" ] && continue
+                if _is_unsafe_path "$env_dir"; then
+                    continue
+                fi
+                for cand in "$env_dir/bin/python" "$env_dir/python.exe" "$env_dir/python"; do
+                    [ -z "$cand" ] || [ ! -f "$cand" ] || [ ! -x "$cand" ] && continue
+                    if _probe_py "$cand" 1; then
+                        _RESOLVED_PYTHON="$cand"
+                        break 3
+                    fi
+                done
+            done
+        done
+    fi
+
+    # Tier 4: Tool-specific Python fallbacks
+    if [ -z "$_RESOLVED_PYTHON" ]; then
+        if [ -n "${PYTHON_RFDIFF:-}" ] && [ -x "$PYTHON_RFDIFF" ]; then
+            _RESOLVED_PYTHON="$PYTHON_RFDIFF"
+        elif [ -n "${PYTHON_MPNN:-}" ] && [ -x "$PYTHON_MPNN" ]; then
+            _RESOLVED_PYTHON="$PYTHON_MPNN"
+        fi
+    fi
+
+    # Tier 5: Host fallback (python3 or python)
+    if [ -z "$_RESOLVED_PYTHON" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            _RESOLVED_PYTHON="$(command -v python3)"
+        elif command -v python >/dev/null 2>&1; then
+            _RESOLVED_PYTHON="$(command -v python)"
+        else
+            _RESOLVED_PYTHON="python3"
+        fi
+    fi
+
+    PYTHON_BIN="$_RESOLVED_PYTHON"
 fi
 export PYTHON_BIN
 
@@ -120,9 +249,11 @@ find_micromamba_bin() {
         "$HOME/micromamba/micromamba" \
         "/usr/local/bin/micromamba" \
         "/opt/conda/bin/micromamba"; do
-        if [ -n "$cand" ] && [ -x "$cand" ]; then
-            echo "$cand"
-            return 0
+        if [ -n "$cand" ] && [ -f "$cand" ] && [ -x "$cand" ]; then
+            if ! _is_unsafe_path "$cand"; then
+                echo "$cand"
+                return 0
+            fi
         fi
     done
     return 1
@@ -154,9 +285,11 @@ find_conda_bin() {
             "$HOME/anaconda3/bin/conda" \
             "/opt/conda/bin/conda" \
             "/usr/local/miniconda3/bin/conda"; do
-            if [ -n "$cand" ] && [ -x "$cand" ]; then
-                _CACHED_CONDA_BIN="$cand"
-                break
+            if [ -n "$cand" ] && [ -f "$cand" ] && [ -x "$cand" ]; then
+                if ! _is_unsafe_path "$cand"; then
+                    _CACHED_CONDA_BIN="$cand"
+                    break
+                fi
             fi
         done
     fi
@@ -236,16 +369,49 @@ run_in_env() {
 }
 
 # Function to discover python executable for a target conda environment across standard roots
+_CACHED_CONDA_ENVS_INFO=""
+
 discover_conda_python() {
     local target_env="$1"
     local req_module="${2:-}"
+    local enable_deep="${3:-0}"
     local candidate=""
 
     [ -z "$target_env" ] && return 1
 
+    # Validate target_env format to prevent directory traversal and injection
+    if [[ ! "$target_env" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        return 1
+    fi
+
+    # Validate req_module identifier to prevent arbitrary Python code injection
+    if [ -n "$req_module" ] && [[ ! "$req_module" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+        return 1
+    fi
+
+    # Session caching: return instantly if already resolved for this session
+    local _cache_key="_CACHE_DISC_PY_${target_env}_${req_module}"
+    _cache_key="${_cache_key//[^a-zA-Z0-9_]/_}"
+    if [ -n "${!_cache_key:-}" ]; then
+        if [ "${!_cache_key}" = "__NONE__" ]; then
+            echo ""
+            return 0
+        fi
+        echo "${!_cache_key}"
+        return 0
+    fi
+
     _verify_python() {
         local py="$1"
-        if [ -z "$py" ] || [ ! -x "$py" ]; then
+        if [ -z "$py" ] || [ ! -f "$py" ] || [ ! -x "$py" ]; then
+            return 1
+        fi
+        if _is_unsafe_path "$py"; then
+            return 1
+        fi
+        local base_py
+        base_py="$(basename "$py")"
+        if [[ ! "$base_py" =~ ^[pP][yY][tT][hH][oO][nN]([0-9]+(\.[0-9]+)?)?(\.[eE][xX][eE])?$ ]]; then
             return 1
         fi
         if [ -n "$req_module" ]; then
@@ -258,11 +424,13 @@ discover_conda_python() {
     # 1. Early exit: Check if an environment variable is already exported for this env/tool
     if [ "$target_env" = "SE3nv" ] || [ "$target_env" = "rfdiffusion" ]; then
         if [ -n "${PYTHON_RFDIFF:-}" ] && _verify_python "$PYTHON_RFDIFF"; then
+            printf -v "$_cache_key" "%s" "$PYTHON_RFDIFF"
             echo "$PYTHON_RFDIFF"
             return 0
         fi
     elif [ "$target_env" = "mlfold" ]; then
         if [ -n "${PYTHON_MPNN:-}" ] && _verify_python "$PYTHON_MPNN"; then
+            printf -v "$_cache_key" "%s" "$PYTHON_MPNN"
             echo "$PYTHON_MPNN"
             return 0
         fi
@@ -272,6 +440,7 @@ discover_conda_python() {
     upper_env="${upper_env//[^A-Z0-9]/_}"
     local env_var="PYTHON_${upper_env}"
     if [ -n "${!env_var:-}" ] && _verify_python "${!env_var}"; then
+        printf -v "$_cache_key" "%s" "${!env_var}"
         echo "${!env_var}"
         return 0
     fi
@@ -279,8 +448,9 @@ discover_conda_python() {
     # 2. Early exit: Check if active conda environment matches
     if [ -n "$CONDA_PREFIX" ]; then
         if [ "$CONDA_DEFAULT_ENV" = "$target_env" ] || [ "${CONDA_PREFIX##*/}" = "$target_env" ]; then
-            for cand in "$CONDA_PREFIX/bin/python" "$CONDA_PREFIX/python.exe"; do
+            for cand in "$CONDA_PREFIX/bin/python" "$CONDA_PREFIX/python.exe" "$CONDA_PREFIX/python"; do
                 if _verify_python "$cand"; then
+                    printf -v "$_cache_key" "%s" "$cand"
                     echo "$cand"
                     return 0
                 fi
@@ -289,8 +459,9 @@ discover_conda_python() {
     fi
 
     # 3. Check local tools/envs directory
-    for cand in "$LOCAL_ENVS_DIR/$target_env/bin/python" "$LOCAL_ENVS_DIR/$target_env/python.exe"; do
+    for cand in "$LOCAL_ENVS_DIR/$target_env/bin/python" "$LOCAL_ENVS_DIR/$target_env/python.exe" "$LOCAL_ENVS_DIR/$target_env/python"; do
         if _verify_python "$cand"; then
+            printf -v "$_cache_key" "%s" "$cand"
             echo "$cand"
             return 0
         fi
@@ -312,8 +483,9 @@ discover_conda_python() {
         "/usr/local/miniconda3" \
         "/usr/local/anaconda3"; do
         if [ -d "$base_dir/envs/$target_env" ]; then
-            for cand in "$base_dir/envs/$target_env/bin/python" "$base_dir/envs/$target_env/python.exe"; do
+            for cand in "$base_dir/envs/$target_env/bin/python" "$base_dir/envs/$target_env/python.exe" "$base_dir/envs/$target_env/python"; do
                 if _verify_python "$cand"; then
+                    printf -v "$_cache_key" "%s" "$cand"
                     echo "$cand"
                     return 0
                 fi
@@ -321,22 +493,33 @@ discover_conda_python() {
         fi
     done
 
-    # 5. Fallback: Query conda info directly only if conda binary exists
-    local conda_bin
-    conda_bin="$(find_conda_bin 2>/dev/null || true)"
-    if [ -n "$conda_bin" ] && [ -x "$conda_bin" ]; then
-        local env_path
-        env_path="$("$conda_bin" info --envs 2>/dev/null | awk -v env="$target_env" '$1 == env {print $NF}' | head -n 1)"
-        if [ -n "$env_path" ]; then
-            for cand in "$env_path/bin/python" "$env_path/python.exe"; do
-                if _verify_python "$cand"; then
-                    echo "$cand"
-                    return 0
-                fi
-            done
+    # 5. Fallback: Query conda info directly only if deep search is enabled or cache is already warm
+    if [ "$enable_deep" -eq 1 ] || [ -n "$_CACHED_CONDA_ENVS_INFO" ]; then
+        if [ -z "$_CACHED_CONDA_ENVS_INFO" ]; then
+            local conda_bin
+            conda_bin="$(find_conda_bin 2>/dev/null || true)"
+            if [ -n "$conda_bin" ] && [ -x "$conda_bin" ]; then
+                _CACHED_CONDA_ENVS_INFO="$("$conda_bin" info --envs 2>/dev/null || echo "")"
+            else
+                _CACHED_CONDA_ENVS_INFO="__NONE__"
+            fi
+        fi
+        if [ "$_CACHED_CONDA_ENVS_INFO" != "__NONE__" ]; then
+            local env_path
+            env_path="$(echo "$_CACHED_CONDA_ENVS_INFO" | awk -v env="$target_env" '$1 == env {print $NF}' | head -n 1)"
+            if [ -n "$env_path" ]; then
+                for cand in "$env_path/bin/python" "$env_path/python.exe" "$env_path/python"; do
+                    if _verify_python "$cand"; then
+                        printf -v "$_cache_key" "%s" "$cand"
+                        echo "$cand"
+                        return 0
+                    fi
+                done
+            fi
         fi
     fi
 
+    printf -v "$_cache_key" "%s" "__NONE__"
     echo ""
     return 0
 }
