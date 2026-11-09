@@ -15,7 +15,21 @@ trap 'echo -e "\n\n${YELLOW}[!] Operation cancelled by user.${NC}"; exit 130' IN
 if [ -n "$AUTOSCAFFOLD_HOME" ] && [ -f "$AUTOSCAFFOLD_HOME/autoscaffold_suite.sh" ]; then
     SCRIPT_DIR="$AUTOSCAFFOLD_HOME"
 else
-    SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    _RAW_SOURCE="${BASH_SOURCE[0]}"
+    while [ -h "$_RAW_SOURCE" ]; do
+        _RESOLVED_DIR="$(cd -P "$(dirname "$_RAW_SOURCE")" 2>/dev/null && pwd -P)"
+        _RAW_SOURCE="$(readlink "$_RAW_SOURCE")"
+        [[ $_RAW_SOURCE != /* ]] && _RAW_SOURCE="$_RESOLVED_DIR/$_RAW_SOURCE"
+    done
+    SCRIPT_DIR="$(cd -P "$(dirname "$_RAW_SOURCE")" 2>/dev/null && pwd -P)"
+fi
+
+# Fallback to ~/.autoscaffold_home if invoked directly or via an unlinked copy
+if [ ! -f "$SCRIPT_DIR/autoscaffold.sh" ] && [ -n "$HOME" ] && [ -f "$HOME/.autoscaffold_home" ]; then
+    _STORED_HOME="$(head -n 1 "$HOME/.autoscaffold_home" 2>/dev/null || true)"
+    if [ -n "$_STORED_HOME" ] && [ -f "$_STORED_HOME/autoscaffold_suite.sh" ]; then
+        SCRIPT_DIR="$_STORED_HOME"
+    fi
 fi
 if [ -z "$SCRIPT_DIR" ] || [ "$SCRIPT_DIR" = "/" ] || [ "$SCRIPT_DIR" = "\\" ] || [[ "$SCRIPT_DIR" =~ ^[a-zA-Z]:[\\/]?$ ]]; then
     echo -e "\033[0;31m[ERROR] Invalid or dangerous SCRIPT_DIR root: '$SCRIPT_DIR'.\033[0m"

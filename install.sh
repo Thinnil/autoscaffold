@@ -363,9 +363,8 @@ install_launcher() {
         rm -f "/usr/local/bin/autoscaffold" 2>/dev/null || true
     fi
 
-    # If ln -sf did not produce a true symlink (common on Windows Git Bash without native symlink rights),
-    # write a canonical launcher wrapper script that explicitly points to LAUNCHER_SRC.
-    if [ ! -L "$TARGET_BIN/autoscaffold" ]; then
+    # Write a robust canonical launcher wrapper script if ln -sf failed or if TARGET_BIN contains a copy
+    if [ ! -L "$TARGET_BIN/autoscaffold" ] || [ ! -f "$TARGET_BIN/autoscaffold" ]; then
         cat << EOF > "$TARGET_BIN/autoscaffold"
 #!/usr/bin/env bash
 AUTOSCAFFOLD_TARGET="$LAUNCHER_SRC"
@@ -378,6 +377,11 @@ exit 1
 EOF
     fi
     chmod 755 "$TARGET_BIN/autoscaffold" 2>/dev/null || true
+
+    # Clean up any lingering files downloaded erroneously into ~/.local/bin/scripts
+    if [ "$TARGET_BIN" = "$HOME/.local/bin" ] && [ -d "$TARGET_BIN/scripts" ] && [ ! -L "$TARGET_BIN/scripts" ]; then
+        rm -rf "$TARGET_BIN/scripts" 2>/dev/null || true
+    fi
 
     # Clean up any conflicting legacy shell aliases in rc files
     for RC_FILE in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_aliases"; do
