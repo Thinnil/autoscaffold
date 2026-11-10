@@ -342,12 +342,35 @@ def inspect_virtual_environments(use_cache: bool = True) -> Dict[str, Dict[str, 
     }
 
     home = os.path.expanduser("~")
+    cfg_env_vars: Dict[str, str] = {}
+    cfg_path = os.path.join(REPO_ROOT, "config.env")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        cfg_env_vars[k.strip()] = v.strip().strip("\"'")
+        except Exception:
+            pass
+
     conda_base_roots = [
+        os.path.join(home, ".micromamba"),
+        os.path.join(home, "micromamba"),
+        os.path.join(home, ".local", "share", "mamba"),
         os.path.join(home, "miniconda3"),
         os.path.join(home, "miniforge3"),
         os.path.join(home, "mambaforge"),
         os.path.join(home, "anaconda3"),
         os.path.join(home, ".conda"),
+        "/data1/mgs/micromamba",
+        "/data1/micromamba",
+        "/data1/miniconda3",
+        "/data1",
+        "/data2",
+        "/scratch",
+        "/mnt",
         "/opt/conda",
         r"C:\miniconda3",
         r"C:\anaconda3",
@@ -355,31 +378,46 @@ def inspect_virtual_environments(use_cache: bool = True) -> Dict[str, Dict[str, 
 
     for label, spec in target_envs.items():
         found_py = None
+        error_detail: Optional[str] = None
+
+        # Check explicit overrides from config.env or environment
+        if "SE3nv" in label:
+            explicit_py = os.environ.get("PYTHON_RFDIFF") or cfg_env_vars.get("PYTHON_RFDIFF")
+            if explicit_py and os.path.isfile(explicit_py):
+                found_py = explicit_py
+        elif "mlfold" in label:
+            explicit_py = os.environ.get("PYTHON_MPNN") or cfg_env_vars.get("PYTHON_MPNN")
+            if explicit_py and os.path.isfile(explicit_py):
+                found_py = explicit_py
+
         # Check active environment first
-        active_prefix = os.environ.get("CONDA_PREFIX")
-        active_env_name = os.environ.get("CONDA_DEFAULT_ENV", "")
+        if not found_py:
+            active_prefix = os.environ.get("CONDA_PREFIX")
+            active_env_name = os.environ.get("CONDA_DEFAULT_ENV", "")
 
-        for name in spec["names"]:
-            if active_env_name.lower() == name.lower() and active_prefix:
-                cand = os.path.join(active_prefix, "bin", "python")
-                if not os.path.isfile(cand):
-                    cand = os.path.join(active_prefix, "python.exe")
-                if os.path.isfile(cand):
-                    found_py = cand
-                    break
-
-            for base in conda_base_roots:
-                for cand in [
-                    os.path.join(base, "envs", name, "bin", "python"),
-                    os.path.join(base, "envs", name, "python.exe"),
-                ]:
+            for name in spec["names"]:
+                if active_env_name.lower() == name.lower() and active_prefix:
+                    cand = os.path.join(active_prefix, "bin", "python")
+                    if not os.path.isfile(cand):
+                        cand = os.path.join(active_prefix, "python.exe")
                     if os.path.isfile(cand):
                         found_py = cand
                         break
+
+                for base in conda_base_roots:
+                    for cand in [
+                        os.path.join(base, "envs", name, "bin", "python"),
+                        os.path.join(base, "envs", name, "python.exe"),
+                        os.path.join(base, name, "bin", "python"),
+                        os.path.join(base, name, "python.exe"),
+                    ]:
+                        if os.path.isfile(cand):
+                            found_py = cand
+                            break
+                    if found_py:
+                        break
                 if found_py:
                     break
-            if found_py:
-                break
 
         # Probe interpreter modules if found
         modules_status = {}
@@ -393,7 +431,7 @@ def inspect_virtual_environments(use_cache: bool = True) -> Dict[str, Dict[str, 
                 "for m in reqs:\n"
                 "    try:\n"
                 "        __import__(m)\n"
-                "    except Exception:\n"
+                "    except Exception as e:\n"
                 "        res['missing'].append(m)\n"
                 "try:\n"
                 "    import torch\n"
@@ -402,14 +440,21 @@ def inspect_virtual_environments(use_cache: bool = True) -> Dict[str, Dict[str, 
                 "    pass\n"
                 "print(json.dumps(res))\n"
             )
+            probe_env = dict(os.environ)
+            env_lib = os.path.realpath(os.path.join(os.path.dirname(found_py), "..", "lib"))
+            if os.path.isdir(env_lib):
+                cur_ld = probe_env.get("LD_LIBRARY_PATH", "")
+                if env_lib not in cur_ld.split(":"):
+                    probe_env["LD_LIBRARY_PATH"] = f"{env_lib}:{cur_ld}" if cur_ld else env_lib
             try:
                 proc = subprocess.run(
                     [found_py, "-c", probe_code],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     universal_newlines=True,
-                    timeout=3.0,
+                    timeout=5.0,
                     shell=False,
+                    env=probe_env,
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
                     for line in reversed(proc.stdout.strip().splitlines()):
@@ -421,8 +466,11 @@ def inspect_virtual_environments(use_cache: bool = True) -> Dict[str, Dict[str, 
                                 modules_status[m] = (m not in missing)
                             is_ready = len(missing) == 0
                             break
-            except Exception:
-                pass
+                else:
+                    if proc.stderr:
+                        error_detail = proc.stderr.strip()
+            except Exception as ex:
+                error_detail = str(ex)
         else:
             # Check current sys.executable
             for m in spec["required_modules"]:
@@ -440,6 +488,7 @@ def inspect_virtual_environments(use_cache: bool = True) -> Dict[str, Dict[str, 
             "ready": is_ready,
             "modules": modules_status,
             "torch_version": torch_ver,
+            "error_detail": error_detail,
         }
 
     if use_cache:
@@ -645,6 +694,12 @@ class SystemDoctor:
                     details.append(mod)
             det_str = f" ({', '.join(details)})" if details else ""
             print(f"  [*] {label:<28}: {status_tag:>7}{det_str}")
+            if not env_data["ready"]:
+                if env_data.get("interpreter"):
+                    print(f"      • Discovered interpreter: {env_data['interpreter']}")
+                if env_data.get("error_detail"):
+                    first_err = env_data["error_detail"].splitlines()[-1]
+                    print(f"      • Diagnostic detail: {first_err}")
 
         print("\nModel Weights & Checkpoints:")
         for label, w_data in self.weights_info.items():
