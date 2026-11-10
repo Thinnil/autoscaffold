@@ -113,9 +113,13 @@ if [[ "$BUILD_ENVS" =~ ^[Yy]$ ]]; then
         fi
     fi
     if [ "$se3_built" = false ]; then
-        "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_RFDIFF" python=3.9 pytorch=1.12.1 cudatoolkit=11.3 -c pytorch -c conda-forge 2>/dev/null || \
-        "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_RFDIFF" python=3.9 pytorch=1.12.1 -c pytorch -c conda-forge || true
+        "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_RFDIFF" python=3.9 pytorch=1.12.1 cudatoolkit=11.3 "mkl<2024.1" "intel-openmp<2024.1" -c pytorch -c conda-forge 2>/dev/null || \
+        "$MICROMAMBA_BIN" create -y -n "$CONDA_ENV_RFDIFF" python=3.9 pytorch=1.12.1 "mkl<2024.1" -c pytorch -c conda-forge || true
     fi
+
+    # Ensure Intel MKL ABI compatibility with PyTorch 1.12 (prevents iJIT_NotifyEvent symbol errors)
+    echo -e "Aligning MKL runtime libraries in $CONDA_ENV_RFDIFF..."
+    "$MICROMAMBA_BIN" install -y -n "$CONDA_ENV_RFDIFF" "mkl<2024.1" "intel-openmp<2024.1" -c conda-forge 2>/dev/null || true
 
     # Guarantee neural dependencies in RFdiffusion env
     echo -e "Verifying neural dependencies (torch, hydra-core) in $CONDA_ENV_RFDIFF..."
